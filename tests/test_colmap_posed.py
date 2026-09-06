@@ -16,12 +16,14 @@ from ps1_hood.reconstruct.colmap import (
     filter_frames_registered_in_matches,
     frame_sizes_uniform,
     frames_have_known_poses,
+    read_db_cameras,
     read_db_image_ids,
     remap_known_pose_model_to_db,
     write_cross_pano_match_list,
     write_known_pose_model,
 )
 from ps1_hood.geo import camera_rotation_cv
+
 
 
 def _fr(e, n, heading, pano="a", path="/tmp/x.jpg", pitch=0.0):
@@ -38,6 +40,23 @@ def _fr(e, n, heading, pano="a", path="/tmp/x.jpg", pitch=0.0):
         "height": 480,
     }
 
+
+def _insert_pinhole_camera(con, camera_id: int, width: int, height: int, *, fx=None):
+    """Insert a COLMAP PINHOLE cameras row (model id 1, float64 params blob)."""
+    import numpy as np
+
+    if fx is None:
+        fx = width / 2.0
+    params = np.asarray([fx, fx, width / 2.0, height / 2.0], dtype=np.float64)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS cameras ("
+        "camera_id INTEGER PRIMARY KEY, model INTEGER, width INTEGER, height INTEGER, "
+        "params BLOB, prior_focal_length INTEGER)"
+    )
+    con.execute(
+        "INSERT INTO cameras VALUES (?, ?, ?, ?, ?, ?)",
+        (camera_id, 1, width, height, params.tobytes(), 0),
+    )
 
 def test_focal_from_hfov():
     # 90° → fx = W/2
@@ -106,6 +125,7 @@ def test_remap_image_ids(tmp_path: Path):
     # Deliberately non-sequential / offset ids
     con.execute("INSERT INTO images VALUES (7, 'aaa.jpg', 1)")
     con.execute("INSERT INTO images VALUES (9, 'bbb.jpg', 1)")
+    _insert_pinhole_camera(con, 1, 640, 480)
     con.commit()
     con.close()
     path, kept_frames, kept_names = remap_known_pose_model_to_db(model, frames, names, db)
@@ -185,6 +205,7 @@ def test_remap_filters_missing_db_images(tmp_path: Path):
         if n == "img9.jpg":
             continue  # 1/10 = 10% — frac > 0.10 is False for ==? 0.1 > 0.1 is False
         con.execute("INSERT INTO images VALUES (?, ?, 1)", (i + 1, n))
+    _insert_pinhole_camera(con, 1, 640, 480)
     con.commit()
     con.close()
     path, kept_f, kept_n = remap_known_pose_model_to_db(model2, frames10, names10, db2)
@@ -331,6 +352,7 @@ def test_filter_frames_drops_images_without_tvg(tmp_path: Path):
     )
     for i, n in enumerate(names, start=1):
         con.execute("INSERT INTO images VALUES (?, ?, 1)", (i, n))
+    _insert_pinhole_camera(con, 1, 640, 480)
     # COLMAP pair_id: id1 * max + id2 with id1 < id2, max=2147483647
     max_images = 2147483647
     # Successful track between 1-2 and 3-4; image 5 orphan
@@ -357,7 +379,13 @@ def test_filter_frames_drops_images_without_tvg(tmp_path: Path):
     assert "e.jpg" not in (model / "images.txt").read_text()
 
 
-def test_remap_uses_size_grouped_cameras_when_db_multi_cam(tmp_path: Path):
+def test_remap_cameras_txt_widths_match_db_mixed_sizes(tmp_path: Path):
+    """Mixed crop sizes + per-image DB cameras → cameras.txt must match DB, not frames.
+
+    Reproduces the PC SIGABRT: reconstruction.cc Check failed:
+    existing_camera.width == camera.width (1901 vs 1920) when cameras.txt was
+    rebuilt from a single frame while DB held a different width for that CAMERA_ID.
+    """
     import sqlite3
 
     frames = [
@@ -366,8 +394,15 @@ def test_remap_uses_size_grouped_cameras_when_db_multi_cam(tmp_path: Path):
         _fr(16, 0, 5, "p3"),
         _fr(24, 0, 5, "p4"),
     ]
-    frames[1]["width"] = 800
-    frames[1]["height"] = 480
+    # Frame metadata claims 1901 — but DB camera for that id is 1920 (the bug case).
+    frames[0]["width"] = 1901
+    frames[0]["height"] = 1080
+    frames[1]["width"] = 1920
+    frames[1]["height"] = 1080
+    frames[2]["width"] = 1728
+    frames[2]["height"] = 1004
+    frames[3]["width"] = 1920
+    frames[3]["height"] = 1080
     names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
     model = write_known_pose_model(frames, names, tmp_path / "sparse")
     db = tmp_path / "database.db"
@@ -375,17 +410,65 @@ def test_remap_uses_size_grouped_cameras_when_db_multi_cam(tmp_path: Path):
     con.execute(
         "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
     )
-    # Per-image cameras as single_camera=0 would create
+    # Per-image cameras as single_camera=0; DB widths are ground truth for COLMAP.
+    db_sizes = {
+        1: (1920, 1080),  # deliberate mismatch vs frames[0] 1901
+        2: (1920, 1080),
+        3: (1728, 1004),
+        4: (1920, 1080),
+    }
     for i, n in enumerate(names, start=1):
         con.execute("INSERT INTO images VALUES (?, ?, ?)", (i, n, i))
+        w, h = db_sizes[i]
+        _insert_pinhole_camera(con, i, w, h, fx=float(w))
     con.commit()
     con.close()
+
+    db_cams = read_db_cameras(db)
+    assert db_cams[1][1] == 1920  # width from DB, not 1901
+
     path, kept_f, kept_n = remap_known_pose_model_to_db(model, frames, names, db)
     assert kept_n == names
     cams = (path / "cameras.txt").read_text()
-    # Size-grouped: 640x480 and 800x480 → 2 cameras, not 4
     cam_lines = [ln for ln in cams.splitlines() if ln and not ln.startswith("#")]
-    assert len(cam_lines) == 2
-    assert "PINHOLE 640 480" in cams
-    assert "PINHOLE 800 480" in cams
+    assert len(cam_lines) == 4  # one cameras.txt row per DB camera_id
+    # Must match DB widths — never the stale 1901 from frame metadata.
+    assert "1901" not in cams
+    assert "1 PINHOLE 1920 1080" in cams
+    assert "2 PINHOLE 1920 1080" in cams
+    assert "3 PINHOLE 1728 1004" in cams
+    assert "4 PINHOLE 1920 1080" in cams
+    # images.txt CAMERA_IDs must be the DB camera_ids
+    imgs = (path / "images.txt").read_text()
+    pose_lines = [
+        ln for ln in imgs.splitlines() if ln and not ln.startswith("#") and ln.strip()
+    ]
+    assert len(pose_lines) == 4
+    for ln, expect_cid in zip(pose_lines, [1, 2, 3, 4], strict=True):
+        parts = ln.split()
+        assert int(parts[8]) == expect_cid
+
+
+def test_remap_shared_camera_still_reads_db_row(tmp_path: Path):
+    import sqlite3
+
+    frames = [_fr(0, 0, 0, "p1"), _fr(8, 0, 0, "p2"), _fr(16, 0, 5, "p3"), _fr(24, 0, 5, "p4")]
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    model = write_known_pose_model(frames, names, tmp_path / "sparse")
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    for i, n in enumerate(names, start=1):
+        con.execute("INSERT INTO images VALUES (?, ?, 1)", (i, n))
+    _insert_pinhole_camera(con, 1, 640, 480, fx=321.5)
+    con.commit()
+    con.close()
+    path, _, _ = remap_known_pose_model_to_db(model, frames, names, db)
+    cams = (path / "cameras.txt").read_text()
+    cam_lines = [ln for ln in cams.splitlines() if ln and not ln.startswith("#")]
+    assert len(cam_lines) == 1
+    assert cam_lines[0].startswith("1 PINHOLE 640 480")
+    assert "321.500000" in cam_lines[0]
 
