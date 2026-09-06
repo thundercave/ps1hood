@@ -635,6 +635,20 @@ def colmap_cpu_gpu_flags(colmap: str) -> tuple[tuple[str, ...], tuple[str, ...]]
     return tuple(extract), tuple(matching)
 
 
+def clear_db_matches(database: Path) -> None:
+    """Drop matcher output so a retry does not see a half-written DB."""
+    con = sqlite3.connect(str(database))
+    try:
+        con.execute("DELETE FROM two_view_geometries")
+        con.execute("DELETE FROM matches")
+        con.commit()
+    except sqlite3.OperationalError:
+        # Tables may not exist yet — nothing to clear.
+        pass
+    finally:
+        con.close()
+
+
 def matches_importer_argv(
     colmap: str,
     database: Path,
@@ -869,7 +883,18 @@ def run_colmap_posed(
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
-    _run(matches_importer_argv(colmap, db, match_list, guided_matching=True))
+    # Guided matching densifies inliers under known geometry but can OOM on
+    # large SV sets — clear partial matcher tables and retry without it.
+    try:
+        _run(matches_importer_argv(colmap, db, match_list, guided_matching=True))
+    except (subprocess.CalledProcessError, OSError) as exc:
+        log.warning(
+            "COLMAP matches_importer with guided_matching failed (%s); "
+            "retrying without guided matching",
+            exc,
+        )
+        clear_db_matches(db)
+        _run(matches_importer_argv(colmap, db, match_list, guided_matching=False))
 
     # Images with only failed geometric verification can SIGABRT point_triangulator.
     frames, image_names = filter_frames_registered_in_matches(

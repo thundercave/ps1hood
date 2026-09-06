@@ -528,3 +528,14 @@ def test_cross_pano_prefers_more_pairs():
     pairs_tight = cross_pano_pair_indices(frames, max_pairs_per_frame=1)
     assert len(pairs_default) >= len(pairs_tight)
     assert len(pairs_default) >= 3
+
+
+def test_matches_importer_argv_can_disable_guided(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    argv = matches_importer_argv(
+        "colmap", Path("db.db"), Path("pairs.txt"), guided_matching=False
+    )
+    assert "--SiftMatching.guided_matching" not in argv
