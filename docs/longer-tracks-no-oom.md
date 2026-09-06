@@ -50,8 +50,10 @@ Too-dense FILM samples → matches prefer **almost-identical** neighbors (easy 2
 - Match **only** the custom pair list (never exhaustive+guided)
 - CPU guided on fewer pairs beats GPU OOM on all-pairs
 
-### 4) MASt3R / RoMa as matcher (cloud or PC if VRAM allows)
+### 4) MASt3R / RoMa as matcher (cloud or PC if VRAM allows) ★ wired
 Pairwise matches on the **same** custom cross-pano pair list → import to COLMAP DB → `point_triangulator` with fixed poses. Learned matchers often repeat across 3+ views better than SIFT on façades. Still **no free poses**.
+
+In-repo: `ps1hood reconstruct <run> --backend mast3r` (or `--backend colmap_posed --matcher mast3r`). See [`mast3r-matcher.md`](mast3r-matcher.md).
 
 ### 5) Bypass OpenMVS neighbor starve **now**
 Even with 2-view sparse, try:

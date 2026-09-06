@@ -49,7 +49,6 @@ from ps1_hood.reconstruct.unproject import triangulate_frames, triangulate_sift_
 from ps1_hood.reconstruct.export import scene_payload, write_scene
 from ps1_hood.reconstruct.facades import extract_facades
 from ps1_hood.reconstruct.keyframes import load_keyframes
-from ps1_hood.reconstruct.mast3r import run_mast3r
 
 log = logging.getLogger(__name__)
 
@@ -410,6 +409,12 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
     ):
         backend = "colmap_posed"
         log.info("colmap → colmap_posed (known ENU poses present; skip mapper)")
+    matcher = getattr(spec, "recon_matcher", "sift") or "sift"
+    if backend == "mast3r":
+        # Product path: MASt3R = matcher only → colmap_posed with ENU lock.
+        backend = "colmap_posed"
+        matcher = "mast3r"
+        log.info("mast3r → colmap_posed matcher=mast3r (ENU locked; no free-pose)")
     if backend in {"colmap", "colmap_posed", "sift", "mast3r", "export"}:
         frames = keyframes
         source = "keyframes"
@@ -488,11 +493,17 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
         _emit(progress, "reconstruct", "exported keyframes for an external reconstructor")
         _emit(progress, "reconstruct", COLMAP_HINT.strip())
     elif backend == "colmap_posed":
-        _emit(progress, "reconstruct", "COLMAP known-pose triangulator (cross-pano)")
+        _emit(
+            progress,
+            "reconstruct",
+            f"COLMAP known-pose triangulator (cross-pano, matcher={matcher})",
+        )
         ws, names = export_colmap_images(frames, project.recon_dir / "colmap")
         ply_photo = project.recon_dir / "cloud_photo.ply"
         try:
-            ply_path = run_colmap_posed(ws, frames, names, ply_out=ply_photo)
+            ply_path = run_colmap_posed(
+                ws, frames, names, ply_out=ply_photo, matcher=matcher
+            )
             cloud_ply = project.recon_dir / "cloud.ply"
             shutil.copy2(ply_path, cloud_ply)
             n_pts = 0
@@ -503,11 +514,16 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
             cloud = {
                 "path": str(cloud_ply),
                 "source": "colmap_posed",
+                "matcher": matcher,
                 "photo_ply": str(ply_path),
                 "points": n_pts,
+                "pose_lock": True,
             }
             _facade_pass(cloud_ply, cloud)
         except Exception as exc:  # noqa: BLE001
+            # Mast3r missing/GPU: fail loud (no silent SIFT swap) — user asked for mast3r.
+            if matcher == "mast3r":
+                raise
             log.warning("colmap_posed failed (%s) — falling back to OpenCV SIFT stereo", exc)
             _emit(progress, "reconstruct", f"posed COLMAP failed; OpenCV SIFT fallback: {exc}")
             cloud = triangulate_sift_frames(frames, project.recon_dir / "cloud.ply")
@@ -530,8 +546,6 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
         _emit(progress, "reconstruct", "OpenCV SIFT stereo (cross-pano known poses)")
         cloud = triangulate_sift_frames(frames, project.recon_dir / "cloud.ply")
         _facade_pass(project.recon_dir / "cloud.ply", cloud)
-    elif backend == "mast3r":
-        cloud = run_mast3r(frames, project.recon_dir)
     else:
         _emit(progress, "reconstruct", "triangulating flow correspondences (cross-pano pairs)")
         cloud = triangulate_frames(frames, project.recon_dir / "cloud.ply")

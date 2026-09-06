@@ -64,6 +64,9 @@ Official toys: `kapture_mast3r_mapping.py` / `demo_glomap.py` in https://github.
 - Flags to mind: keep poses (`has_pose`); avoid `--ignore_pose`; skip pose-optimizing BA that drifts world frame (or BA with locked extrinsics if available).  
 Community wrappers: https://github.com/jwd222/mast3r-sfm , https://github.com/hjh530/GIM-colmap-recon  
 
+**In-repo:** [`mast3r-matcher.md`](mast3r-matcher.md) — `ps1hood reconstruct --backend mast3r`
+(or `--backend colmap_posed --matcher mast3r`). Fail-loud without package/GPU; free-pose GA not CLI.
+
 #### VGGT without inventing poses
 https://github.com/facebookresearch/vggt  
 - Run aggregator + **depth_head** (and optional point_head).  
@@ -131,4 +134,4 @@ Dropping `drive.mp4` into Luma/Postshot/pose-free MASt3R and concatenating PLYs.
 
 ---
 
-**Related in-repo:** [correct-geometry-ghost-duplicates.md](correct-geometry-ghost-duplicates.md) (ENU midframes), [mapanything-densify.md](mapanything-densify.md) (TC2 MapAnything), [openmvs-densify.md](openmvs-densify.md) / [openmvs-denser-sparse.md](openmvs-denser-sparse.md) (Milestone B), [gpu-mast3r-ubuntu.md](gpu-mast3r-ubuntu.md) (CUDA/ROCm).
+**Related in-repo:** [correct-geometry-ghost-duplicates.md](correct-geometry-ghost-duplicates.md) (ENU midframes), [mapanything-densify.md](mapanything-densify.md) (TC2 MapAnything), [openmvs-densify.md](openmvs-densify.md) / [openmvs-denser-sparse.md](openmvs-denser-sparse.md) (Milestone B), [gpu-mast3r-ubuntu.md](gpu-mast3r-ubuntu.md) (CUDA/ROCm), [mast3r-matcher.md](mast3r-matcher.md) (TC3 matcher→posed).

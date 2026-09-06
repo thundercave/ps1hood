@@ -86,7 +86,7 @@ This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of t
 
 **Video → point cloud / splat:**
 
-- [MASt3R](https://github.com/naver/mast3r) / MASt3R-SfM — “drop images, get a point cloud.” Strong match for the missing piece.
+- [MASt3R](https://github.com/naver/mast3r) — **matcher only** into posed COLMAP (`--backend mast3r`); not free-pose SfM as product. See [`docs/mast3r-matcher.md`](docs/mast3r-matcher.md).
 - [VGGT](https://github.com/facebookresearch/vggt) — Meta, 2025, feed-forward point maps from a video.
 - COLMAP — still the reliable ordered-video baseline.
 - Luma / Postshot / Polycam — drag `runs/<name>/interp/drive.mp4` in.
@@ -105,7 +105,8 @@ uv run ps1hood reconstruct my-block --backend flow
 # or --backend colmap         prefers colmap_posed when cameras.json exists
 # or --backend sift           OpenCV SIFT stereo on cross-pano pairs
 # or --backend export
-# or --backend mast3r         optional; needs GPU + naver/mast3r + weights
+# or --backend mast3r         MASt3R matcher → posed triangulator (ENU locked)
+# or --backend colmap_posed --matcher mast3r   same; needs GPU + naver/mast3r
 
 # Optional densify (AGPL OpenMVS binary on PATH — not vendored):
 uv run ps1hood densify my-block --backend openmvs
