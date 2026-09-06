@@ -8,6 +8,7 @@
     #hud { position: absolute; left: 12px; top: 12px; z-index: 2; background: rgba(12,12,14,.72); padding: 10px 12px; border: 1px solid #333; }
     a { color: #e8c36a; }
     canvas { display: block; }
+    label { cursor: pointer; user-select: none; }
   </style>
 </head>
 <body>
@@ -24,6 +25,8 @@
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+    import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+    import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 
     const params = new URLSearchParams(location.search);
     const run = params.get('run');
@@ -41,18 +44,31 @@
     document.body.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    const sun = new THREE.DirectionalLight(0xffe6c0, 0.9);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+    const sun = new THREE.DirectionalLight(0xffe6c0, 0.95);
     sun.position.set(20, 40, 10);
     scene.add(sun);
     scene.add(new THREE.GridHelper(120, 40, 0x333333, 0x222222));
 
     const sceneJson = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/scene')).json();
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
+      + `<br><label><input type="checkbox" id="togCloud" checked> cloud</label>`
+      + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
       + `<br><a href="/">back</a>`;
 
     // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
     const to3 = (e, n, u) => new THREE.Vector3(e, u, -n);
+
+    const remapEnuGeometry = (geom) => {
+      const pos = geom.getAttribute('position');
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        const e = pos.getX(i), n = pos.getY(i), u = pos.getZ(i);
+        pos.setXYZ(i, e, u, -n);
+      }
+      pos.needsUpdate = true;
+      geom.computeVertexNormals();
+    };
 
     const satUrl = '/api/runs/' + encodeURIComponent(run) + '/satellite.jpg';
     const tex = new THREE.TextureLoader().load(satUrl);
@@ -89,7 +105,7 @@
       geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
       geo.computeVertexNormals();
       scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
-        color: 0x8a6a3c, side: THREE.DoubleSide, transparent: true, opacity: 0.7
+        color: 0x8a6a3c, side: THREE.DoubleSide, transparent: true, opacity: 0.35
       })));
     }
 
@@ -119,21 +135,56 @@
       scene.add(group);
     }
 
+    let cloudPoints = null;
     try {
       const geom = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud.ply');
-      geom.computeVertexNormals();
-      // ply is ENU; remap to three
-      const pos = geom.getAttribute('position');
-      for (let i = 0; i < pos.count; i++) {
-        const e = pos.getX(i), n = pos.getY(i), u = pos.getZ(i);
-        pos.setXYZ(i, e, u, -n);
-      }
-      pos.needsUpdate = true;
-      const mat = new THREE.PointsMaterial({ size: 0.08, vertexColors: true });
-      scene.add(new THREE.Points(geom, mat));
+      remapEnuGeometry(geom);
+      const mat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, opacity: 0.45, transparent: true });
+      cloudPoints = new THREE.Points(geom, mat);
+      scene.add(cloudPoints);
     } catch (err) {
       hud.innerHTML += '<br>no point cloud yet';
     }
+
+    let facadeRoot = null;
+    try {
+      const base = '/api/runs/' + encodeURIComponent(run) + '/';
+      const mtlLoader = new MTLLoader();
+      mtlLoader.setPath(base);
+      const materials = await mtlLoader.loadAsync('facades.mtl');
+      materials.preload();
+      for (const mat of Object.values(materials.materials)) {
+        if (!mat) continue;
+        mat.side = THREE.DoubleSide;
+        if (mat.map) mat.map.colorSpace = THREE.SRGBColorSpace;
+      }
+      const objLoader = new OBJLoader();
+      objLoader.setMaterials(materials);
+      objLoader.setPath(base);
+      facadeRoot = await objLoader.loadAsync('facades.obj');
+      facadeRoot.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+          remapEnuGeometry(child.geometry);
+          if (child.material) {
+            const mats = Array.isArray(child.material) ? child.material : [child.material];
+            for (const m of mats) {
+              m.side = THREE.DoubleSide;
+              if (m.map) m.map.colorSpace = THREE.SRGBColorSpace;
+            }
+          }
+        }
+      });
+      scene.add(facadeRoot);
+    } catch (err) {
+      hud.innerHTML += '<br>no textured facades yet';
+    }
+
+    document.getElementById('togCloud')?.addEventListener('change', (ev) => {
+      if (cloudPoints) cloudPoints.visible = ev.target.checked;
+    });
+    document.getElementById('togFacades')?.addEventListener('change', (ev) => {
+      if (facadeRoot) facadeRoot.visible = ev.target.checked;
+    });
 
     addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;

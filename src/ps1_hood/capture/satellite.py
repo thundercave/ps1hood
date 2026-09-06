@@ -18,28 +18,48 @@ ESRI_EXPORT = (
 )
 
 
-def fetch_satellite(bbox: BBox, dest: Path, size: int = 2048) -> dict[str, Any]:
-    dest.mkdir(parents=True, exist_ok=True)
+def _ortho_dims(bbox: BBox, size: int) -> tuple[int, int]:
     aspect = bbox.width_m() / max(bbox.height_m(), 1e-3)
     if aspect >= 1:
-        w, h = size, max(256, int(round(size / aspect)))
-    else:
-        h, w = size, max(256, int(round(size * aspect)))
-    url = (
-        f"{ESRI_EXPORT}?bbox={bbox.west},{bbox.south},{bbox.east},{bbox.north}"
-        f"&bboxSR=4326&imageSR=4326&size={w},{h}&format=jpg&f=image"
-    )
+        return size, max(256, int(round(size / aspect)))
+    return max(256, int(round(size * aspect))), size
+
+
+def fetch_satellite(bbox: BBox, dest: Path, size: int = 1400) -> dict[str, Any]:
+    """Download an Esri World Imagery mosaic.
+
+    Esri's export endpoint intermittently 500s on some large ``size=`` values
+    (especially near 2k for tiny bboxes). Try the requested size, then step
+    down until one works.
+    """
+    from ps1_hood.httputil import HttpError
+
+    dest.mkdir(parents=True, exist_ok=True)
     image_path = dest / "ortho.jpg"
-    image_path.write_bytes(get_bytes(url, timeout=60.0))
-    meta = {
-        "path": str(image_path),
-        "width": w,
-        "height": h,
-        "bbox": bbox.as_dict(),
-        "provider": "esri_world_imagery",
-        "crs": "EPSG:4326",
-    }
-    return meta
+    last_err: Exception | None = None
+    attempt = max(256, int(size))
+    while attempt >= 256:
+        w, h = _ortho_dims(bbox, attempt)
+        url = (
+            f"{ESRI_EXPORT}?bbox={bbox.west},{bbox.south},{bbox.east},{bbox.north}"
+            f"&bboxSR=4326&imageSR=4326&size={w},{h}&format=jpg&f=image"
+        )
+        try:
+            image_path.write_bytes(get_bytes(url, timeout=60.0))
+            return {
+                "path": str(image_path),
+                "width": w,
+                "height": h,
+                "bbox": bbox.as_dict(),
+                "provider": "esri_world_imagery",
+                "crs": "EPSG:4326",
+            }
+        except HttpError as exc:
+            last_err = exc
+            if exc.status not in {500, 502, 503, 504}:
+                raise
+            attempt = attempt // 2 if attempt // 2 < attempt else attempt - 128
+    raise HttpError(f"satellite export failed at all sizes: {last_err}") from last_err
 
 
 class Ortho:

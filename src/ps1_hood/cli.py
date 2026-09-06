@@ -43,9 +43,36 @@ def main() -> None:
     type=click.Choice(["google_web", "google_js", "google_static", "mapillary"]),
     default=None,
 )
-@click.option("--spacing", type=float, default=8.0, help="metres between Street View probes")
-@click.option("--steps", type=int, default=8, help="interpolated frames between neighbouring SVs")
-@click.option("--heading-step", type=int, default=45, help="degrees between 360° screengrabs")
+@click.option(
+    "--spacing",
+    type=float,
+    default=None,
+    help="metres between Street View probes (default 8; smoke preset 25)",
+)
+@click.option(
+    "--steps",
+    type=int,
+    default=None,
+    help="interpolated frames between neighbouring SVs (default 8; smoke preset 3)",
+)
+@click.option(
+    "--heading-step",
+    type=int,
+    default=None,
+    help="degrees between 360° screengrabs (default 45; smoke preset 90)",
+)
+@click.option(
+    "--max-panos",
+    type=int,
+    default=None,
+    help="hard-cap panoramas after discover (evenly subsampled by index)",
+)
+@click.option(
+    "--preset",
+    type=click.Choice(["smoke"]),
+    default=None,
+    help="smoke: spacing=25, heading_step=90, steps=3, max_panos=8, extra_pitches=[0]",
+)
 def init_cmd(
     name: str,
     south: float,
@@ -53,24 +80,48 @@ def init_cmd(
     north: float,
     east: float,
     source: str | None,
-    spacing: float,
-    steps: int,
-    heading_step: int,
+    spacing: float | None,
+    steps: int | None,
+    heading_step: int | None,
+    max_panos: int | None,
+    preset: str | None,
 ) -> None:
     """Create a run from a geographic bounding box."""
     settings = Settings.from_env()
+    # Defaults; --preset smoke fills cheap demo budget (CLI flags still win).
+    spacing_m = 8.0 if spacing is None else spacing
+    interp_steps = 8 if steps is None else steps
+    h_step = 45 if heading_step is None else heading_step
+    pitches = [-30, 0, 18]
+    cap = max_panos
+    if preset == "smoke":
+        if spacing is None:
+            spacing_m = 25.0
+        if steps is None:
+            interp_steps = 3
+        if heading_step is None:
+            h_step = 90
+        if max_panos is None:
+            cap = 8
+        pitches = [0]
     spec = ProjectSpec(
         name=name,
         bbox=BBox(south=south, west=west, north=north, east=east),
         source=source or settings.source,
-        spacing_m=spacing,
-        interp_steps=steps,
-        heading_step=heading_step,
+        spacing_m=spacing_m,
+        interp_steps=interp_steps,
+        heading_step=h_step,
+        extra_pitches=pitches,
+        max_panos=cap,
     )
     project = create_project(spec)
     click.echo(f"created {project.root}")
     click.echo(f"  bbox {spec.bbox.width_m():.0f} × {spec.bbox.height_m():.0f} m")
     click.echo(f"  source {spec.source}")
+    if spec.max_panos is not None:
+        click.echo(f"  max_panos {spec.max_panos}")
+    if preset:
+        click.echo(f"  preset {preset}")
     click.echo("next:  ps1hood run " + name)
 
 

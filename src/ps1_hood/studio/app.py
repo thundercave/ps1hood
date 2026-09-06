@@ -142,6 +142,31 @@ def create_app() -> Flask:
             return jsonify({"error": "no cloud yet"}), 404
         return send_file(path)
 
+    @app.get("/api/runs/<name>/facades.obj")
+    def api_facades_obj(name: str):
+        path = open_project(name).recon_dir / "facades.obj"
+        if not path.is_file():
+            return jsonify({"error": "no facades yet"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/facades.mtl")
+    def api_facades_mtl(name: str):
+        path = open_project(name).recon_dir / "facades.mtl"
+        if not path.is_file():
+            return jsonify({"error": "no facades mtl yet"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/textures/<path:filename>")
+    def api_facade_texture(name: str, filename: str):
+        root = open_project(name).recon_dir / "textures"
+        # Prevent path escape while allowing nested texture names.
+        target = (root / filename).resolve()
+        if root.resolve() not in target.parents and target != root.resolve():
+            return jsonify({"error": "path outside textures"}), 400
+        if not target.is_file():
+            return jsonify({"error": "missing"}), 404
+        return send_file(target)
+
     @app.get("/api/runs/<name>/satellite.jpg")
     def api_sat(name: str):
         path = open_project(name).satellite_dir / "ortho.jpg"

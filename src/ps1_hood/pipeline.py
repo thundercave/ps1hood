@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from ps1_hood.align.seat import (
 )
 from ps1_hood.capture.bag import buildings_enu, fetch_bag, live_buildings
 from ps1_hood.capture.crop import crop_shots
-from ps1_hood.capture.discover import discover
+from ps1_hood.capture.discover import cap_panos, discover
 from ps1_hood.capture.google_js import capture_panos as capture_js
 from ps1_hood.capture.google_static import capture_panos as capture_static
 from ps1_hood.capture.google_web import capture_panos as capture_web
@@ -39,6 +40,8 @@ from ps1_hood.project import Project
 from ps1_hood.reconstruct.colmap import COLMAP_HINT, export_colmap_images, run_colmap
 from ps1_hood.reconstruct.export import scene_payload, write_scene
 from ps1_hood.reconstruct.facades import extract_facades
+from ps1_hood.reconstruct.keyframes import load_keyframes
+from ps1_hood.reconstruct.mast3r import run_mast3r
 from ps1_hood.reconstruct.unproject import triangulate_frames
 
 log = logging.getLogger(__name__)
@@ -120,6 +123,20 @@ def stage_discover(project: Project, settings: Settings, progress: Progress | No
     spec = project.load_spec()
     _emit(progress, "discover", f"sampling {spec.source} coverage in bbox")
     payload = discover(spec.bbox, spec.source, settings, spec.spacing_m)
+    before = len(payload["panos"])
+    capped, max_n = cap_panos(payload["panos"], getattr(spec, "max_panos", None))
+    payload["panos"] = capped
+    if max_n is not None:
+        log.info("discover: capped to %s / max %s", len(capped), max_n)
+        if before > len(capped):
+            _emit(
+                progress,
+                "discover",
+                f"capped to {len(capped)} / max {max_n} (from {before})",
+                queued=len(capped),
+                captured=0,
+                skipped=0,
+            )
     project.write_json(project.discover_dir / "panos.json", payload)
     osm = fetch_roads(spec.bbox)
     project.write_json(project.osm_dir / "roads.json", osm)
@@ -365,29 +382,87 @@ def stage_interpolate(project: Project, progress: Progress | None = None) -> lis
 
 def stage_reconstruct(project: Project, progress: Progress | None = None) -> dict[str, Any]:
     spec = project.load_spec()
-    frames = project.read_json(project.interp_dir / "frames.json")
     poses = project.read_json(project.align_dir / "poses.json")
     sat = project.read_json(project.satellite_dir / "ortho.json")
     frame = LocalFrame.from_bbox(spec.bbox)
-    cloud = None
-    if spec.recon_backend == "export":
-        export_colmap_images(frames, project.recon_dir / "colmap")
-        _emit(progress, "reconstruct", "exported frames for an external reconstructor")
-        _emit(progress, "reconstruct", COLMAP_HINT.strip())
-    elif spec.recon_backend == "colmap":
-        ws = export_colmap_images(frames, project.recon_dir / "colmap")
-        run_colmap(ws)
-    elif spec.recon_backend == "mast3r":
-        export_colmap_images(frames, project.recon_dir / "mast3r_input")
-        raise RuntimeError(
-            "MASt3R is not vendored. Frames are in recon/mast3r_input/images.\n" + COLMAP_HINT
-        )
+    keyframes = load_keyframes(project)
+    interp_path = project.interp_dir / "frames.json"
+    interp_frames: list[dict[str, Any]] = (
+        project.read_json(interp_path) if interp_path.is_file() else []
+    )
+
+    # Real aligned shots for SfM / MVS; DIS midframes only as flow fallback.
+    backend = spec.recon_backend
+    if backend in {"colmap", "mast3r", "export"}:
+        frames = keyframes
+        source = "keyframes"
+        if len(frames) < 2:
+            raise RuntimeError(
+                f"recon backend {backend} needs ≥2 aligned keyframes "
+                f"(align/cameras.json with existing shot_path); got {len(frames)}"
+            )
     else:
-        _emit(progress, "reconstruct", "triangulating flow correspondences")
+        # flow triangulation
+        if len(keyframes) >= 2:
+            frames = keyframes
+            source = "keyframes"
+        elif len(interp_frames) >= 2:
+            frames = interp_frames
+            source = "interp"
+            log.warning(
+                "only %s keyframes — falling back to %s interpolated frames",
+                len(keyframes),
+                len(interp_frames),
+            )
+        else:
+            raise RuntimeError(
+                "need ≥2 keyframes (or interp frames) to triangulate; "
+                f"got keyframes={len(keyframes)} interp={len(interp_frames)}"
+            )
+
+    log.info("reconstruct: using %s (%s views) backend=%s", source, len(frames), backend)
+    _emit(progress, "reconstruct", f"{backend} from {source} ({len(frames)} views)")
+
+    cloud = None
+    if backend == "export":
+        export_colmap_images(frames, project.recon_dir / "colmap")
+        _emit(progress, "reconstruct", "exported keyframes for an external reconstructor")
+        _emit(progress, "reconstruct", COLMAP_HINT.strip())
+    elif backend == "colmap":
+        ws = export_colmap_images(frames, project.recon_dir / "colmap")
+        ply_colmap = project.recon_dir / "cloud_colmap.ply"
+        ply_path = run_colmap(ws, ply_out=ply_colmap)
+        # Prefer the COLMAP cloud as cloud.ply when it has real geometry.
+        cloud_ply = project.recon_dir / "cloud.ply"
+        shutil.copy2(ply_path, cloud_ply)
+        cloud = {
+            "path": str(cloud_ply),
+            "source": "colmap",
+            "colmap_ply": str(ply_path),
+        }
+        try:
+            fac = extract_facades(
+                cloud_ply,
+                project.recon_dir / "facades.obj",
+                frames=frames,
+                satellite=sat,
+                local_frame=frame,
+            )
+            cloud["facades"] = fac
+        except RuntimeError as exc:
+            log.warning("facade pass skipped: %s", exc)
+    elif backend == "mast3r":
+        cloud = run_mast3r(frames, project.recon_dir)
+    else:
+        _emit(progress, "reconstruct", "triangulating flow correspondences (known-pose pairs)")
         cloud = triangulate_frames(frames, project.recon_dir / "cloud.ply")
         try:
             fac = extract_facades(
-                project.recon_dir / "cloud.ply", project.recon_dir / "facades.obj"
+                project.recon_dir / "cloud.ply",
+                project.recon_dir / "facades.obj",
+                frames=frames,
+                satellite=sat,
+                local_frame=frame,
             )
             cloud["facades"] = fac
         except RuntimeError as exc:

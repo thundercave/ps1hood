@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from ps1_hood.geo import camera_rotation_cv
+from ps1_hood.reconstruct.known_pose import select_stereo_pairs, sequential_pairs
 
 
 def _load_mask(path: str | None, height: int, width: int) -> np.ndarray | None:
@@ -48,13 +49,34 @@ def _P(pose: dict[str, Any], width: int, height: int) -> np.ndarray:
     return K @ np.hstack([Rcw, t.reshape(3, 1)])
 
 
+def _cam_center(pose: dict[str, Any]) -> np.ndarray:
+    return np.array([pose["e"], pose["n"], pose["u"]], dtype=np.float64)
+
+
+def _forward(pose: dict[str, Any]) -> np.ndarray:
+    return np.array(camera_rotation_cv(pose["heading"], pose["pitch"]), dtype=np.float64)[:, 2]
+
+
+def _reproj_err(
+    P: np.ndarray, pts_w: np.ndarray, pts_img: np.ndarray
+) -> np.ndarray:
+    """Per-point pixel reprojection error."""
+    hom = np.hstack([pts_w, np.ones((len(pts_w), 1), dtype=np.float64)])
+    proj = (P @ hom.T).T
+    denom = np.clip(proj[:, 2:3], 1e-8, None)
+    uv = proj[:, :2] / denom
+    return np.linalg.norm(uv - pts_img.T, axis=1)
+
+
 def triangulate_frames(
     frames: list[dict[str, Any]],
     dest_ply: Path,
     *,
-    stride: int = 4,
+    stride: int = 3,
     pair_step: int = 2,
     max_points: int = 1_200_000,
+    use_pose_pairs: bool = True,
+    max_reproj_px: float = 12.0,
 ) -> dict[str, Any]:
     if len(frames) < 2:
         raise RuntimeError("need at least 2 interpolated frames to triangulate")
@@ -63,13 +85,23 @@ def triangulate_frames(
         raise RuntimeError("could not read first frame")
     h, w = sample.shape[:2]
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+
+    if use_pose_pairs and all("e" in f and "n" in f and "heading" in f for f in frames):
+        pairs = select_stereo_pairs(frames)
+        # Sequential list order is a poor proxy for SV orbits (many same-spot
+        # headings). Only fall back to it when pose geometry finds nothing.
+        if not pairs:
+            pairs = sequential_pairs(len(frames), pair_step=pair_step)
+    else:
+        pairs = sequential_pairs(len(frames), pair_step=pair_step)
+
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     zs: list[np.ndarray] = []
     cs: list[np.ndarray] = []
     total = 0
-    for i in range(0, len(frames) - pair_step):
-        a, b = frames[i], frames[i + pair_step]
+    for i, j in pairs:
+        a, b = frames[i], frames[j]
         ia = cv2.imread(a["path"], cv2.IMREAD_COLOR)
         ib = cv2.imread(b["path"], cv2.IMREAD_COLOR)
         if ia is None or ib is None:
@@ -98,6 +130,13 @@ def triangulate_frames(
             bx = np.clip(np.round(pts2[0]), 0, w - 1).astype(int)
             by = np.clip(np.round(pts2[1]), 0, h - 1).astype(int)
             keep &= mb[by, bx] == 0
+        # second view must land inside the image
+        keep &= (
+            (pts2[0] >= 0)
+            & (pts2[0] < w)
+            & (pts2[1] >= 0)
+            & (pts2[1] < h)
+        )
         if int(keep.sum()) < 80:
             continue
         pts1 = pts1[:, keep]
@@ -106,14 +145,23 @@ def triangulate_frames(
         P2 = _P(b, w, h)
         hom = cv2.triangulatePoints(P1, P2, pts1, pts2)
         pts = (hom[:3] / np.clip(hom[3], 1e-8, None)).T
-        # keep points in front of camera A and near the street
-        Rcw, t = _Rt(a)
-        cam = -Rcw.T @ t
-        vis = (pts - cam) @ np.array(camera_rotation_cv(a["heading"], a["pitch"]))[:, 2]
+        # cheirality: in front of both cameras
+        cam_a = _cam_center(a)
+        cam_b = _cam_center(b)
+        fwd_a = _forward(a)
+        fwd_b = _forward(b)
+        vis_a = (pts - cam_a) @ fwd_a
+        vis_b = (pts - cam_b) @ fwd_b
         z = pts[:, 2]
-        ok = (vis > 0.4) & (z > -1.5) & (z < 40.0)
-        dist = np.linalg.norm(pts - cam, axis=1)
+        ok = (vis_a > 0.4) & (vis_b > 0.2) & (z > -1.5) & (z < 40.0)
+        dist = np.linalg.norm(pts - cam_a, axis=1)
         ok &= dist < 60.0
+        if int(ok.sum()) == 0:
+            continue
+        # reprojection sanity on surviving points
+        err1 = _reproj_err(P1, pts, pts1)
+        err2 = _reproj_err(P2, pts, pts2)
+        ok &= (err1 < max_reproj_px) & (err2 < max_reproj_px)
         pts = pts[ok]
         if pts.size == 0:
             continue
@@ -132,7 +180,7 @@ def triangulate_frames(
     xyz, rgb = _voxel_downsample(xyz, rgb, 0.12)
     dest_ply.parent.mkdir(parents=True, exist_ok=True)
     write_ply(dest_ply, xyz, rgb)
-    return {"path": str(dest_ply), "points": int(len(xyz))}
+    return {"path": str(dest_ply), "points": int(len(xyz)), "pairs": len(pairs)}
 
 
 def _voxel_downsample(

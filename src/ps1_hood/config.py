@@ -80,9 +80,10 @@ class ProjectSpec:
     interp_steps: int = 8
     interp_backend: str = "flow"
     recon_backend: str = "flow"
+    max_panos: int | None = None
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "bbox": self.bbox.as_dict(),
             "source": self.source,
@@ -96,9 +97,14 @@ class ProjectSpec:
             "interp_backend": self.interp_backend,
             "recon_backend": self.recon_backend,
         }
+        if self.max_panos is not None:
+            out["max_panos"] = int(self.max_panos)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict) -> "ProjectSpec":
+        pitches_raw = data.get("extra_pitches", data.get("pitches", [-30, 0, 18]))
+        max_raw = data.get("max_panos")
         return cls(
             name=str(data["name"]),
             bbox=BBox.from_dict(data["bbox"]),
@@ -108,8 +114,9 @@ class ProjectSpec:
             fov_deg=float(data.get("fov_deg", 90.0)),
             heading_step=int(data.get("heading_step", 45)),
             headings_rel=[int(x) for x in data.get("headings_rel", [0, 90, 180, 270])],
-            extra_pitches=[int(x) for x in data.get("extra_pitches", [-30, 0, 18])],
+            extra_pitches=[int(x) for x in pitches_raw],
             interp_steps=int(data.get("interp_steps", 8)),
             interp_backend=str(data.get("interp_backend", "flow")),
             recon_backend=str(data.get("recon_backend", "flow")),
+            max_panos=int(max_raw) if max_raw is not None else None,
         )

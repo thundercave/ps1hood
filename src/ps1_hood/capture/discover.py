@@ -14,6 +14,31 @@ from ps1_hood.overpass import fetch_roads, roads_to_lonlat_lines
 log = logging.getLogger(__name__)
 
 
+def subsample_evenly(items: list[Any], max_n: int) -> list[Any]:
+    """Keep at most max_n items, evenly spaced by index (includes first + last)."""
+    n = len(items)
+    if max_n <= 0 or n <= max_n:
+        return list(items)
+    if max_n == 1:
+        return [items[0]]
+    indices = [round(i * (n - 1) / (max_n - 1)) for i in range(max_n)]
+    out: list[Any] = []
+    seen: set[int] = set()
+    for idx in indices:
+        if idx not in seen:
+            seen.add(idx)
+            out.append(items[idx])
+    return out
+
+
+def cap_panos(panos: list[Any], max_panos: int | None) -> tuple[list[Any], int | None]:
+    """Hard-cap a pano list. Returns (possibly shortened list, max applied or None)."""
+    if max_panos is None or max_panos <= 0:
+        return list(panos), None
+    capped = subsample_evenly(panos, int(max_panos))
+    return capped, int(max_panos)
+
+
 def discover(bbox: BBox, spec_source: str, settings: Settings, spacing_m: float) -> dict[str, Any]:
     osm = fetch_roads(bbox)
     lines = roads_to_lonlat_lines(osm)

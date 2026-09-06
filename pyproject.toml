@@ -23,6 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 browser = ["playwright>=1.47"]
 dev = ["pytest>=8.0"]
+# MASt3R is not pip-installable as a single package from PyPI here.
+# Install from https://github.com/naver/mast3r (torch+cuda + weights) yourself.
+# This empty extra documents the optional path:  uv sync --extra mast3r
+mast3r = []
 
 [project.scripts]
 ps1hood = "ps1_hood.cli:main"
