@@ -213,8 +213,14 @@ def write_known_pose_model(
     *,
     image_ids: list[int] | None = None,
     camera_ids: list[int] | None = None,
+    db_cameras: dict[int, tuple[str, int, int, list[float]]] | None = None,
 ) -> Path:
-    """Write COLMAP text model; empty points3D.txt. PINHOLE, t = -R @ C."""
+    """Write COLMAP text model; empty points3D.txt. PINHOLE, t = -R @ C.
+
+    When remapping after feature_extractor, pass ``camera_ids`` + ``db_cameras``
+    from the COLMAP SQLite DB so cameras.txt WIDTH/HEIGHT/PARAMS match the DB
+    for every CAMERA_ID (avoids point_triangulator SIGABRT on size mismatches).
+    """
     if len(frames) != len(image_names):
         raise ValueError("frames and image_names length mismatch")
     if not frames_have_known_poses(frames):
@@ -222,46 +228,63 @@ def write_known_pose_model(
 
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # One PINHOLE camera per (w, h, fov); override ids when remapping to DB.
-    cam_key_to_id: dict[tuple[int, int, float], int] = {}
-    cam_defs: list[tuple[int, int, int, float, float, float, float]] = []
-    # id, w, h, fx, fy, cx, cy
-    frame_cam_ids: list[int] = []
-    for idx, fr in enumerate(frames):
-        w, h = _frame_size(fr)
-        fov = float(fr.get("fov") or 90.0)
-        key = (w, h, round(fov, 3))
-        if key not in cam_key_to_id:
-            if camera_ids is not None:
-                cid = int(camera_ids[idx])
-            else:
-                cid = len(cam_key_to_id) + 1
-            cam_key_to_id[key] = cid
-            fx = _focal_px(w, fov)
-            fy = fx  # square pixels
-            cam_defs.append((cid, w, h, fx, fy, w / 2.0, h / 2.0))
-        frame_cam_ids.append(cam_key_to_id[key])
-
-    if camera_ids is not None:
-        # Prefer per-image DB camera_id (usually all 1 with single_camera).
+    cameras_txt = model_dir / "cameras.txt"
+    if db_cameras is not None:
+        if camera_ids is None:
+            raise ValueError("db_cameras requires camera_ids")
         frame_cam_ids = [int(c) for c in camera_ids]
-        # Rebuild cam_defs from unique DB camera ids using first matching frame.
-        seen: dict[int, tuple[int, int, int, float, float, float, float]] = {}
-        for fr, cid in zip(frames, frame_cam_ids, strict=True):
-            if cid in seen:
-                continue
+        used = sorted(set(frame_cam_ids))
+        missing_cams = [cid for cid in used if cid not in db_cameras]
+        if missing_cams:
+            raise RuntimeError(
+                f"COLMAP database missing cameras rows for CAMERA_ID(s) {missing_cams}"
+            )
+        with cameras_txt.open("w", encoding="ascii") as fh:
+            fh.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            fh.write(f"# Number of cameras: {len(used)}\n")
+            for cid in used:
+                model_name, w, h, params = db_cameras[cid]
+                params_s = " ".join(f"{p:.6f}" for p in params)
+                fh.write(f"{cid} {model_name} {int(w)} {int(h)} {params_s}\n")
+    else:
+        # One PINHOLE camera per (w, h, fov); used for the pre-extractor prior.
+        cam_key_to_id: dict[tuple[int, int, float], int] = {}
+        cam_defs: list[tuple[int, int, int, float, float, float, float]] = []
+        # id, w, h, fx, fy, cx, cy
+        frame_cam_ids = []
+        for idx, fr in enumerate(frames):
             w, h = _frame_size(fr)
             fov = float(fr.get("fov") or 90.0)
-            fx = _focal_px(w, fov)
-            seen[cid] = (cid, w, h, fx, fx, w / 2.0, h / 2.0)
-        cam_defs = list(seen.values())
+            key = (w, h, round(fov, 3))
+            if key not in cam_key_to_id:
+                if camera_ids is not None:
+                    cid = int(camera_ids[idx])
+                else:
+                    cid = len(cam_key_to_id) + 1
+                cam_key_to_id[key] = cid
+                fx = _focal_px(w, fov)
+                fy = fx  # square pixels
+                cam_defs.append((cid, w, h, fx, fy, w / 2.0, h / 2.0))
+            frame_cam_ids.append(cam_key_to_id[key])
 
-    cameras_txt = model_dir / "cameras.txt"
-    with cameras_txt.open("w", encoding="ascii") as fh:
-        fh.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        fh.write(f"# Number of cameras: {len(cam_defs)}\n")
-        for cid, w, h, fx, fy, cx, cy in cam_defs:
-            fh.write(f"{cid} PINHOLE {w} {h} {fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n")
+        if camera_ids is not None:
+            # Legacy path without db_cameras: pin ids, rebuild from first frame.
+            frame_cam_ids = [int(c) for c in camera_ids]
+            seen: dict[int, tuple[int, int, int, float, float, float, float]] = {}
+            for fr, cid in zip(frames, frame_cam_ids, strict=True):
+                if cid in seen:
+                    continue
+                w, h = _frame_size(fr)
+                fov = float(fr.get("fov") or 90.0)
+                fx = _focal_px(w, fov)
+                seen[cid] = (cid, w, h, fx, fx, w / 2.0, h / 2.0)
+            cam_defs = list(seen.values())
+
+        with cameras_txt.open("w", encoding="ascii") as fh:
+            fh.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            fh.write(f"# Number of cameras: {len(cam_defs)}\n")
+            for cid, w, h, fx, fy, cx, cy in cam_defs:
+                fh.write(f"{cid} PINHOLE {w} {h} {fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n")
 
     ids = image_ids if image_ids is not None else list(range(1, len(frames) + 1))
     if len(ids) != len(frames):
@@ -294,6 +317,22 @@ def write_known_pose_model(
     return model_dir
 
 
+# COLMAP CameraModelId → cameras.txt model name (src/colmap/sensor/models.h).
+_CAMERA_MODEL_NAMES: dict[int, str] = {
+    0: "SIMPLE_PINHOLE",
+    1: "PINHOLE",
+    2: "SIMPLE_RADIAL",
+    3: "RADIAL",
+    4: "OPENCV",
+    5: "OPENCV_FISHEYE",
+    6: "FULL_OPENCV",
+    7: "FOV",
+    8: "SIMPLE_RADIAL_FISHEYE",
+    9: "RADIAL_FISHEYE",
+    10: "THIN_PRISM_FISHEYE",
+}
+
+
 def read_db_image_ids(database: Path) -> dict[str, tuple[int, int]]:
     """Map image basename → (image_id, camera_id) from COLMAP SQLite DB."""
     con = sqlite3.connect(str(database))
@@ -307,6 +346,29 @@ def read_db_image_ids(database: Path) -> dict[str, tuple[int, int]]:
     return out
 
 
+def read_db_cameras(database: Path) -> dict[int, tuple[str, int, int, list[float]]]:
+    """Map camera_id → (model_name, width, height, params) from COLMAP SQLite DB.
+
+    ``params`` is the float64 blob decoded to a Python list (PINHOLE: fx,fy,cx,cy).
+    """
+    con = sqlite3.connect(str(database))
+    try:
+        rows = con.execute(
+            "SELECT camera_id, model, width, height, params FROM cameras"
+        ).fetchall()
+    finally:
+        con.close()
+    out: dict[int, tuple[str, int, int, list[float]]] = {}
+    for camera_id, model, width, height, params_blob in rows:
+        model_id = int(model)
+        model_name = _CAMERA_MODEL_NAMES.get(model_id)
+        if model_name is None:
+            raise RuntimeError(f"unsupported COLMAP camera model id {model_id}")
+        params = list(np.frombuffer(params_blob, dtype=np.float64)) if params_blob else []
+        out[int(camera_id)] = (model_name, int(width), int(height), params)
+    return out
+
+
 def remap_known_pose_model_to_db(
     model_dir: Path,
     frames: list[dict[str, Any]],
@@ -316,7 +378,10 @@ def remap_known_pose_model_to_db(
     max_missing_frac: float = 0.10,
     min_images: int = 4,
 ) -> tuple[Path, list[dict[str, Any]], list[str]]:
-    """Rewrite images.txt IMAGE_IDs to match feature_extractor DB (colmap#497).
+    """Rewrite images.txt IMAGE_IDs/CAMERA_IDs to match feature_extractor DB.
+
+    cameras.txt is rewritten from the DB ``cameras`` table (not frame metadata)
+    so WIDTH/HEIGHT/PARAMS match for every CAMERA_ID used in images.txt.
 
     If a small minority of ``image_names`` are absent from the DB (e.g. COLMAP
     silently skipped odd-sized crops under ``single_camera``), drop those frames,
@@ -355,12 +420,18 @@ def remap_known_pose_model_to_db(
             len(kept_names),
         )
     image_ids = [db_map[n][0] for n in kept_names]
-    camera_ids_raw = [db_map[n][1] for n in kept_names]
-    # One PINHOLE per (w,h,fov) keeps intrinsics honest when sizes differ.
-    # Only pin DB camera_ids when feature_extractor used a single shared camera.
-    camera_ids = camera_ids_raw if len(set(camera_ids_raw)) == 1 else None
+    camera_ids = [db_map[n][1] for n in kept_names]
+    # Always write cameras.txt from the DB so WIDTH/HEIGHT/PARAMS match the
+    # cameras table for every CAMERA_ID (size-grouping from frames can collide
+    # with DB camera_ids at different dimensions → triangulator SIGABRT).
+    db_cameras = read_db_cameras(database)
     path = write_known_pose_model(
-        kept_frames, kept_names, model_dir, image_ids=image_ids, camera_ids=camera_ids
+        kept_frames,
+        kept_names,
+        model_dir,
+        image_ids=image_ids,
+        camera_ids=camera_ids,
+        db_cameras=db_cameras,
     )
     return path, kept_frames, kept_names
 
@@ -454,10 +525,15 @@ def filter_frames_registered_in_matches(
         )
     if model_dir is not None:
         image_ids = [db_map[n][0] for n in kept_names]
-        camera_ids_raw = [db_map[n][1] for n in kept_names]
-        camera_ids = camera_ids_raw if len(set(camera_ids_raw)) == 1 else None
+        camera_ids = [db_map[n][1] for n in kept_names]
+        db_cameras = read_db_cameras(database)
         write_known_pose_model(
-            kept_frames, kept_names, model_dir, image_ids=image_ids, camera_ids=camera_ids
+            kept_frames,
+            kept_names,
+            model_dir,
+            image_ids=image_ids,
+            camera_ids=camera_ids,
+            db_cameras=db_cameras,
         )
     return kept_frames, kept_names
 
