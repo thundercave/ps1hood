@@ -91,9 +91,9 @@ This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of t
 - COLMAP — still the reliable ordered-video baseline.
 - Luma / Postshot / Polycam — drag `runs/<name>/interp/drive.mp4` in.
 
-Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, prefer near-horizon shots) + a RANSAC vertical-plane facade pass. Pairs are chosen by ENU baseline (2–25 m) and overlapping heading (≤60°), not list order alone. DIS midframes are only a fallback if fewer than two keyframes exist. Export / COLMAP / MASt3R use the same keyframes.
+Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, prefer near-horizon shots) + a **photo-consistency** vertical-plane façade pass (ZNCC under known poses; fail-loud if none pass — not flow-RANSAC walls). Pairs are chosen by ENU baseline (2–25 m) and overlapping heading (≤60°), not list order alone. DIS midframes are only a fallback if fewer than two keyframes exist. Export / COLMAP / MASt3R use the same keyframes.
 
-**Textured facades:** after plane extraction, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.
+**Textured façades:** after photo-consistency accept, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.
 
 COLMAP is hardened for SV orbits: if the sparse model is missing/`points3D.bin` empty or <1 KB, reconstruct errors with a clear "use flow/mast3r/known poses" message; a valid model is converted to `recon/cloud_colmap.ply` (and copied to `cloud.ply`).
 

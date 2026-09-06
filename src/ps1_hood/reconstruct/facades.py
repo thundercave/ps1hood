@@ -1,4 +1,4 @@
-"""Vertical-plane facades + ground quad — textured when cameras are available."""
+"""Photo-consistent vertical façades + ground quad (known poses, ZNCC)."""
 
 from __future__ import annotations
 
@@ -316,7 +316,7 @@ def _fit_ground_z(xyz: np.ndarray) -> float:
 
 
 def extract_facades(
-    ply_path: Path,
+    ply_path: Path | None,
     dest_obj: Path,
     n_planes: int = 12,
     *,
@@ -324,74 +324,85 @@ def extract_facades(
     satellite: dict[str, Any] | None = None,
     local_frame: LocalFrame | None = None,
     min_points: int = 80,
+    zncc_accept: float = 0.35,
 ) -> dict:
-    """RANSAC vertical planes seeded by the *photo* cloud (not OSM/BAG).
+    """Photo-consistent vertical façades under known poses (Milestone A).
 
-    Voxel-downsample → cluster vertical planes + ground from photo extents →
-    texture with existing SV warp. Cadastral shells are not used.
+    Hypothesize vertical planes (sparse seeds + Manhattan heading×distance),
+    score cross-pano ZNCC via plane-induced homography, keep only accepts,
+    ortho-bake textures. Fail-loud: empty wall list + clear log — never
+    invent flow-cloud RANSAC walls as product geometry. OSM/BAG are not used.
     """
-    xyz = _read_ply_xyz(ply_path)
-    if len(xyz) < min_points:
-        raise RuntimeError(
-            f"not enough photo points for facade extraction ({len(xyz)} < {min_points})"
-        )
-    xyz = _voxel_downsample_xyz(xyz, 0.20)
-    ground_z = _fit_ground_z(xyz)
-    remaining = xyz.copy()
+    import logging
+
+    from ps1_hood.reconstruct.photo_planes import (
+        plane_dict_for_obj,
+        search_photo_consistent_planes,
+    )
+
+    log = logging.getLogger(__name__)
+    frames = list(frames or [])
+
+    xyz = np.zeros((0, 3), dtype=np.float64)
+    if ply_path is not None and Path(ply_path).is_file():
+        try:
+            xyz = _read_ply_xyz(Path(ply_path))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("facades: could not read seed PLY %s (%s)", ply_path, exc)
+    if len(xyz) >= 20:
+        xyz = _voxel_downsample_xyz(xyz, 0.20)
+        ground_z = _fit_ground_z(xyz)
+    else:
+        ground_z = 0.0
+        if frames:
+            ground_z = float(np.median([float(f.get("u") or 0.0) for f in frames])) - 2.5
+
+    accepted = search_photo_consistent_planes(
+        frames,
+        xyz if len(xyz) >= 30 else None,
+        zncc_accept=zncc_accept,
+        ground_z=ground_z,
+        max_keep=n_planes,
+    )
+
     planes: list[dict] = []
-    rng = np.random.default_rng(0)
-    min_inliers = max(25, min(60, len(xyz) // 20))
-    for _ in range(n_planes):
-        if len(remaining) < max(40, min_inliers):
-            break
-        best_inliers = None
-        best_n = None
-        best_d = None
-        for _try in range(120):
-            i0, i1 = rng.integers(0, len(remaining), size=2)
-            p0, p1 = remaining[i0], remaining[i1]
-            v = p1[:2] - p0[:2]
-            if np.linalg.norm(v) < 0.2:
-                continue
-            nrm = np.array([-v[1], v[0]], dtype=np.float64)
-            nrm /= np.linalg.norm(nrm)
-            d = float(nrm @ p0[:2])
-            dist = np.abs(remaining[:, :2] @ nrm - d)
-            # Prefer facade-height points (above ground)
-            height_ok = remaining[:, 2] > (ground_z + 0.4)
-            inl = (dist < 0.50) & height_ok
-            if best_inliers is None or int(inl.sum()) > int(best_inliers.sum()):
-                best_inliers = inl
-                best_n = nrm
-                best_d = d
-        if best_inliers is None or int(best_inliers.sum()) < min_inliers:
-            break
-        pts = remaining[best_inliers]
-        # Quads from photo point extents (not cadastral footprints)
-        planes.append(
-            {
-                "nx": float(best_n[0]),
-                "ny": float(best_n[1]),
-                "d": float(best_d),
-                "min": pts.min(axis=0).tolist(),
-                "max": pts.max(axis=0).tolist(),
-                "count": int(len(pts)),
-                "ground_z": ground_z,
-            }
-        )
-        remaining = remaining[~best_inliers]
+    for pl in accepted:
+        planes.append(plane_dict_for_obj(pl, ground_z))
 
     dest_obj.parent.mkdir(parents=True, exist_ok=True)
     tex_dir = dest_obj.parent / "textures"
     if tex_dir.is_dir():
-        for old in tex_dir.glob("*.jpg"):
-            old.unlink(missing_ok=True)
+        for old_tex in tex_dir.glob("*.jpg"):
+            old_tex.unlink(missing_ok=True)
     tex_dir.mkdir(parents=True, exist_ok=True)
     materials: list[dict[str, Any]] = []
 
-    # Ground
+    # Ground extents from photo cloud or camera AABB
+    if len(xyz) >= 4:
+        extent_xyz = xyz
+    elif frames:
+        pts = np.array(
+            [[float(f["e"]), float(f["n"]), float(f.get("u") or ground_z)] for f in frames],
+            dtype=np.float64,
+        )
+        # Pad so ground quad is not degenerate
+        pad = 15.0
+        extent_xyz = np.vstack(
+            [
+                pts,
+                pts.min(axis=0) - pad,
+                pts.max(axis=0) + pad,
+            ]
+        )
+    else:
+        extent_xyz = np.array(
+            [[-10, -10, ground_z], [10, 10, ground_z]], dtype=np.float64
+        )
+
     ground_tex = tex_dir / "ground.jpg"
-    has_ground_tex = _ground_satellite_texture(xyz, ground_tex, satellite, local_frame)
+    has_ground_tex = _ground_satellite_texture(
+        extent_xyz, ground_tex, satellite, local_frame
+    )
     materials.append(
         {
             "name": "ground",
@@ -402,7 +413,7 @@ def extract_facades(
 
     textured = 0
     for i, pl in enumerate(planes):
-        quad = _plane_quad(pl)
+        quad = pl.get("quad") or _plane_quad(pl)
         mat_name = f"facade_{i:02d}"
         map_rel = None
         if frames:
@@ -421,18 +432,27 @@ def extract_facades(
             }
         )
 
+    if not planes:
+        log.error(
+            "facades.obj: 0 photo-consistent walls (ZNCC≥%.2f). "
+            "Studio will show ground only — not uncorrelated RANSAC blocks.",
+            zncc_accept,
+        )
+
     mtl_path = dest_obj.with_suffix(".mtl")
     _write_mtl(mtl_path, materials)
-    _write_obj(dest_obj, planes, xyz, materials, mtl_path.name)
+    _write_obj(dest_obj, planes, extent_xyz, materials, mtl_path.name)
     return {
         "path": str(dest_obj),
         "mtl": str(mtl_path),
         "planes": len(planes),
         "textured": textured,
         "ground_textured": has_ground_tex,
-        "source": "photo_ransac",
+        "source": "photo_consistency",
+        "zncc_accept": float(zncc_accept),
         "ground_z": ground_z,
         "points_used": int(len(xyz)),
+        "mean_zncc": float(np.mean([p.get("zncc", 0.0) for p in planes])) if planes else None,
     }
 
 
