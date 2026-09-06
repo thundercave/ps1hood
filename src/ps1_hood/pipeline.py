@@ -33,6 +33,7 @@ from ps1_hood.capture.satellite import Ortho, fetch_satellite
 from ps1_hood.config import Settings
 from ps1_hood.geo import BBox, LocalFrame
 from ps1_hood.interpolate.flow import interpolate_track
+from ps1_hood.interpolate.sequence import assert_interp_frame_poses, select_densify_frames
 from ps1_hood.interpolate.video import write_video
 from ps1_hood.overpass import fetch_roads
 from ps1_hood.progress import emit as _emit
@@ -379,6 +380,7 @@ def stage_interpolate(project: Project, progress: Progress | None = None) -> lis
             "See README for FILM / RIFE.",
         )
     frames = interpolate_track(poses, project.interp_dir / "frames", spec.interp_steps)
+    assert_interp_frame_poses(frames)  # full FILM rate: ENU + fov/width/height
     project.write_json(project.interp_dir / "frames.json", frames)
     video = write_video(frames, project.interp_dir / "drive.mp4")
     if video:
@@ -396,6 +398,9 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
     interp_frames: list[dict[str, Any]] = (
         project.read_json(interp_path) if interp_path.is_file() else []
     )
+    if interp_frames:
+        # Fail loud before any densify/recon consumes FILM midframes.
+        assert_interp_frame_poses(interp_frames)
 
     # Real aligned shots for SfM / MVS; DIS midframes only as flow fallback.
     backend = spec.recon_backend
@@ -419,12 +424,15 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
             frames = keyframes
             source = "keyframes"
         elif len(interp_frames) >= 2:
-            frames = interp_frames
+            # Assert every midframe pose; densify/recon only every Nth midframe + panos.
+            frames = select_densify_frames(interp_frames)
             source = "interp"
             log.warning(
-                "only %s keyframes — falling back to %s interpolated frames",
+                "only %s keyframes — falling back to %s interpolated frames "
+                "(densify subset %s after stride)",
                 len(keyframes),
                 len(interp_frames),
+                len(frames),
             )
         else:
             raise RuntimeError(

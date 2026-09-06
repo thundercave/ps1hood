@@ -54,7 +54,7 @@ Phase 0 is about *finishability*, not beauty. Ugly cloud + cardboard walls is a 
    - fall back to `export` with a clear error if weights missing
 3. Prefer **aligned keyframes** over densely interpolated DIS frames as MASt3R input (large-baseline stills are what FILM/MASt3R want; DIS-warped midframes can poison SfM).
 4. Keep COLMAP path working; document VGGT / Luma / Postshot as external “drop `drive.mp4` here.”
-5. (Stretch) FILM or Practical-RIFE behind `interp_backend` with a weight download script — only after MASt3R path is usable.
+5. (Stretch) FILM or Practical-RIFE behind `interp_backend` with a weight download script — only after MASt3R path is usable. Until then: keep midframe ENU from `lerp_pose` only — [anti-ghost / FILM densify notes](docs/correct-geometry-ghost-duplicates.md).
 
 ### Success criteria
 
@@ -156,7 +156,7 @@ After the capture-budget PR:
 | Satellite | Good | Esri ortho, no key |
 | 3DBAG + edge snap | Strong (NL) | Best align signal in-repo |
 | Pose graph / seat | Good | Collapse fixes, footprint push |
-| Interpolate | Baseline only | DIS flow; FILM/RIFE not wired |
+| Interpolate | Baseline + ENU guard | DIS flow; FILM/RIFE not wired; `assert_interp_frame_poses` + min-baseline skip + densify stride (see `docs/correct-geometry-ghost-duplicates.md`) |
 | Recon flow | Baseline | Coloured PLY; noisy at SV baselines |
 | Facades OBJ | Prototype | Untextured vertical planes ≠ PS1 |
 | Studio | Usable | No PS1 look mode; OBJ not loaded |
