@@ -1,0 +1,230 @@
+"""Command line for ps1-hood."""
+
+from __future__ import annotations
+
+import logging
+import sys
+
+import click
+
+from ps1_hood import __version__
+from ps1_hood.config import Settings
+from ps1_hood.geo import BBox
+from ps1_hood.pipeline import STAGES, run_all  # includes bag + 3DBAG edge snap
+from ps1_hood.project import create_project, default_runs_root, open_project
+from ps1_hood.config import ProjectSpec
+
+log = logging.getLogger("ps1hood")
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+@click.group()
+@click.version_option(__version__)
+def main() -> None:
+    """Rebuild a street-scale 3D neighborhood from Street View + satellite."""
+    _setup_logging()
+
+
+@main.command("init")
+@click.argument("name")
+@click.option("--south", type=float, required=True)
+@click.option("--west", type=float, required=True)
+@click.option("--north", type=float, required=True)
+@click.option("--east", type=float, required=True)
+@click.option(
+    "--source",
+    type=click.Choice(["google_web", "google_js", "google_static", "mapillary"]),
+    default=None,
+)
+@click.option("--spacing", type=float, default=8.0, help="metres between Street View probes")
+@click.option("--steps", type=int, default=8, help="interpolated frames between neighbouring SVs")
+@click.option("--heading-step", type=int, default=45, help="degrees between 360° screengrabs")
+def init_cmd(
+    name: str,
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    source: str | None,
+    spacing: float,
+    steps: int,
+    heading_step: int,
+) -> None:
+    """Create a run from a geographic bounding box."""
+    settings = Settings.from_env()
+    spec = ProjectSpec(
+        name=name,
+        bbox=BBox(south=south, west=west, north=north, east=east),
+        source=source or settings.source,
+        spacing_m=spacing,
+        interp_steps=steps,
+        heading_step=heading_step,
+    )
+    project = create_project(spec)
+    click.echo(f"created {project.root}")
+    click.echo(f"  bbox {spec.bbox.width_m():.0f} × {spec.bbox.height_m():.0f} m")
+    click.echo(f"  source {spec.source}")
+    click.echo("next:  ps1hood run " + name)
+
+
+@main.command("bag-download")
+def bag_download_cmd() -> None:
+    """Show / resume the national 3DBAG GeoPackage zip (~18 GB, queried by bbox)."""
+    from ps1_hood.capture.bag import BAG_ZIP_BYTES, BAG_ZIP_URL, bag_zip_path, zip_status
+
+    path = bag_zip_path()
+    st = zip_status(path)
+    click.echo(f"{st['path']}")
+    click.echo(f"  {st['have']}/{st['expected']} bytes  ({st['percent']}%)")
+    if st["complete"]:
+        click.echo("complete — bbox queries will not unpack the whole country")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    click.echo(f"downloading {BAG_ZIP_URL}")
+    import subprocess
+
+    subprocess.run(
+        [
+            "curl",
+            "-L",
+            "--retry",
+            "8",
+            "--retry-all-errors",
+            "-C",
+            "-",
+            "-o",
+            str(path),
+            BAG_ZIP_URL,
+        ],
+        check=False,
+    )
+    st = zip_status(path)
+    click.echo(f"now {st['percent']}%  complete={st['complete']}")
+    if st["have"] and st["have"] != BAG_ZIP_BYTES:
+        click.echo(f"expected {BAG_ZIP_BYTES} bytes")
+
+
+@main.command("run")
+@click.argument("name")
+@click.option("--from-stage", "from_stage", default="discover", type=click.Choice(STAGES))
+def run_cmd(name: str, from_stage: str) -> None:
+    """Run the pipeline (or resume from a stage)."""
+    settings = Settings.from_env()
+    project = open_project(name)
+    click.echo(f"run {project.root}  from {from_stage}")
+    try:
+        run_all(project, settings, from_stage=from_stage)
+    except Exception as exc:
+        click.echo(f"failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo("done.  ps1hood studio   → open the 3D viewer")
+
+
+@main.command("discover")
+@click.argument("name")
+def discover_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_discover
+
+    stage_discover(open_project(name), Settings.from_env())
+
+
+@main.command("capture")
+@click.argument("name")
+def capture_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_capture
+
+    stage_capture(open_project(name), Settings.from_env())
+
+
+@main.command("crop")
+@click.argument("name")
+def crop_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_crop
+
+    stage_crop(open_project(name), Settings.from_env())
+
+
+@main.command("satellite")
+@click.argument("name")
+def satellite_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_satellite
+
+    stage_satellite(open_project(name))
+
+
+@main.command("align")
+@click.argument("name")
+def align_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_align
+
+    stage_align(open_project(name))
+
+
+@main.command("interpolate")
+@click.argument("name")
+def interpolate_cmd(name: str) -> None:
+    from ps1_hood.pipeline import stage_interpolate
+
+    stage_interpolate(open_project(name))
+
+
+@main.command("reconstruct")
+@click.argument("name")
+@click.option(
+    "--backend",
+    type=click.Choice(["flow", "colmap", "mast3r", "export"]),
+    default=None,
+)
+def reconstruct_cmd(name: str, backend: str | None) -> None:
+    from ps1_hood.pipeline import stage_reconstruct
+
+    project = open_project(name)
+    if backend:
+        spec = project.load_spec()
+        spec.recon_backend = backend
+        project.save_spec(spec)
+    stage_reconstruct(project)
+
+
+@main.command("studio")
+@click.option("--host", default="127.0.0.1")
+@click.option("--port", default=8765, type=int)
+def studio_cmd(host: str, port: int) -> None:
+    """Leaflet bbox picker + Three.js point-cloud viewer."""
+    from ps1_hood.studio.app import serve
+
+    click.echo(f"studio  http://{host}:{port}")
+    serve(host, port)
+
+
+@main.command("setup-browser")
+def setup_browser_cmd() -> None:
+    """Download the bundled Chromium that screengrabs the 360 panos."""
+    import subprocess
+
+    click.echo("installing Playwright Chromium…")
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    click.echo("done. capture will drive this browser, not your desktop Chrome.")
+
+
+@main.command("list")
+def list_cmd() -> None:
+    root = default_runs_root()
+    if not root.is_dir():
+        click.echo("no runs yet")
+        return
+    for child in sorted(root.iterdir()):
+        if (child / "project.yaml").is_file():
+            click.echo(child.name)
+
+
+def main_argv(argv: list[str] | None = None) -> None:
+    sys.argv = ["ps1hood", *(argv or sys.argv[1:])]
+    main()

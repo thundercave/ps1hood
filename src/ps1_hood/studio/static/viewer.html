@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>ps1-hood viewer</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0b0c; color: #eee; font: 13px/1.4 sans-serif; overflow: hidden; }
+    #hud { position: absolute; left: 12px; top: 12px; z-index: 2; background: rgba(12,12,14,.72); padding: 10px 12px; border: 1px solid #333; }
+    a { color: #e8c36a; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="hud">loading…</div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+
+    const params = new URLSearchParams(location.search);
+    const run = params.get('run');
+    const hud = document.getElementById('hud');
+    if (!run) { hud.textContent = 'missing ?run='; throw new Error('run'); }
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101114);
+    scene.fog = new THREE.Fog(0x101114, 80, 260);
+    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 800);
+    camera.position.set(18, 28, 24);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const sun = new THREE.DirectionalLight(0xffe6c0, 0.9);
+    sun.position.set(20, 40, 10);
+    scene.add(sun);
+    scene.add(new THREE.GridHelper(120, 40, 0x333333, 0x222222));
+
+    const sceneJson = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/scene')).json();
+    hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
+      + `<br><a href="/">back</a>`;
+
+    // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
+    const to3 = (e, n, u) => new THREE.Vector3(e, u, -n);
+
+    const satUrl = '/api/runs/' + encodeURIComponent(run) + '/satellite.jpg';
+    const tex = new THREE.TextureLoader().load(satUrl);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const bw = sceneJson.bbox;
+    // approximate ground size from cameras if present
+    let minE = Infinity, maxE = -Infinity, minN = Infinity, maxN = -Infinity;
+    for (const c of sceneJson.cameras) {
+      minE = Math.min(minE, c.e); maxE = Math.max(maxE, c.e);
+      minN = Math.min(minN, c.n); maxN = Math.max(maxN, c.n);
+    }
+    if (!isFinite(minE)) { minE = -20; maxE = 20; minN = -20; maxN = 20; }
+    const gw = Math.max(20, maxE - minE + 16);
+    const gh = Math.max(20, maxN - minN + 16);
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(gw, gh),
+      new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.copy(to3((minE+maxE)/2, (minN+maxN)/2, 0));
+    scene.add(ground);
+
+    for (const b of (sceneJson.buildings || [])) {
+      const verts = b.vertices || [];
+      const faces = b.faces || [];
+      const pos = [];
+      for (const f of faces) {
+        const a = verts[f[0]], bb = verts[f[1]], c = verts[f[2]];
+        if (!a || !bb || !c) continue;
+        pos.push(a[0], a[2], -a[1], bb[0], bb[2], -bb[1], c[0], c[2], -c[1]);
+      }
+      if (!pos.length) continue;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.computeVertexNormals();
+      scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+        color: 0x8a6a3c, side: THREE.DoubleSide, transparent: true, opacity: 0.7
+      })));
+    }
+
+    const loader = new THREE.TextureLoader();
+    for (const c of sceneJson.cameras) {
+      const group = new THREE.Group();
+      group.position.copy(to3(c.e, c.n, c.u));
+      group.rotation.order = 'YXZ';
+      group.rotation.y = THREE.MathUtils.degToRad(-c.heading);
+      group.rotation.x = THREE.MathUtils.degToRad(c.pitch || 0);
+      const helper = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 3, 0xe8c36a);
+      group.add(helper);
+      if (c.image) {
+        const rel = c.image.split('/cropped/').pop();
+        const url = '/api/runs/' + encodeURIComponent(run) + '/file?path=' + encodeURIComponent('cropped/' + rel);
+        loader.load(url, (im) => {
+          im.colorSpace = THREE.SRGBColorSpace;
+          const aspect = (im.image.width || 4) / (im.image.height || 3);
+          const plane = new THREE.Mesh(
+            new THREE.PlaneGeometry(2.4 * aspect, 2.4),
+            new THREE.MeshBasicMaterial({ map: im, side: THREE.DoubleSide, transparent: true, opacity: 0.92 })
+          );
+          plane.position.z = -2.2;
+          group.add(plane);
+        });
+      }
+      scene.add(group);
+    }
+
+    try {
+      const geom = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud.ply');
+      geom.computeVertexNormals();
+      // ply is ENU; remap to three
+      const pos = geom.getAttribute('position');
+      for (let i = 0; i < pos.count; i++) {
+        const e = pos.getX(i), n = pos.getY(i), u = pos.getZ(i);
+        pos.setXYZ(i, e, u, -n);
+      }
+      pos.needsUpdate = true;
+      const mat = new THREE.PointsMaterial({ size: 0.08, vertexColors: true });
+      scene.add(new THREE.Points(geom, mat));
+    } catch (err) {
+      hud.innerHTML += '<br>no point cloud yet';
+    }
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+    (function tick() {
+      requestAnimationFrame(tick);
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+  </script>
+</body>
+</html>

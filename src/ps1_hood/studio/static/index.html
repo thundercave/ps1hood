@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>ps1-hood</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+  <style>
+    :root {
+      --bg: #12110f;
+      --panel: #1c1a17;
+      --ink: #ece7dc;
+      --muted: #9a9284;
+      --accent: #e8c36a;
+      --line: #3a342c;
+      --ok: #7dba6a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+      font: 14px/1.45 "IBM Plex Sans", "Segoe UI", sans-serif; }
+    #app { display: grid; grid-template-columns: 300px 1fr 1fr; grid-template-rows: 1fr; height: 100%; }
+    aside { padding: 18px; border-right: 1px solid var(--line); overflow: auto; background: var(--panel); }
+    h1 { font-size: 20px; letter-spacing: 0.08em; text-transform: lowercase; margin: 0 0 6px; }
+    p.lead { color: var(--muted); margin: 0 0 14px; font-size: 13px; }
+    label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 10px 0 4px; }
+    input, select { width: 100%; background: #0e0d0b; color: var(--ink); border: 1px solid var(--line); padding: 8px; border-radius: 4px; }
+    button { width: 100%; margin-top: 12px; background: var(--accent); color: #1a1408; border: 0; padding: 10px; font-weight: 700; cursor: pointer; border-radius: 4px; }
+    button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    #map { height: 100%; background: #222; border-right: 1px solid var(--line); }
+    #view3d { position: relative; background: #0b0b0c; }
+    #view3d canvas { display: block; }
+    .hint { font-size: 12px; color: var(--muted); }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 14px 0 8px; }
+    .stat { background: #0e0d0b; border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+    .stat b { display: block; font-size: 22px; color: var(--accent); }
+    .stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .bar { height: 10px; background: #0e0d0b; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin: 8px 0; }
+    .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #c4a056, var(--accent)); transition: width .35s; }
+    .pct { font-variant-numeric: tabular-nums; color: var(--accent); }
+    #stage { color: var(--ok); font-size: 12px; min-height: 1.4em; }
+    #log { white-space: pre-wrap; font: 11px/1.4 ui-monospace, monospace; color: var(--muted); margin-top: 10px; max-height: 140px; overflow: auto; }
+    .run { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+    .run a { color: var(--accent); }
+    #hud3d { position: absolute; left: 10px; top: 10px; z-index: 2; font-size: 12px; color: var(--muted); pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside>
+      <h1>ps1-hood</h1>
+      <p class="lead">Draw a block. Street View capture runs headless in bundled Chromium — you only see the queue and the 3D snap to 3DBAG.</p>
+      <label>Run name</label>
+      <input id="name" value="block-01"/>
+      <label>Source</label>
+      <select id="source">
+        <option value="google_web" selected>Chrome Street View screengrab (no key)</option>
+        <option value="google_js">Official JS embed (needs API key)</option>
+        <option value="google_static">Street View Static API (needs key)</option>
+        <option value="mapillary">Mapillary</option>
+      </select>
+      <label>Spacing (metres)</label>
+      <input id="spacing" type="number" value="10" min="4" max="20"/>
+      <p class="hint">Start small. GPS is the prior; 3DBAG edges pull each Street View to ~10 cm.</p>
+      <button id="create">save bbox</button>
+      <button class="ghost" id="go">run pipeline</button>
+      <div class="stats">
+        <div class="stat"><b id="queued">0</b><span>queued</span></div>
+        <div class="stat"><b id="captured">0</b><span>captured</span></div>
+        <div class="stat"><b id="skipped">0</b><span>skipped</span></div>
+        <div class="stat"><b id="bag">0</b><span>3DBAG</span></div>
+      </div>
+      <div>progress <span class="pct" id="pct">0%</span></div>
+      <div class="bar"><i id="fill"></i></div>
+      <div id="stage">idle</div>
+      <div id="log"></div>
+      <div class="run" id="runs"></div>
+    </aside>
+    <div id="map"></div>
+    <div id="view3d"><div id="hud3d">3DBAG + Street Views</div></div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script type="importmap">
+  { "imports": {
+      "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const map = L.map('map').setView([52.0907, 5.1214], 16);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OSM &copy; CARTO', maxZoom: 20
+    }).addTo(map);
+    const drawn = new L.FeatureGroup().addTo(map);
+    map.addControl(new L.Control.Draw({
+      draw: { polygon: false, marker: false, circle: false, polyline: false, circlemarker: false,
+              rectangle: { shapeOptions: { color: '#e8c36a' } } },
+      edit: { featureGroup: drawn }
+    }));
+    let bbox = null;
+    map.on(L.Draw.Event.CREATED, (e) => {
+      drawn.clearLayers();
+      drawn.addLayer(e.layer);
+      const b = e.layer.getBounds();
+      bbox = { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() };
+    });
+
+    const host = document.getElementById('view3d');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101114);
+    const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 600);
+    camera.position.set(24, 32, 28);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    host.appendChild(renderer.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const sun = new THREE.DirectionalLight(0xffe6c0, 0.85);
+    sun.position.set(20, 40, 10);
+    scene.add(sun);
+    scene.add(new THREE.GridHelper(80, 20, 0x333, 0x222));
+    const bagGroup = new THREE.Group();
+    const camGroup = new THREE.Group();
+    scene.add(bagGroup);
+    scene.add(camGroup);
+    const texLoader = new THREE.TextureLoader();
+    const to3 = (e, n, u) => new THREE.Vector3(e, u, -n);
+
+    function resize() {
+      const w = host.clientWidth, h = host.clientHeight;
+      camera.aspect = w / Math.max(1, h);
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    addEventListener('resize', resize);
+    resize();
+    (function tick() {
+      requestAnimationFrame(tick);
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+
+    function rebuildLive(live) {
+      bagGroup.clear();
+      camGroup.clear();
+      const buildings = live.buildings || [];
+      const cameras = live.cameras || [];
+      document.getElementById('hud3d').textContent =
+        `3DBAG ${buildings.length}  ·  SV ${cameras.length}`;
+      for (const b of buildings) {
+        const verts = b.vertices || [];
+        const faces = b.faces || [];
+        if (!faces.length) continue;
+        const geo = new THREE.BufferGeometry();
+        const pos = [];
+        const col = [];
+        const tone = b.dak_type === 'slanted' ? [0.72, 0.55, 0.38] : [0.62, 0.62, 0.58];
+        for (const f of faces) {
+          const a = verts[f[0]], bb = verts[f[1]], c = verts[f[2]];
+          if (!a || !bb || !c) continue;
+          pos.push(a[0], a[2], -a[1], bb[0], bb[2], -bb[1], c[0], c[2], -c[1]);
+          col.push(...tone, ...tone, ...tone);
+        }
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+        geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+        geo.computeVertexNormals();
+        bagGroup.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+          vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.78
+        })));
+        bagGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+          new THREE.LineBasicMaterial({ color: 0xe8c36a, opacity: 0.55, transparent: true })));
+      }
+      for (const c of cameras) {
+        if (c.e == null) continue;
+        const g = new THREE.Group();
+        g.position.copy(to3(c.e, c.n, c.u || 2.5));
+        g.rotation.order = 'YXZ';
+        g.rotation.y = THREE.MathUtils.degToRad(-(c.heading || 0));
+        g.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 3, 0x7dba6a));
+        if (c.image) {
+          const url = '/api/runs/' + encodeURIComponent(currentRun) + '/file?path=' + encodeURIComponent(c.image);
+          texLoader.load(url, (im) => {
+            im.colorSpace = THREE.SRGBColorSpace;
+            const aspect = (im.image.width || 4) / (im.image.height || 3);
+            const plane = new THREE.Mesh(
+              new THREE.PlaneGeometry(3.2 * aspect, 3.2),
+              new THREE.MeshBasicMaterial({ map: im, side: THREE.DoubleSide, transparent: true, opacity: 0.92 })
+            );
+            plane.position.z = -1.8;
+            g.add(plane);
+          }, undefined, () => {});
+        }
+        camGroup.add(g);
+      }
+    }
+
+    let currentRun = document.getElementById('name').value;
+    let lastLive = -1;
+    let lastKey = '';
+
+    function frameScene() {
+      const box = new THREE.Box3();
+      if (bagGroup.children.length) box.expandByObject(bagGroup);
+      if (camGroup.children.length) box.expandByObject(camGroup);
+      if (box.isEmpty()) return;
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const radius = Math.max(size.x, size.y, size.z, 8) * 0.7;
+      controls.target.copy(center);
+      camera.position.set(center.x + radius, center.y + radius * 0.85, center.z + radius);
+      camera.near = 0.05;
+      camera.far = Math.max(600, radius * 30);
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+
+    async function refreshRuns() {
+      const runs = await (await fetch('/api/runs')).json();
+      const el = document.getElementById('runs');
+      el.innerHTML = '<strong>runs</strong>';
+      for (const r of runs) {
+        const a = document.createElement('div');
+        a.innerHTML = `<p><a href="#" data-run="${r.name}">${r.name}</a>` +
+          (r.has_live || r.has_scene ? ` · <a href="/viewer?run=${encodeURIComponent(r.name)}">viewer</a>` : '') +
+          `</p>`;
+        el.appendChild(a);
+      }
+    }
+
+    document.getElementById('runs').addEventListener('click', (ev) => {
+      const t = ev.target.closest('[data-run]');
+      if (!t) return;
+      ev.preventDefault();
+      selectRun(t.getAttribute('data-run'));
+    });
+
+    function paintStatus(st) {
+      document.getElementById('queued').textContent = st.queued || 0;
+      document.getElementById('captured').textContent = st.captured || 0;
+      document.getElementById('skipped').textContent = st.skipped || 0;
+      document.getElementById('bag').textContent = st.bag_buildings || 0;
+      const pct = Number(st.percent || 0);
+      document.getElementById('pct').textContent = pct.toFixed(0) + '%';
+      document.getElementById('fill').style.width = pct + '%';
+      document.getElementById('stage').textContent = (st.stage || 'idle') + (st.current ? ' · ' + st.current : '');
+      const log = (st.log || []).slice(-12).map(x => x.stage + ': ' + x.message).join('\n');
+      if (log) document.getElementById('log').textContent = log;
+    }
+
+    async function pullLive() {
+      if (!currentRun) return;
+      try {
+        const live = await (await fetch('/api/runs/' + encodeURIComponent(currentRun) + '/live?t=' + Date.now())).json();
+        rebuildLive(live);
+        const buildings = live.buildings || [];
+        const cameras = live.cameras || [];
+        const key = buildings.length + ':' + cameras.length;
+        if (key !== lastKey && (buildings.length || cameras.length)) {
+          lastKey = key;
+          frameScene();
+        }
+        if (buildings.length && !document.getElementById('bag').textContent) {
+          document.getElementById('bag').textContent = buildings.length;
+        }
+      } catch (e) {}
+    }
+
+    async function pullStatus() {
+      if (!currentRun) return;
+      try {
+        const st = await (await fetch('/api/runs/' + encodeURIComponent(currentRun) + '/status')).json();
+        paintStatus(st);
+        if (st.live_version !== lastLive) {
+          lastLive = st.live_version;
+          await pullLive();
+        }
+      } catch (e) {}
+    }
+
+    function selectRun(name) {
+      currentRun = name;
+      document.getElementById('name').value = name;
+      lastLive = -1;
+      lastKey = '';
+      pullStatus();
+    }
+
+    document.getElementById('create').onclick = async () => {
+      if (!bbox) { alert('draw a rectangle first'); return; }
+      const body = {
+        name: document.getElementById('name').value,
+        bbox,
+        source: document.getElementById('source').value,
+        spacing_m: Number(document.getElementById('spacing').value)
+      };
+      const data = await (await fetch('/api/runs', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+      })).json();
+      currentRun = data.name;
+      document.getElementById('log').textContent = JSON.stringify(data, null, 2);
+      lastLive = -1;
+      refreshRuns();
+      pullStatus();
+    };
+
+    document.getElementById('go').onclick = async () => {
+      currentRun = document.getElementById('name').value;
+      lastLive = -1;
+      lastKey = '';
+      const res = await fetch('/api/runs/' + encodeURIComponent(currentRun) + '/run', { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        document.getElementById('stage').textContent = body.error || ('run failed ' + res.status);
+        return;
+      }
+      document.getElementById('stage').textContent = 'starting';
+    };
+
+    refreshRuns();
+    pullStatus();
+    setInterval(pullStatus, 700);
+    setInterval(refreshRuns, 8000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+.venv/
+.python-version
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+runs/
+data/
+# 3DBAG national dump is ~18 GB — never commit it
+data/**
+*.ply
+*.mp4
+*.avi
+.DS_Store
+uv.lock
+dist/
+build/
+playwright-report/
