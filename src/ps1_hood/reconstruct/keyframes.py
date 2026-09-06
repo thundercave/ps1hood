@@ -82,7 +82,7 @@ def load_keyframes(
 
 def _camera_to_frame(cam: dict[str, Any]) -> dict[str, Any]:
     """Shape a camera like an interpolate frame dict."""
-    return {
+    out: dict[str, Any] = {
         "path": cam["shot_path"],
         "e": float(cam["e"]),
         "n": float(cam["n"]),
@@ -92,4 +92,11 @@ def _camera_to_frame(cam: dict[str, Any]) -> dict[str, Any]:
         "fov": float(cam.get("fov") or 90.0),
         "mask": cam.get("mask"),
         "pano_id": cam.get("pano_id"),
+        "interpolated": False,
     }
+    # PINHOLE K needs size — cameras.json usually has them after crop/align.
+    if cam.get("width") is not None:
+        out["width"] = int(cam["width"])
+    if cam.get("height") is not None:
+        out["height"] = int(cam["height"])
+    return out

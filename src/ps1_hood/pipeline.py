@@ -33,7 +33,7 @@ from ps1_hood.capture.satellite import Ortho, fetch_satellite
 from ps1_hood.config import Settings
 from ps1_hood.geo import BBox, LocalFrame
 from ps1_hood.interpolate.flow import interpolate_track
-from ps1_hood.interpolate.sequence import assert_interp_frame_poses, select_densify_frames
+from ps1_hood.interpolate.sequence import assert_interp_frame_poses, select_densify_frames, select_posed_sparse_frames
 from ps1_hood.interpolate.video import write_video
 from ps1_hood.overpass import fetch_roads
 from ps1_hood.progress import emit as _emit
@@ -413,6 +413,18 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
     if backend in {"colmap", "colmap_posed", "sift", "mast3r", "export"}:
         frames = keyframes
         source = "keyframes"
+        # Grow posed sparse/tracks: orbit keyframes + subsampled FILM midframes
+        # that already carry lerp_pose ENU (assert on full FILM rate first).
+        if backend in {"colmap_posed", "sift", "export"} and interp_frames:
+            frames = select_posed_sparse_frames(keyframes, interp_frames)
+            n_mids = sum(1 for f in frames if f.get("interpolated"))
+            source = "keyframes+midframes" if n_mids else "keyframes"
+            log.info(
+                "posed sparse frames: %s keyframes + %s strided midframes → %s views",
+                len(keyframes),
+                n_mids,
+                len(frames),
+            )
         if len(frames) < 2:
             raise RuntimeError(
                 f"recon backend {backend} needs ≥2 aligned keyframes "

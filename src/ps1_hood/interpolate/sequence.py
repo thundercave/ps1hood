@@ -163,3 +163,58 @@ def select_densify_frames(
             out.append(frame)
         mid_i += 1
     return out
+
+
+def _enu_xy_dist_m(a: dict[str, Any], b: dict[str, Any]) -> float:
+    de = float(a["e"]) - float(b["e"])
+    dn = float(a["n"]) - float(b["n"])
+    return math.hypot(de, dn)
+
+
+def select_posed_sparse_frames(
+    keyframes: list[dict[str, Any]],
+    interp_frames: list[dict[str, Any]] | None = None,
+    *,
+    midframe_stride: int = DENSIFY_MIDFRAME_STRIDE,
+    min_midframe_baseline_m: float = MIN_LERP_BASELINE_M,
+) -> list[dict[str, Any]]:
+    """Orbit keyframes + every Nth posed FILM midframe for denser COLMAP tracks.
+
+    Real SV crops / orbit headings stay the backbone. Subsampled midframes that
+    already carry ``lerp_pose`` ENU (+ fov/width/height) are appended so landmarks
+    see more cameras across baselines — feeding OpenMVS neighbor selection.
+
+    - Asserts ENU + PINHOLE size on the **full** FILM-rate ``interp_frames`` first.
+    - Midframes closer than ``min_midframe_baseline_m`` to an already-selected
+      camera (keyframe or prior mid) are skipped (near-dupe cams drown MVS).
+    - Without interp frames, returns ``keyframes`` unchanged.
+    """
+    if not keyframes and not interp_frames:
+        return []
+    if not interp_frames:
+        return list(keyframes)
+
+    assert_interp_frame_poses(interp_frames)
+    if midframe_stride < 1:
+        raise ValueError(f"midframe_stride must be >= 1, got {midframe_stride}")
+    if min_midframe_baseline_m < 0:
+        raise ValueError(
+            f"min_midframe_baseline_m must be >= 0, got {min_midframe_baseline_m}"
+        )
+
+    out: list[dict[str, Any]] = list(keyframes)
+    mid_i = 0
+    for frame in interp_frames:
+        if not frame.get("interpolated", False):
+            continue
+        keep = mid_i % midframe_stride == 0
+        mid_i += 1
+        if not keep:
+            continue
+        # Skip near-dupe of any already-selected camera (keyframe or mid).
+        if any(
+            _enu_xy_dist_m(frame, prev) < min_midframe_baseline_m for prev in out
+        ):
+            continue
+        out.append(frame)
+    return out
