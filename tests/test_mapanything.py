@@ -328,3 +328,25 @@ def test_cli_densify_mapanything_no_cuda(
     )
     assert result.exit_code == 1
     assert "CUDA" in result.output or "densify failed" in result.output
+
+def test_default_amp_dtype_hip_fp16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When torch.version.hip is set (ROCm), default AMP is fp16 not bf16."""
+    import sys
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip="6.3.42134")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    assert ma.default_amp_dtype() == "fp16"
+
+
+def test_default_amp_dtype_cuda_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NVIDIA CUDA builds (no HIP) keep bf16 as the MapAnything default."""
+    import sys
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip=None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    assert ma.default_amp_dtype() == "bf16"
+

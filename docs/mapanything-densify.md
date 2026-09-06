@@ -101,6 +101,7 @@ Infer flags (also stored under `manifest.infer_flags`):
 | `ignore_depth_inputs` | True (we do not feed depth) |
 | `is_metric_scale` | True on every view |
 | `minibatch_size` | 1 (VRAM-safe) |
+| `amp_dtype` | **`bf16` on CUDA**; **`fp16` when `torch.version.hip` is set** (ROCm / RDNA2 — see [mapanything-rocm-gfx1030.md](mapanything-rocm-gfx1030.md)) |
 | `--ignore_pose_inputs` (CLI) | **never** |
 
 Fuse masked `pts3d` → `mapanything/cloud.ply`, copy to
@@ -135,7 +136,7 @@ uv run pytest -q tests/test_mapanything.py
 ```
 
 Mocks cover bundle shape, cam2world lock, COLMAP demo argv (no ignore flag),
-and CUDA fail-loud — no GPU required.
+CUDA fail-loud, and HIP → `fp16` AMP default — no GPU required.
 
 ---
 
