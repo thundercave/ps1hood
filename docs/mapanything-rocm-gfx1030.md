@@ -31,7 +31,7 @@ gfx1030 **is** listed in newer AMD multi-arch PyTorch ROCm wheels (`device-gfx10
 
 | Issue | What to do |
 |-------|------------|
-| **bf16 on RDNA2** | Recipe uses `amp_dtype="bf16"`. If NaNs/slow/unsupported → `amp_dtype="fp16"` or `use_amp=False` for smoke. |
+| **bf16 on RDNA2** | Infer uses `amp_dtype="fp16"` when `torch.version.hip` is set (`amp_dtype_for_device`); NVIDIA CUDA stays `bf16`. |
 | **Flash-Attention / xFormers** | Official FA2 CK backend targets MI200/300; RDNA needs **Triton** FA (`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`) or **disable** flash-attn and use PyTorch SDPA. First failure mode on consumer AMD is often attention kernels. |
 | **VRAM 16 GB** | `memory_efficient_inference=True`, `minibatch_size=1`, `--stride 4+`, short smoke bbox only. Don’t feed full FILM rate. |
 | **`ignore_pose_inputs=False`** | Keep locked ENU; unchanged on ROCm. |

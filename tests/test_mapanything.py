@@ -139,6 +139,22 @@ def test_colmap_demo_argv_never_ignores_poses(tmp_path: Path) -> None:
     assert "--ignore_pose_inputs" not in argv
 
 
+def test_amp_dtype_fp16_on_hip() -> None:
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip="7.16.26354")  # type: ignore[attr-defined]
+    assert ma.amp_dtype_for_device(fake) == "fp16"
+
+
+def test_amp_dtype_bf16_without_hip() -> None:
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip=None)  # type: ignore[attr-defined]
+    assert ma.amp_dtype_for_device(fake) == "bf16"
+
+
 def test_require_cuda_no_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     import sys
     import types

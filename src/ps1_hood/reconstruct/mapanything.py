@@ -362,6 +362,18 @@ def which_mapanything() -> dict[str, Any] | None:
     return info
 
 
+def amp_dtype_for_device(torch_mod: Any | None = None) -> str:
+    """AMP dtype for MapAnything infer.
+
+    NVIDIA CUDA keeps upstream ``bf16``. ROCm/HIP (RDNA2 gfx1030) uses
+    ``fp16`` — bf16 and FA2 CK often break on that stack.
+    """
+    if torch_mod is None:
+        import torch as torch_mod
+    hip = bool(getattr(getattr(torch_mod, "version", None), "hip", None))
+    return "fp16" if hip else "bf16"
+
+
 def require_cuda_for_densify() -> None:
     """Fail loud when densify is requested without CUDA."""
     try:
@@ -693,7 +705,7 @@ def run_mapanything_on_bundle(
         memory_efficient_inference=True,
         minibatch_size=int(minibatch_size),
         use_amp=True,
-        amp_dtype="bf16",
+        amp_dtype=amp_dtype_for_device(torch),
         apply_mask=True,
         mask_edges=True,
         apply_confidence_mask=True,
