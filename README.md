@@ -1,4 +1,6 @@
-# ps1-hood
+# ps1hood
+
+A hobby project to recreate the world in PS1 graphics.
 
 Rebuild a street-scale 3D neighborhood from **Street View** and **satellite** imagery.
 
