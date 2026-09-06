@@ -447,8 +447,21 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
                 local_frame=frame,
             )
             meta["facades"] = fac
+            if int(fac.get("planes") or 0) == 0:
+                log.error(
+                    "facade pass: 0 photo-consistent planes (source=%s) — "
+                    "Studio shows ground only, not RANSAC invention",
+                    fac.get("source"),
+                )
+            else:
+                log.info(
+                    "facade pass: %s photo-consistent planes (%s textured, mean ZNCC=%s)",
+                    fac.get("planes"),
+                    fac.get("textured"),
+                    fac.get("mean_zncc"),
+                )
         except RuntimeError as exc:
-            log.warning("facade pass skipped: %s", exc)
+            log.error("facade pass failed loud: %s", exc)
 
     if backend == "export":
         export_colmap_images(frames, project.recon_dir / "colmap")
