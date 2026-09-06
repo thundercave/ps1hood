@@ -102,7 +102,8 @@ def _plane_quad(pl: dict) -> list[tuple[float, float, float]]:
     c = np.array(pl["min"][:2]) * 0.5 + np.array(pl["max"][:2]) * 0.5
     c = c - (c @ np.array([nx, ny]) - d) * np.array([nx, ny])
     half = 0.5 * np.linalg.norm(np.array(pl["max"][:2]) - np.array(pl["min"][:2]))
-    z0 = max(0.0, float(pl["min"][2]))
+    gz = float(pl.get("ground_z", 0.0))
+    z0 = max(gz, float(pl["min"][2]))
     z1 = max(z0 + 2.0, float(pl["max"][2]))
     p1 = (float(c[0] - tx * half), float(c[1] - ty * half), z0)
     p2 = (float(c[0] + tx * half), float(c[1] + ty * half), z0)
@@ -283,6 +284,37 @@ def _ground_satellite_texture(
     return bool(cv2.imwrite(str(dest), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 88]))
 
 
+def _voxel_downsample_xyz(xyz: np.ndarray, voxel: float = 0.20) -> np.ndarray:
+    if len(xyz) == 0:
+        return xyz
+    keys = np.floor(xyz / voxel).astype(np.int64)
+    view = np.ascontiguousarray(keys).view([("", keys.dtype)] * 3).ravel()
+    _, idx = np.unique(view, return_index=True)
+    return xyz[idx]
+
+
+def _fit_ground_z(xyz: np.ndarray) -> float:
+    """Photo-seeded ground height: robust low percentile of near-horizontal band."""
+    if len(xyz) < 20:
+        return 0.0
+    z = xyz[:, 2]
+    lo, hi = np.percentile(z, [5, 40])
+    band = xyz[(z >= lo - 0.5) & (z <= hi + 0.5)]
+    if len(band) < 10:
+        return float(np.percentile(z, 10))
+    # RANSAC horizontal plane z = const
+    rng = np.random.default_rng(1)
+    best_z, best_n = float(np.median(band[:, 2])), 0
+    for _ in range(40):
+        z0 = float(band[int(rng.integers(0, len(band))), 2])
+        inl = np.abs(band[:, 2] - z0) < 0.35
+        n = int(inl.sum())
+        if n > best_n:
+            best_n = n
+            best_z = float(np.median(band[inl, 2]))
+    return best_z
+
+
 def extract_facades(
     ply_path: Path,
     dest_obj: Path,
@@ -291,24 +323,33 @@ def extract_facades(
     frames: list[dict[str, Any]] | None = None,
     satellite: dict[str, Any] | None = None,
     local_frame: LocalFrame | None = None,
+    min_points: int = 80,
 ) -> dict:
-    """RANSAC vertical planes, optionally textured from the most frontal camera."""
+    """RANSAC vertical planes seeded by the *photo* cloud (not OSM/BAG).
+
+    Voxel-downsample → cluster vertical planes + ground from photo extents →
+    texture with existing SV warp. Cadastral shells are not used.
+    """
     xyz = _read_ply_xyz(ply_path)
-    if len(xyz) < 200:
-        raise RuntimeError("not enough points for facade extraction")
+    if len(xyz) < min_points:
+        raise RuntimeError(
+            f"not enough photo points for facade extraction ({len(xyz)} < {min_points})"
+        )
+    xyz = _voxel_downsample_xyz(xyz, 0.20)
+    ground_z = _fit_ground_z(xyz)
     remaining = xyz.copy()
     planes: list[dict] = []
     rng = np.random.default_rng(0)
+    min_inliers = max(25, min(60, len(xyz) // 20))
     for _ in range(n_planes):
-        if len(remaining) < 80:
+        if len(remaining) < max(40, min_inliers):
             break
         best_inliers = None
         best_n = None
         best_d = None
-        for _try in range(80):
+        for _try in range(120):
             i0, i1 = rng.integers(0, len(remaining), size=2)
             p0, p1 = remaining[i0], remaining[i1]
-            # force vertical: normal in XY
             v = p1[:2] - p0[:2]
             if np.linalg.norm(v) < 0.2:
                 continue
@@ -316,14 +357,17 @@ def extract_facades(
             nrm /= np.linalg.norm(nrm)
             d = float(nrm @ p0[:2])
             dist = np.abs(remaining[:, :2] @ nrm - d)
-            inl = dist < 0.45
+            # Prefer facade-height points (above ground)
+            height_ok = remaining[:, 2] > (ground_z + 0.4)
+            inl = (dist < 0.50) & height_ok
             if best_inliers is None or int(inl.sum()) > int(best_inliers.sum()):
                 best_inliers = inl
                 best_n = nrm
                 best_d = d
-        if best_inliers is None or int(best_inliers.sum()) < 60:
+        if best_inliers is None or int(best_inliers.sum()) < min_inliers:
             break
         pts = remaining[best_inliers]
+        # Quads from photo point extents (not cadastral footprints)
         planes.append(
             {
                 "nx": float(best_n[0]),
@@ -332,6 +376,7 @@ def extract_facades(
                 "min": pts.min(axis=0).tolist(),
                 "max": pts.max(axis=0).tolist(),
                 "count": int(len(pts)),
+                "ground_z": ground_z,
             }
         )
         remaining = remaining[~best_inliers]
@@ -385,6 +430,9 @@ def extract_facades(
         "planes": len(planes),
         "textured": textured,
         "ground_textured": has_ground_tex,
+        "source": "photo_ransac",
+        "ground_z": ground_z,
+        "points_used": int(len(xyz)),
     }
 
 
@@ -412,11 +460,15 @@ def _write_obj(
 ) -> None:
     # ground quad from point AABB
     mn, mx = xyz.min(axis=0), xyz.max(axis=0)
+    gz = float(min(0.0, mn[2])) if len(xyz) else 0.0
+    # Prefer near-ground band from photo cloud
+    if len(xyz) >= 20:
+        gz = float(np.percentile(xyz[:, 2], 8))
     verts: list[tuple[float, float, float]] = [
-        (mn[0], mn[1], 0.0),
-        (mx[0], mn[1], 0.0),
-        (mx[0], mx[1], 0.0),
-        (mn[0], mx[1], 0.0),
+        (mn[0], mn[1], gz),
+        (mx[0], mn[1], gz),
+        (mx[0], mx[1], gz),
+        (mn[0], mx[1], gz),
     ]
     uvs: list[tuple[float, float]] = [
         (0.0, 0.0),

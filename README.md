@@ -99,10 +99,19 @@ COLMAP is hardened for SV orbits: if the sparse model is missing/`points3D.bin` 
 
 ```bash
 uv run ps1hood reconstruct my-block --backend flow
+# or --backend colmap_posed   known ENU poses → point_triangulator (not mapper)
+# or --backend colmap         prefers colmap_posed when cameras.json exists
+# or --backend sift           OpenCV SIFT stereo on cross-pano pairs
 # or --backend export
-# or --backend colmap   if colmap is installed (often fails to init on SV orbits)
-# or --backend mast3r   optional; needs GPU + naver/mast3r + weights
+# or --backend mast3r         optional; needs GPU + naver/mast3r + weights
 ```
+
+`colmap_posed` seeds `cameras.txt`/`images.txt` from align ENU + FOV PINHOLE,
+remaps IMAGE_IDs to the COLMAP database (colmap#497), matches **cross-pano**
+pairs only (same-center orbit headings are pure rotation), then runs
+`point_triangulator`. On success writes `recon/cloud_photo.ply` as primary.
+If too few points, fails loud and falls back to OpenCV SIFT. Geometry stays
+photo-derived — OSM/BAG shells are align priors only, not Studio hero mesh.
 
 ## Layout of a run
 

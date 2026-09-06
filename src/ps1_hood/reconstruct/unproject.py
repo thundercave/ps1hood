@@ -68,6 +68,148 @@ def _reproj_err(
     return np.linalg.norm(uv - pts_img.T, axis=1)
 
 
+
+def _cross_pano_pairs(frames: list[dict[str, Any]], pair_step: int = 2) -> list[tuple[int, int]]:
+    """Drive-adjacent pairs only — skip same-center orbit mates (pure rotation)."""
+    import math
+
+    def pano_key(f: dict[str, Any]) -> str:
+        if f.get("pano_id"):
+            return str(f["pano_id"])
+        return f"{round(float(f.get('e', 0)), 2)}_{round(float(f.get('n', 0)), 2)}"
+
+    if all("e" in f and "n" in f and "heading" in f for f in frames):
+        pairs = select_stereo_pairs(frames)
+    else:
+        pairs = sequential_pairs(len(frames), pair_step=pair_step)
+    out: list[tuple[int, int]] = []
+    for i, j in pairs:
+        if pano_key(frames[i]) == pano_key(frames[j]):
+            continue
+        be = abs(float(frames[i]["e"]) - float(frames[j]["e"]))
+        bn = abs(float(frames[i]["n"]) - float(frames[j]["n"]))
+        if math.hypot(be, bn) < 1.5:
+            continue
+        out.append((i, j))
+    return out
+
+
+def triangulate_sift_frames(
+    frames: list[dict[str, Any]],
+    dest_ply: Path,
+    *,
+    max_points: int = 800_000,
+    max_reproj_px: float = 8.0,
+) -> dict[str, Any]:
+    """OpenCV SIFT stereo on cross-pano known-pose pairs (COLMAP-thin fallback)."""
+    if len(frames) < 2:
+        raise RuntimeError("need ≥2 frames for SIFT stereo")
+    sample = cv2.imread(frames[0]["path"], cv2.IMREAD_COLOR)
+    if sample is None:
+        raise RuntimeError("could not read first frame")
+    h, w = sample.shape[:2]
+    pairs = _cross_pano_pairs(frames)
+    if not pairs:
+        raise RuntimeError("no cross-pano pairs for SIFT stereo")
+
+    sift = cv2.SIFT_create(nfeatures=4000)
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    zs: list[np.ndarray] = []
+    cs: list[np.ndarray] = []
+    total = 0
+    used_pairs = 0
+    for i, j in pairs:
+        a, b = frames[i], frames[j]
+        ia = cv2.imread(a["path"], cv2.IMREAD_COLOR)
+        ib = cv2.imread(b["path"], cv2.IMREAD_COLOR)
+        if ia is None or ib is None:
+            continue
+        if ia.shape[:2] != (h, w):
+            ia = cv2.resize(ia, (w, h))
+        if ib.shape[:2] != (h, w):
+            ib = cv2.resize(ib, (w, h))
+        ga = cv2.cvtColor(ia, cv2.COLOR_BGR2GRAY)
+        gb = cv2.cvtColor(ib, cv2.COLOR_BGR2GRAY)
+        kpa, desa = sift.detectAndCompute(ga, None)
+        kpb, desb = sift.detectAndCompute(gb, None)
+        if desa is None or desb is None or len(kpa) < 30 or len(kpb) < 30:
+            continue
+        knn = bf.knnMatch(desa, desb, k=2)
+        good = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+        if len(good) < 40:
+            continue
+        pts1 = np.array([kpa[m.queryIdx].pt for m in good], dtype=np.float64).T
+        pts2 = np.array([kpb[m.trainIdx].pt for m in good], dtype=np.float64).T
+        ma = _load_mask(a.get("mask"), h, w)
+        mb = _load_mask(b.get("mask"), h, w)
+        keep = np.ones(pts1.shape[1], dtype=bool)
+        if ma is not None:
+            xi = np.clip(np.round(pts1[0]).astype(int), 0, w - 1)
+            yi = np.clip(np.round(pts1[1]).astype(int), 0, h - 1)
+            keep &= ma[yi, xi] == 0
+        if mb is not None:
+            xi = np.clip(np.round(pts2[0]).astype(int), 0, w - 1)
+            yi = np.clip(np.round(pts2[1]).astype(int), 0, h - 1)
+            keep &= mb[yi, xi] == 0
+        if int(keep.sum()) < 30:
+            continue
+        pts1 = pts1[:, keep]
+        pts2 = pts2[:, keep]
+        P1 = _P(a, w, h)
+        P2 = _P(b, w, h)
+        hom = cv2.triangulatePoints(P1, P2, pts1, pts2)
+        pts = (hom[:3] / np.clip(hom[3], 1e-8, None)).T
+        cam_a = _cam_center(a)
+        cam_b = _cam_center(b)
+        fwd_a = _forward(a)
+        fwd_b = _forward(b)
+        vis_a = (pts - cam_a) @ fwd_a
+        vis_b = (pts - cam_b) @ fwd_b
+        z = pts[:, 2]
+        ok = (vis_a > 0.4) & (vis_b > 0.2) & (z > -1.5) & (z < 40.0)
+        dist = np.linalg.norm(pts - cam_a, axis=1)
+        ok &= dist < 60.0
+        err1 = _reproj_err(P1, pts, pts1)
+        err2 = _reproj_err(P2, pts, pts2)
+        ok &= (err1 < max_reproj_px) & (err2 < max_reproj_px)
+        if int(ok.sum()) == 0:
+            continue
+        pts_ok = pts[ok]
+        xi = np.clip(np.round(pts1[0, ok]).astype(int), 0, w - 1)
+        yi = np.clip(np.round(pts1[1, ok]).astype(int), 0, h - 1)
+        colors = ia[yi, xi]
+        xs.append(pts_ok[:, 0])
+        ys.append(pts_ok[:, 1])
+        zs.append(pts_ok[:, 2])
+        cs.append(colors)
+        total += len(pts_ok)
+        used_pairs += 1
+        if total >= max_points:
+            break
+    if not xs:
+        raise RuntimeError("SIFT triangulation produced no points")
+    xyz = np.stack([np.concatenate(xs), np.concatenate(ys), np.concatenate(zs)], axis=1)
+    rgb = np.concatenate(cs, axis=0)
+    xyz, rgb = _voxel_downsample(xyz, rgb, 0.12)
+    dest_ply.parent.mkdir(parents=True, exist_ok=True)
+    write_ply(dest_ply, xyz, rgb)
+    return {
+        "path": str(dest_ply),
+        "points": int(len(xyz)),
+        "pairs": used_pairs,
+        "source": "sift",
+    }
+
+
 def triangulate_frames(
     frames: list[dict[str, Any]],
     dest_ply: Path,
@@ -87,9 +229,10 @@ def triangulate_frames(
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
 
     if use_pose_pairs and all("e" in f and "n" in f and "heading" in f for f in frames):
-        pairs = select_stereo_pairs(frames)
-        # Sequential list order is a poor proxy for SV orbits (many same-spot
-        # headings). Only fall back to it when pose geometry finds nothing.
+        pairs = _cross_pano_pairs(frames, pair_step=pair_step)
+        if not pairs:
+            # last resort: pose pairs without cross-pano filter
+            pairs = select_stereo_pairs(frames)
         if not pairs:
             pairs = sequential_pairs(len(frames), pair_step=pair_step)
     else:

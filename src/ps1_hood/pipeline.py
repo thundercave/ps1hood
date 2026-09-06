@@ -37,12 +37,18 @@ from ps1_hood.interpolate.video import write_video
 from ps1_hood.overpass import fetch_roads
 from ps1_hood.progress import emit as _emit
 from ps1_hood.project import Project
-from ps1_hood.reconstruct.colmap import COLMAP_HINT, export_colmap_images, run_colmap
+from ps1_hood.reconstruct.colmap import (
+    COLMAP_HINT,
+    export_colmap_images,
+    frames_have_known_poses,
+    run_colmap,
+    run_colmap_posed,
+)
+from ps1_hood.reconstruct.unproject import triangulate_frames, triangulate_sift_frames
 from ps1_hood.reconstruct.export import scene_payload, write_scene
 from ps1_hood.reconstruct.facades import extract_facades
 from ps1_hood.reconstruct.keyframes import load_keyframes
 from ps1_hood.reconstruct.mast3r import run_mast3r
-from ps1_hood.reconstruct.unproject import triangulate_frames
 
 log = logging.getLogger(__name__)
 
@@ -393,7 +399,13 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
 
     # Real aligned shots for SfM / MVS; DIS midframes only as flow fallback.
     backend = spec.recon_backend
-    if backend in {"colmap", "mast3r", "export"}:
+    # Prefer known-pose triangulator when poses exist — never retry mapper on SV.
+    if backend == "colmap" and frames_have_known_poses(
+        keyframes if len(keyframes) >= 2 else (interp_frames if interp_frames else [])
+    ):
+        backend = "colmap_posed"
+        log.info("colmap → colmap_posed (known ENU poses present; skip mapper)")
+    if backend in {"colmap", "colmap_posed", "sift", "mast3r", "export"}:
         frames = keyframes
         source = "keyframes"
         if len(frames) < 2:
@@ -424,22 +436,8 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
     _emit(progress, "reconstruct", f"{backend} from {source} ({len(frames)} views)")
 
     cloud = None
-    if backend == "export":
-        export_colmap_images(frames, project.recon_dir / "colmap")
-        _emit(progress, "reconstruct", "exported keyframes for an external reconstructor")
-        _emit(progress, "reconstruct", COLMAP_HINT.strip())
-    elif backend == "colmap":
-        ws = export_colmap_images(frames, project.recon_dir / "colmap")
-        ply_colmap = project.recon_dir / "cloud_colmap.ply"
-        ply_path = run_colmap(ws, ply_out=ply_colmap)
-        # Prefer the COLMAP cloud as cloud.ply when it has real geometry.
-        cloud_ply = project.recon_dir / "cloud.ply"
-        shutil.copy2(ply_path, cloud_ply)
-        cloud = {
-            "path": str(cloud_ply),
-            "source": "colmap",
-            "colmap_ply": str(ply_path),
-        }
+
+    def _facade_pass(cloud_ply: Path, meta: dict) -> None:
         try:
             fac = extract_facades(
                 cloud_ply,
@@ -448,25 +446,63 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
                 satellite=sat,
                 local_frame=frame,
             )
-            cloud["facades"] = fac
+            meta["facades"] = fac
         except RuntimeError as exc:
             log.warning("facade pass skipped: %s", exc)
+
+    if backend == "export":
+        export_colmap_images(frames, project.recon_dir / "colmap")
+        _emit(progress, "reconstruct", "exported keyframes for an external reconstructor")
+        _emit(progress, "reconstruct", COLMAP_HINT.strip())
+    elif backend == "colmap_posed":
+        _emit(progress, "reconstruct", "COLMAP known-pose triangulator (cross-pano)")
+        ws, names = export_colmap_images(frames, project.recon_dir / "colmap")
+        ply_photo = project.recon_dir / "cloud_photo.ply"
+        try:
+            ply_path = run_colmap_posed(ws, frames, names, ply_out=ply_photo)
+            cloud_ply = project.recon_dir / "cloud.ply"
+            shutil.copy2(ply_path, cloud_ply)
+            n_pts = 0
+            for line in cloud_ply.read_text(encoding="ascii", errors="ignore").splitlines():
+                if line.startswith("element vertex"):
+                    n_pts = int(line.split()[-1])
+                    break
+            cloud = {
+                "path": str(cloud_ply),
+                "source": "colmap_posed",
+                "photo_ply": str(ply_path),
+                "points": n_pts,
+            }
+            _facade_pass(cloud_ply, cloud)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("colmap_posed failed (%s) — falling back to OpenCV SIFT stereo", exc)
+            _emit(progress, "reconstruct", f"posed COLMAP failed; OpenCV SIFT fallback: {exc}")
+            cloud = triangulate_sift_frames(frames, project.recon_dir / "cloud.ply")
+            sift_copy = project.recon_dir / "cloud_sift.ply"
+            shutil.copy2(project.recon_dir / "cloud.ply", sift_copy)
+            cloud["sift_ply"] = str(sift_copy)
+            cloud["colmap_posed_error"] = str(exc)
+            _facade_pass(project.recon_dir / "cloud.ply", cloud)
+    elif backend == "colmap":
+        # Explicit classic mapper — only when user asked and poses missing.
+        _emit(progress, "reconstruct", "COLMAP classic mapper (often fails on SV orbits)")
+        ws, _names = export_colmap_images(frames, project.recon_dir / "colmap")
+        ply_colmap = project.recon_dir / "cloud_colmap.ply"
+        ply_path = run_colmap(ws, ply_out=ply_colmap)
+        cloud_ply = project.recon_dir / "cloud.ply"
+        shutil.copy2(ply_path, cloud_ply)
+        cloud = {"path": str(cloud_ply), "source": "colmap", "colmap_ply": str(ply_path)}
+        _facade_pass(cloud_ply, cloud)
+    elif backend == "sift":
+        _emit(progress, "reconstruct", "OpenCV SIFT stereo (cross-pano known poses)")
+        cloud = triangulate_sift_frames(frames, project.recon_dir / "cloud.ply")
+        _facade_pass(project.recon_dir / "cloud.ply", cloud)
     elif backend == "mast3r":
         cloud = run_mast3r(frames, project.recon_dir)
     else:
-        _emit(progress, "reconstruct", "triangulating flow correspondences (known-pose pairs)")
+        _emit(progress, "reconstruct", "triangulating flow correspondences (cross-pano pairs)")
         cloud = triangulate_frames(frames, project.recon_dir / "cloud.ply")
-        try:
-            fac = extract_facades(
-                project.recon_dir / "cloud.ply",
-                project.recon_dir / "facades.obj",
-                frames=frames,
-                satellite=sat,
-                local_frame=frame,
-            )
-            cloud["facades"] = fac
-        except RuntimeError as exc:
-            log.warning("facade pass skipped: %s", exc)
+        _facade_pass(project.recon_dir / "cloud.ply", cloud)
     buildings = []
     if (project.bag_dir / "buildings.json").is_file():
         buildings = project.read_json(project.bag_dir / "buildings.json")

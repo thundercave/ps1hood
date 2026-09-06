@@ -230,7 +230,7 @@ def interpolate_cmd(name: str) -> None:
 @click.argument("name")
 @click.option(
     "--backend",
-    type=click.Choice(["flow", "colmap", "mast3r", "export"]),
+    type=click.Choice(["flow", "colmap", "colmap_posed", "sift", "mast3r", "export"]),
     default=None,
 )
 def reconstruct_cmd(name: str, backend: str | None) -> None:

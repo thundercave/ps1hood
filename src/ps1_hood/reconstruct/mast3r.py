@@ -56,7 +56,7 @@ def run_mast3r(
     if len(frames) < 2:
         raise RuntimeError("MASt3R needs at least 2 keyframes with images")
 
-    input_ws = export_colmap_images(frames, recon_dir / "mast3r_input")
+    input_ws, _names = export_colmap_images(frames, recon_dir / "mast3r_input")
     images_dir = input_ws / "images"
 
     if not _try_import_mast3r():

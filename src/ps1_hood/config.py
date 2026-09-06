@@ -10,7 +10,7 @@ from ps1_hood.geo import BBox
 
 SOURCES = ("google_web", "google_js", "google_static", "mapillary")
 INTERP_BACKENDS = ("flow", "rife", "film")
-RECON_BACKENDS = ("flow", "colmap", "mast3r", "export")
+RECON_BACKENDS = ("flow", "colmap", "colmap_posed", "sift", "mast3r", "export")
 
 
 def load_dotenv(path: Path | None = None) -> None:
