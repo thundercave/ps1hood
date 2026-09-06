@@ -82,7 +82,7 @@ The original build interpolated between Street Views, then fed the resulting vid
 - [FILM](https://github.com/google-research/frame-interpolation) — Google, made for big motion between stills. Most likely what we used or meant to use.
 - [RIFE](https://github.com/hzwer/Practical-RIFE) / Practical-RIFE.
 
-This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of the pipeline runs today. Point `interp_backend` at `film` or `rife` in `project.yaml` once those weights live on the machine; until then it falls back to flow.
+This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of the pipeline runs today. Point `interp_backend` at `film` or `rife` in `project.yaml` once those weights live on the machine; until then it falls back to flow. Midframe poses always come from `lerp_pose` (ENU); see [`docs/correct-geometry-ghost-duplicates.md`](docs/correct-geometry-ghost-duplicates.md) (assert full FILM-rate ENU + PINHOLE size; densify every Nth midframe; skip legs ≪ 2 m).
 
 **Video → point cloud / splat:**
 
