@@ -382,6 +382,23 @@ def require_cuda_for_densify() -> None:
         )
 
 
+def default_amp_dtype() -> str:
+    """AMP dtype for MapAnything ``model.infer``.
+
+    NVIDIA CUDA: ``bf16`` (upstream recipe default).
+    HIP/ROCm (``torch.version.hip`` set, e.g. RX 6900 XT / gfx1030): ``fp16`` —
+    bf16 and flash-attn often break or NaN on RDNA2.
+    """
+    try:
+        import torch
+    except ImportError:
+        return "bf16"
+    hip = getattr(getattr(torch, "version", None), "hip", None)
+    if hip:  # non-empty string on ROCm builds
+        return "fp16"
+    return "bf16"
+
+
 def resolve_posed_colmap(run_root: Path) -> tuple[Path, Path] | None:
     """Locate posed COLMAP sparse + images if present (Path A)."""
     root = run_root.resolve()
@@ -665,6 +682,7 @@ def run_mapanything_on_bundle(
     apache: bool = True,
     device: str | None = None,
     minibatch_size: int = 1,
+    amp_dtype: str | None = None,
 ) -> dict[str, Any]:
     """Path B: load pose-locked bundle → MapAnything infer → PLY."""
     require_cuda_for_densify()
@@ -683,8 +701,15 @@ def run_mapanything_on_bundle(
     if "camera_poses" not in views[0]:
         raise RuntimeError("refusing infer: reference view[0] lacks camera_poses")
 
+    amp = amp_dtype or default_amp_dtype()
     model_id = DEFAULT_HF_MODEL if apache else "facebook/map-anything"
-    log.info("MapAnything: loading %s on %s (%s views)", model_id, device, len(views))
+    log.info(
+        "MapAnything: loading %s on %s (%s views, amp_dtype=%s)",
+        model_id,
+        device,
+        len(views),
+        amp,
+    )
     model = MapAnything.from_pretrained(model_id).to(device)
 
     processed = preprocess_inputs(views)
@@ -693,7 +718,7 @@ def run_mapanything_on_bundle(
         memory_efficient_inference=True,
         minibatch_size=int(minibatch_size),
         use_amp=True,
-        amp_dtype="bf16",
+        amp_dtype=amp,
         apply_mask=True,
         mask_edges=True,
         apply_confidence_mask=True,
@@ -712,6 +737,7 @@ def run_mapanything_on_bundle(
     meta["n_views"] = len(views)
     meta["pose_lock"] = True
     meta["ignore_pose_inputs"] = False
+    meta["amp_dtype"] = amp
     meta["bundle"] = str(bundle_dir)
     meta["manifest_format"] = manifest.get("format")
     return meta

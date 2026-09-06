@@ -31,13 +31,24 @@ gfx1030 **is** listed in newer AMD multi-arch PyTorch ROCm wheels (`device-gfx10
 
 | Issue | What to do |
 |-------|------------|
-| **bf16 on RDNA2** | Recipe uses `amp_dtype="bf16"`. If NaNs/slow/unsupported → `amp_dtype="fp16"` or `use_amp=False` for smoke. |
+| **bf16 on RDNA2** | **Default on HIP/ROCm:** `default_amp_dtype()` → `fp16` when `torch.version.hip` is set (bf16/flash often break on RDNA2). CUDA keeps `bf16`. Override with `amp_dtype=` if needed; `use_amp=False` for last-resort smoke. |
 | **Flash-Attention / xFormers** | Official FA2 CK backend targets MI200/300; RDNA needs **Triton** FA (`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`) or **disable** flash-attn and use PyTorch SDPA. First failure mode on consumer AMD is often attention kernels. |
 | **VRAM 16 GB** | `memory_efficient_inference=True`, `minibatch_size=1`, `--stride 4+`, short smoke bbox only. Don’t feed full FILM rate. |
 | **`ignore_pose_inputs=False`** | Keep locked ENU; unchanged on ROCm. |
 | **Apache weights** | `facebook/map-anything-apache` / `--apache` — same compute, friendlier license. |
 | **First-view poses** | If any view has poses, view0 must too (already in recipe). |
 | **cam2world** | Still OpenCV +X right +Y down +Z forward; ENU C + `camera_rotation_cv` as cam2world. |
+
+---
+
+## AMP default (HIP → fp16)
+
+`ps1_hood.reconstruct.mapanything.default_amp_dtype()`:
+
+- **ROCm / HIP** (`torch.version.hip` truthy, e.g. RX 6900 XT gfx1030): **`fp16`**
+- **NVIDIA CUDA** (and anything without HIP): **`bf16`** (upstream MapAnything recipe)
+
+Path B (`run_mapanything_on_bundle`) uses this unless `amp_dtype=` is passed explicitly. PC Grok validated MapAnything on RX 6900 XT ROCm with fp16.
 
 ---
 
