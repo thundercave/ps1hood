@@ -114,11 +114,15 @@ uv run ps1hood densify my-block --backend openmvs
 AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-ubuntu.md`](docs/gpu-mast3r-ubuntu.md) for an honest ROCm feasibility note, uv setup on Ubuntu, denser `smoke-dense` capture, COLMAP posed fallbacks, and cloud-CUDA MASt3R commands.
 
 `colmap_posed` seeds `cameras.txt`/`images.txt` from align ENU + FOV PINHOLE,
+optionally adds **subsampled FILM midframes** with `lerp_pose` ENU
+(`select_posed_sparse_frames`; min ≥2 m baseline, stride every Nth mid),
 remaps IMAGE_IDs to the COLMAP database (colmap#497), matches **cross-pano**
-pairs only (same-center orbit headings are pure rotation), then runs
-`point_triangulator`. On success writes `recon/cloud_photo.ply` as primary.
-If too few points, fails loud and falls back to OpenCV SIFT. Geometry stays
-photo-derived — OSM/BAG shells are align priors only, not Studio hero mesh.
+pairs only (same-center orbit headings are pure rotation; guided matching on),
+keeps two-view tracks, then runs `point_triangulator`. On success writes
+`recon/cloud_photo.ply` as primary. If too few points, fails loud and falls
+back to OpenCV SIFT. Geometry stays photo-derived — OSM/BAG shells are align
+priors only, not Studio hero mesh. Thin covisibility → OpenMVS empty densify:
+see [`docs/openmvs-denser-sparse.md`](docs/openmvs-denser-sparse.md).
 
 **Optional OpenMVS densify** is AGPL-3.0; the binary is **not** redistributed in this
 MIT repo. Install `InterfaceCOLMAP` + `DensifyPointCloud` yourself, then

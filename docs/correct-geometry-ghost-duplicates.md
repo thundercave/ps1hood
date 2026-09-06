@@ -51,12 +51,13 @@ Ghosts happen when a **second** recon (Luma / Postshot / MASt3R free poses / per
 ## Ranked next steps (stack-native)
 1. **Verify** every `interp` frame dict has ENU + PINHOLE size before recon (`assert_interp_frame_poses`) — landed in-repo.
 2. **Subsample** midframes for densify (`select_densify_frames`); keep full rate only for video/preview.
-3. **Milestone B** densify on full posed set (not per-leg).
-4. Optional cloud **3DGS with locked extrinsics** as ghost-proof A/B.
-5. MASt3R only as **matcher → posed COLMAP**, never as free-pose scene builder for the hero cloud.
+3. **Grow posed sparse** with the same strided midframes (`select_posed_sparse_frames` → `colmap_posed`) so OpenMVS neighbors see longer tracks — see [`openmvs-denser-sparse.md`](openmvs-denser-sparse.md).
+4. **Milestone B** densify on full posed set (not per-leg). Do **not** concat per-clip AI recon; do **not** use OSM/BAG as hero.
+5. Optional cloud **3DGS with locked extrinsics** as ghost-proof A/B.
+6. MASt3R only as **matcher → posed COLMAP**, never as free-pose scene builder for the hero cloud.
 
 ## Links
 - DUSt3R global align (why free pairwise clouds need fusion): https://arxiv.org/abs/2312.14132
 - OpenMVS known poses / densify: https://github.com/cdcseacave/openMVS/wiki/Usage
 - Monocular scale drift vs GS: https://arxiv.org/abs/2507.03737
-- Related: [`docs/openmvs-densify.md`](openmvs-densify.md), [`docs/photo-consistent-facades.md`](photo-consistent-facades.md)
+- Related: [`openmvs-densify.md`](openmvs-densify.md), [`openmvs-denser-sparse.md`](openmvs-denser-sparse.md), [`photo-consistent-facades.md`](photo-consistent-facades.md)

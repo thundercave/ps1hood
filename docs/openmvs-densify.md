@@ -63,11 +63,17 @@ Smoke-friendly defaults keep RAM/time sane (`--resolution-level 2` = ¼ linear).
 
 | Seed | Use |
 |------|-----|
-| Posed COLMAP triangulated | **Preferred** |
+| Posed COLMAP triangulated | **Preferred** — grow with strided FILM midframes (`select_posed_sparse_frames`) before densify |
 | Filtered flow cloud | Only if street/ground dominance stripped |
 | Photo-plane inliers | Optional extra points with visibility |
 
 Cross-pano images only (same rule as posed triangulator). Same-center orbit mates waste densify.
+
+If DensifyPointCloud reports **“not enough images in view”** / empty cloud, the
+covisibility graph is too thin for `SelectNeighborViews`. **Lowering
+`--number-views-fuse` does not fix neighbor selection.** See
+[`openmvs-denser-sparse.md`](openmvs-denser-sparse.md) (grow posed sparse / longer
+tracks; optional `--view-neighbors-file` from `select_stereo_pairs` later).
 
 ## CPU note
 

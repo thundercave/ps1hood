@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import numpy as np
 
 from ps1_hood.reconstruct.colmap import (
@@ -16,6 +18,8 @@ from ps1_hood.reconstruct.colmap import (
     filter_frames_registered_in_matches,
     frame_sizes_uniform,
     frames_have_known_poses,
+    matches_importer_argv,
+    mean_track_length,
     read_db_cameras,
     read_db_image_ids,
     remap_known_pose_model_to_db,
@@ -472,3 +476,55 @@ def test_remap_shared_camera_still_reads_db_row(tmp_path: Path):
     assert cam_lines[0].startswith("1 PINHOLE 640 480")
     assert "321.500000" in cam_lines[0]
 
+
+
+def test_matches_importer_argv_enables_guided_matching(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help",
+        lambda _c, _s: "--SiftMatching.guided_matching arg (=0)\n",
+    )
+    argv = matches_importer_argv(
+        "colmap", Path("db.db"), Path("pairs.txt"), guided_matching=True
+    )
+    assert "--match_type" in argv
+    assert argv[argv.index("--match_type") + 1] == "pairs"
+    assert "--SiftMatching.guided_matching" in argv
+    assert argv[argv.index("--SiftMatching.guided_matching") + 1] == "1"
+    assert "--SiftMatching.use_gpu" in argv
+
+
+def test_mean_track_length_from_bin(tmp_path: Path):
+    # Minimal points3D.bin: 1 point, track length 3
+    import struct
+
+    model = tmp_path / "model"
+    model.mkdir()
+    # id, xyz, rgb, error, track_len, then 3*(image_id u32, point2D u32)
+    blob = struct.pack("<Q", 1)  # count
+    blob += struct.pack("<Q", 42)  # id
+    blob += struct.pack("<ddd", 1.0, 2.0, 3.0)
+    blob += bytes([10, 20, 30])
+    blob += struct.pack("<d", 0.5)
+    blob += struct.pack("<Q", 3)
+    for img in (1, 2, 3):
+        blob += struct.pack("<II", img, 0)
+    (model / "points3D.bin").write_bytes(blob)
+    assert mean_track_length(model) == pytest.approx(3.0)
+
+
+def test_cross_pano_prefers_more_pairs():
+    # Three panos along a line with overlapping headings → more than one pair/frame budget
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(8, 0, 5, "p2"),
+        _fr(16, 0, 0, "p3"),
+        _fr(24, 0, 5, "p4"),
+    ]
+    pairs_default = cross_pano_pair_indices(frames)
+    pairs_tight = cross_pano_pair_indices(frames, max_pairs_per_frame=1)
+    assert len(pairs_default) >= len(pairs_tight)
+    assert len(pairs_default) >= 3

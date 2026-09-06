@@ -108,6 +108,33 @@ def _count_model_points(model: Path) -> int:
     return 0
 
 
+def mean_track_length(model: Path) -> float | None:
+    """Mean observations/point from points3D.bin (None if unavailable)."""
+    bin_path = model / "points3D.bin"
+    if not bin_path.is_file() or bin_path.stat().st_size < 8:
+        return None
+    raw = bin_path.read_bytes()
+    n = int(struct.unpack("<Q", raw[:8])[0])
+    if n < 1:
+        return 0.0
+    off = 8
+    total = 0
+    for _ in range(n):
+        if off + 8 + 24 + 3 + 8 + 8 > len(raw):
+            return None
+        off += 8  # point3D_id
+        off += 24  # xyz
+        off += 3  # rgb
+        off += 8  # error
+        track_len = int(struct.unpack_from("<Q", raw, off)[0])
+        off += 8
+        total += track_len
+        off += track_len * 8  # (image_id, point2D_idx) pairs
+        if off > len(raw) + 1:
+            return None
+    return total / float(n)
+
+
 def _validate_sparse_model(model: Path, *, min_points: int = 1, label: str = "COLMAP") -> int:
     points_bin = model / "points3D.bin"
     points_txt = model / "points3D.txt"
@@ -190,9 +217,22 @@ def _pano_key(frame: dict[str, Any]) -> str:
     return f"{round(float(frame['e']), 2)}_{round(float(frame['n']), 2)}"
 
 
-def cross_pano_pair_indices(frames: list[dict[str, Any]]) -> list[tuple[int, int]]:
-    """Stereo pairs with real baseline — never same-center / same-pano orbit mates."""
-    pairs = select_stereo_pairs(frames)
+def cross_pano_pair_indices(
+    frames: list[dict[str, Any]],
+    *,
+    max_pairs_per_frame: int = 8,
+    min_baseline_m: float = 2.0,
+) -> list[tuple[int, int]]:
+    """Stereo pairs with real baseline — never same-center / same-pano orbit mates.
+
+    Defaults prefer **more** cross-pano matches (``max_pairs_per_frame=8``) so
+    posed sparse covisibility is denser for OpenMVS neighbor selection.
+    """
+    pairs = select_stereo_pairs(
+        frames,
+        min_baseline_m=min_baseline_m,
+        max_pairs_per_frame=max_pairs_per_frame,
+    )
     out: list[tuple[int, int]] = []
     for i, j in pairs:
         if _pano_key(frames[i]) == _pano_key(frames[j]):
@@ -595,6 +635,38 @@ def colmap_cpu_gpu_flags(colmap: str) -> tuple[tuple[str, ...], tuple[str, ...]]
     return tuple(extract), tuple(matching)
 
 
+def matches_importer_argv(
+    colmap: str,
+    database: Path,
+    match_list: Path,
+    *,
+    guided_matching: bool = True,
+) -> list[str]:
+    """Build ``matches_importer`` argv for cross-pano pair lists.
+
+    Enables ``SiftMatching.guided_matching`` when available (denser inliers
+    under known geometry). Falls back without the flag if help omits it.
+    """
+    _extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
+    cmd = [
+        colmap,
+        "matches_importer",
+        "--database_path",
+        str(database),
+        "--match_list_path",
+        str(match_list),
+        "--match_type",
+        "pairs",
+        *match_gpu,
+    ]
+    if guided_matching:
+        help_txt = _colmap_subcommand_help(colmap, "matches_importer")
+        if "guided_matching" in help_txt or not help_txt:
+            # Empty help → still try the flag (COLMAP 3.10+ has it).
+            cmd.extend(["--SiftMatching.guided_matching", "1"])
+    return cmd
+
+
 def _colmap_bin() -> str:
     colmap = shutil.which("colmap")
     if not colmap:
@@ -797,20 +869,7 @@ def run_colmap_posed(
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
-    _extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
-    _run(
-        [
-            colmap,
-            "matches_importer",
-            "--database_path",
-            str(db),
-            "--match_list_path",
-            str(match_list),
-            "--match_type",
-            "pairs",
-            *match_gpu,
-        ]
-    )
+    _run(matches_importer_argv(colmap, db, match_list, guided_matching=True))
 
     # Images with only failed geometric verification can SIGABRT point_triangulator.
     frames, image_names = filter_frames_registered_in_matches(
@@ -864,7 +923,23 @@ def run_colmap_posed(
     out = ply_out if ply_out is not None else workspace.parent / "cloud_photo.ply"
     _convert_model_to_ply(colmap, model, out)
     n = _count_model_points(model)
-    log.info("COLMAP posed → %s (%s points, %s cross-pano pairs)", out, n, n_pairs)
+    mtl = mean_track_length(model)
+    if mtl is not None:
+        log.info(
+            "COLMAP posed → %s (%s points, mean track length %.2f, %s cross-pano pairs)",
+            out,
+            n,
+            mtl,
+            n_pairs,
+        )
+        if mtl < 2.2:
+            log.warning(
+                "posed sparse covisibility thin (mean track length %.2f < 2.2) — "
+                "OpenMVS SelectNeighborViews may still fail; grow midframes / matches",
+                mtl,
+            )
+    else:
+        log.info("COLMAP posed → %s (%s points, %s cross-pano pairs)", out, n, n_pairs)
     # Fail loud AFTER writing PLY so Studio/debug still has the thin cloud.
     if n < min_points:
         raise RuntimeError(
