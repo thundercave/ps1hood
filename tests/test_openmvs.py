@@ -180,3 +180,36 @@ def test_ply_vertex_count(tmp_path: Path) -> None:
         encoding="ascii",
     )
     assert om._ply_vertex_count(ply) == 42
+
+
+def test_densify_argv_view_neighbors() -> None:
+    argv = om.densify_argv(
+        "/bin/DensifyPointCloud",
+        Path("/tmp/scene.mvs"),
+        view_neighbors_file=Path("/tmp/nbrs.txt"),
+    )
+    assert "--view-neighbors-file" in argv
+    assert argv[argv.index("--view-neighbors-file") + 1] == "/tmp/nbrs.txt"
+
+
+def test_write_view_neighbors_from_match_list(tmp_path: Path) -> None:
+    images_txt = tmp_path / "images.txt"
+    images_txt.write_text(
+        "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"
+        "1 1 0 0 0 0 0 0 1 a.jpg\n"
+        "\n"
+        "2 1 0 0 0 1 0 0 1 b.jpg\n"
+        "\n"
+        "3 1 0 0 0 2 0 0 1 c.jpg\n"
+        "\n",
+        encoding="ascii",
+    )
+    pairs = tmp_path / "pairs.txt"
+    pairs.write_text("a.jpg b.jpg\nb.jpg c.jpg\n", encoding="ascii")
+    out = tmp_path / "nbrs.txt"
+    n = om.write_view_neighbors_from_match_list(images_txt, pairs, out)
+    assert n == 3
+    lines = {ln.split()[0]: ln.split()[1:] for ln in out.read_text().splitlines() if ln}
+    assert lines["1"] == ["2"]
+    assert set(lines["2"]) == {"1", "3"}
+    assert lines["3"] == ["2"]

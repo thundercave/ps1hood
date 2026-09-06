@@ -2,17 +2,19 @@
 
 **In-repo wiring:** `colmap_posed` grows the match + triangulator graph with
 orbit keyframes **plus** subsampled FILM midframes (`select_posed_sparse_frames`
-in `interpolate/sequence.py` — asserts `lerp_pose` ENU + fov/width/height on the
-full FILM rate, keeps midframes with ≥2 m ENU clearance, stride
-`DENSIFY_MIDFRAME_STRIDE`). Matching uses cross-pano pairs (prefer more neighbors),
-keeps two-view tracks (`tri_ignore_two_view_tracks=0`), and enables
-`SiftMatching.guided_matching` when COLMAP supports it. Mean track length is
-logged after triangulation — if ≲ 2.2, densify is still risky.
+— asserts `lerp_pose` ENU + fov/width/height on the full FILM rate, keeps
+midframes with ≥`POSED_MATCH_MIDFRAME_BASELINE_M` / 4 m ENU clearance, stride
+`DENSIFY_MIDFRAME_STRIDE`). Matching uses **forward drive** cross-pano pairs
+(each frame ↔ 3 later track mates via `cross_pano_forward_pairs`); guided
+matching stays **off** by default (optional with max_image_size / max_num_matches
+caps). Two-view tracks stay allowed (`tri_ignore_two_view_tracks=0`). Logs mean
+track length **and** fraction of points with ≥3 views — if mean ≲ 2.2, densify
+is still risky. See [`longer-tracks-no-oom.md`](longer-tracks-no-oom.md).
 
 **Do not** treat lowering `--number-views-fuse` as a fix for neighbor selection —
-fuse only runs **after** depth maps exist. If auto neighbors still fail with a
-healthier sparse, pass `--view-neighbors-file` built from `select_stereo_pairs`
-(optional; not yet a first-class CLI flag — see §2).
+fuse only runs **after** depth maps exist. OpenMVS densify auto-builds
+`--view-neighbors-file` from `recon/colmap/cross_pano_pairs.txt` when present
+(see §2).
 
 Related: [`openmvs-densify.md`](openmvs-densify.md),
 [`correct-geometry-ghost-duplicates.md`](correct-geometry-ghost-duplicates.md).

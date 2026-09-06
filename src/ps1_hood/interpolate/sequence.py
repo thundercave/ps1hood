@@ -9,6 +9,9 @@ import numpy as np
 
 # Skip FILM/lerp when the leg is rotation-only / same-pano mates.
 MIN_LERP_BASELINE_M = 2.0
+# Posed matching / triangulator: harder ENU clearance so near-dupe FILM
+# neighbors do not steal into two-view tracks (OpenMVS needs 3+ covisibility).
+POSED_MATCH_MIDFRAME_BASELINE_M = 4.0
 # Densify/recon: keep every Nth midframe + all real panos (full FILM ≈ near-dupes).
 DENSIFY_MIDFRAME_STRIDE = 4
 
@@ -176,13 +179,18 @@ def select_posed_sparse_frames(
     interp_frames: list[dict[str, Any]] | None = None,
     *,
     midframe_stride: int = DENSIFY_MIDFRAME_STRIDE,
-    min_midframe_baseline_m: float = MIN_LERP_BASELINE_M,
+    min_midframe_baseline_m: float = POSED_MATCH_MIDFRAME_BASELINE_M,
 ) -> list[dict[str, Any]]:
     """Orbit keyframes + every Nth posed FILM midframe for denser COLMAP tracks.
 
     Real SV crops / orbit headings stay the backbone. Subsampled midframes that
     already carry ``lerp_pose`` ENU (+ fov/width/height) are appended so landmarks
     see more cameras across baselines — feeding OpenMVS neighbor selection.
+
+    Default ``min_midframe_baseline_m`` is ``POSED_MATCH_MIDFRAME_BASELINE_M``
+    (≥4 m) so near-dupe FILM neighbors do not dominate the match graph as
+    two-view edges. Full FILM rate still gets ENU asserts; denser frames can
+    stay for texture later without entering matching.
 
     - Asserts ENU + PINHOLE size on the **full** FILM-rate ``interp_frames`` first.
     - Midframes closer than ``min_midframe_baseline_m`` to an already-selected

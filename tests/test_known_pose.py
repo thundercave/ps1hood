@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from ps1_hood.reconstruct.known_pose import select_stereo_pairs, sequential_pairs
+from ps1_hood.reconstruct.known_pose import (
+    forward_drive_pairs,
+    select_stereo_pairs,
+    sequential_pairs,
+)
 
 
 def _fr(e: float, n: float, heading: float) -> dict:
@@ -32,3 +36,29 @@ def test_select_stereo_pairs_empty_when_no_geometry() -> None:
 def test_sequential_pairs_fallback() -> None:
     assert sequential_pairs(5, pair_step=2) == [(0, 2), (1, 3), (2, 4)]
     assert sequential_pairs(1) == []
+
+
+def test_forward_drive_pairs_three_mates() -> None:
+    # Evenly spaced along a line — each frame should link to next 3 within baseline.
+    frames = [_fr(float(i * 5), 0.0, 0.0) for i in range(6)]
+    pairs = forward_drive_pairs(frames, n_forward=3, min_baseline_m=2.0, max_baseline_m=25.0)
+    # Frame 0 → 1,2,3
+    assert (0, 1) in pairs and (0, 2) in pairs and (0, 3) in pairs
+    assert (0, 4) not in pairs  # only 3 forward
+    # Frame 2 → 3,4,5
+    assert (2, 3) in pairs and (2, 4) in pairs and (2, 5) in pairs
+    # Creates overlapping edges (3-cycles seed): 0-1, 0-2, 1-2
+    assert (1, 2) in pairs
+
+
+def test_forward_drive_pairs_skips_too_close() -> None:
+    frames = [
+        _fr(0.0, 0.0, 0.0),
+        _fr(0.5, 0.0, 0.0),  # too close — skip, still count toward? No: skip without counting
+        _fr(5.0, 0.0, 0.0),
+        _fr(10.0, 0.0, 0.0),
+        _fr(15.0, 0.0, 0.0),
+    ]
+    pairs = forward_drive_pairs(frames, n_forward=3, min_baseline_m=2.0)
+    assert (0, 1) not in pairs
+    assert (0, 2) in pairs and (0, 3) in pairs and (0, 4) in pairs
