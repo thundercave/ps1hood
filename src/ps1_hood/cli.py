@@ -249,9 +249,9 @@ def reconstruct_cmd(name: str, backend: str | None) -> None:
 @click.argument("name")
 @click.option(
     "--backend",
-    type=click.Choice(["openmvs"]),
+    type=click.Choice(["openmvs", "mapanything"]),
     default="openmvs",
-    help="optional densify backend (openmvs = external AGPL binary on PATH)",
+    help="optional densify backend (openmvs=AGPL binary; mapanything=CUDA Meta)",
 )
 @click.option("--resolution-level", default=2, show_default=True, type=int)
 @click.option("--number-views", default=4, show_default=True, type=int)
@@ -269,6 +269,31 @@ def reconstruct_cmd(name: str, backend: str | None) -> None:
     default=None,
     help="override posed sparse model (default recon/colmap/sparse_posed)",
 )
+@click.option(
+    "--stride",
+    default=2,
+    show_default=True,
+    type=int,
+    help="MapAnything: subsample every Nth frame (COLMAP demo / bundle)",
+)
+@click.option(
+    "--max-views",
+    default=48,
+    show_default=True,
+    type=int,
+    help="MapAnything Path B: cap views after stride",
+)
+@click.option(
+    "--apache/--research",
+    default=True,
+    help="MapAnything: apache weights (default) vs CC-BY-NC research checkpoint",
+)
+@click.option(
+    "--export-only",
+    is_flag=True,
+    default=False,
+    help="MapAnything: write pose-locked bundle only (no CUDA infer)",
+)
 def densify_cmd(
     name: str,
     backend: str,
@@ -276,32 +301,140 @@ def densify_cmd(
     number_views: int,
     images_path: Path | None,
     sparse_path: Path | None,
+    stride: int,
+    max_views: int,
+    apache: bool,
+    export_only: bool,
 ) -> None:
-    """Optional MVS densify from posed COLMAP sparse seed (not flow street cloud).
+    """Optional densify: OpenMVS (CPU/AGPL) or MapAnything (CUDA, ENU-locked).
 
-    OpenMVS is AGPL-3.0 and not vendored; requires InterfaceCOLMAP +
-    DensifyPointCloud on PATH. Writes openmvs/scene_dense.ply.
+    OpenMVS: InterfaceCOLMAP + DensifyPointCloud on PATH → openmvs/scene_dense.ply.
+    MapAnything: fixed ENU cam2world + K; never ignore_pose_inputs. Prefer
+    --apache. Without CUDA use --export-only then scripts/run_mapanything_bundle.py.
     """
-    from ps1_hood.reconstruct.openmvs import INSTALL_HINT, run_openmvs_densify, which_openmvs
+    project = open_project(name)
+    if backend == "openmvs":
+        from ps1_hood.reconstruct.openmvs import INSTALL_HINT, run_openmvs_densify, which_openmvs
+
+        if which_openmvs() is None:
+            click.echo(INSTALL_HINT, err=True)
+            raise SystemExit(1)
+        try:
+            meta = run_openmvs_densify(
+                project.root,
+                images_path=Path(images_path) if images_path else None,
+                sparse_path=Path(sparse_path) if sparse_path else None,
+                resolution_level=resolution_level,
+                number_views=number_views,
+            )
+        except Exception as exc:
+            click.echo(f"densify failed: {exc}", err=True)
+            raise SystemExit(1) from exc
+        click.echo(
+            f"densify ok  {meta['path']}  points={meta['points']}  backend={meta['backend']}"
+        )
+        return
+
+    if backend == "mapanything":
+        from ps1_hood.reconstruct import mapanything as ma
+
+        try:
+            frames = ma.resolve_mapanything_frames(
+                project, stride=1, max_views=None, prefer_interp=True
+            )
+            bundle_meta = ma.export_mapanything_bundle(
+                frames,
+                project.root / "mapanything" / "bundle",
+                stride=stride,
+                max_views=max_views,
+                run_name=name,
+            )
+        except Exception as exc:
+            click.echo(f"mapanything export failed: {exc}", err=True)
+            raise SystemExit(1) from exc
+        click.echo(
+            f"mapanything bundle  {bundle_meta['path']}  "
+            f"views={bundle_meta['n_views']}  pose_lock=True"
+        )
+        if export_only:
+            click.echo(
+                "export-only: on CUDA host run "
+                "python scripts/run_mapanything_bundle.py "
+                f"{bundle_meta['path']} --apache"
+            )
+            return
+        try:
+            meta = ma.run_mapanything_densify(
+                project.root,
+                project,
+                stride=stride,
+                max_views=max_views,
+                apache=apache,
+            )
+        except Exception as exc:
+            click.echo(f"densify failed: {exc}", err=True)
+            click.echo(ma.INSTALL_HINT, err=True)
+            raise SystemExit(1) from exc
+        click.echo(
+            f"densify ok  {meta.get('path') or meta.get('cloud_mapanything')}  "
+            f"points={meta.get('points')}  backend=mapanything  "
+            f"pose_lock={meta.get('pose_lock')}  path={meta.get('path_kind')}"
+        )
+        return
+
+    raise SystemExit(f"unsupported densify backend: {backend}")
+
+
+@main.group("export")
+def export_group() -> None:
+    """Export run artefacts for external tools."""
+
+
+@export_group.command("mapanything-bundle")
+@click.argument("name")
+@click.option("--stride", default=2, show_default=True, type=int)
+@click.option("--max-views", default=48, show_default=True, type=int)
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(path_type=Path, exists=False),
+    default=None,
+    help="override output dir (default runs/<name>/mapanything/bundle)",
+)
+def export_mapanything_bundle_cmd(
+    name: str,
+    stride: int,
+    max_views: int,
+    out_dir: Path | None,
+) -> None:
+    """Export images + ENU cam2world + K for MapAnything (no GPU required).
+
+    Writes manifest.json with pose_lock=True. Feed to
+    scripts/run_mapanything_bundle.py on a CUDA host. Never use
+    --ignore_pose_inputs when inferring.
+    """
+    from ps1_hood.reconstruct import mapanything as ma
 
     project = open_project(name)
-    if backend != "openmvs":
-        raise SystemExit(f"unsupported densify backend: {backend}")
-    if which_openmvs() is None:
-        click.echo(INSTALL_HINT, err=True)
-        raise SystemExit(1)
     try:
-        meta = run_openmvs_densify(
-            project.root,
-            images_path=Path(images_path) if images_path else None,
-            sparse_path=Path(sparse_path) if sparse_path else None,
-            resolution_level=resolution_level,
-            number_views=number_views,
+        frames = ma.resolve_mapanything_frames(
+            project, stride=1, max_views=None, prefer_interp=True
+        )
+        dest = Path(out_dir) if out_dir else project.root / "mapanything" / "bundle"
+        meta = ma.export_mapanything_bundle(
+            frames,
+            dest,
+            stride=stride,
+            max_views=max_views,
+            run_name=name,
         )
     except Exception as exc:
-        click.echo(f"densify failed: {exc}", err=True)
+        click.echo(f"export failed: {exc}", err=True)
         raise SystemExit(1) from exc
-    click.echo(f"densify ok  {meta['path']}  points={meta['points']}  backend={meta['backend']}")
+    click.echo(
+        f"exported {meta['path']}  views={meta['n_views']}  "
+        f"format={meta['format']}  pose_lock=True"
+    )
 
 
 @main.command("studio")

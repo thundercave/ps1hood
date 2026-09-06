@@ -72,8 +72,12 @@ https://github.com/facebookresearch/vggt
 - Optional: Sim(3) align VGGT cloud → ENU for sanity, then throw away VGGT poses.  
 - Cloud CUDA; ~1B weights; chunk long SV sets.
 
-#### MapAnything (TC2) — verify knobs
-https://github.com/facebookresearch/MapAnything — feed `camera_poses` + intrinsics; treat any “refine poses” switch as **off** for hood ENU.
+#### MapAnything (TC2) — locked ENU
+https://github.com/facebookresearch/map-anything — feed `camera_poses` + intrinsics; **never** `ignore_pose_inputs`.
+In-repo: [`mapanything-densify.md`](mapanything-densify.md) — Path A posed COLMAP demo
+(`--apache --stride 2 --save_glb --save_colmap`); Path B
+`ps1hood export mapanything-bundle` + `scripts/run_mapanything_bundle.py`.
+Prefer `facebook/map-anything-apache`; `minibatch_size=1` if VRAM tight.
 
 #### 3DGS mesh → PS1
 - Train with **fixed cams** (gsplat / nerfstudio splatfacto; camera-optimizer **off**).  
@@ -127,4 +131,4 @@ Dropping `drive.mp4` into Luma/Postshot/pose-free MASt3R and concatenating PLYs.
 
 ---
 
-**Related in-repo:** [correct-geometry-ghost-duplicates.md](correct-geometry-ghost-duplicates.md) (ENU midframes), [openmvs-densify.md](openmvs-densify.md) / [openmvs-denser-sparse.md](openmvs-denser-sparse.md) (Milestone B), [gpu-mast3r-ubuntu.md](gpu-mast3r-ubuntu.md) (CUDA/ROCm).
+**Related in-repo:** [correct-geometry-ghost-duplicates.md](correct-geometry-ghost-duplicates.md) (ENU midframes), [mapanything-densify.md](mapanything-densify.md) (TC2 MapAnything), [openmvs-densify.md](openmvs-densify.md) / [openmvs-denser-sparse.md](openmvs-denser-sparse.md) (Milestone B), [gpu-mast3r-ubuntu.md](gpu-mast3r-ubuntu.md) (CUDA/ROCm).

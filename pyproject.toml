@@ -27,6 +27,9 @@ dev = ["pytest>=8.0"]
 # Install from https://github.com/naver/mast3r (torch+cuda + weights) yourself.
 # This empty extra documents the optional path:  uv sync --extra mast3r
 mast3r = []
+# MapAnything: install from https://github.com/facebookresearch/map-anything (CUDA).
+# uv sync --extra mapanything  (documents optional path; package not on PyPI here)
+mapanything = []
 
 [project.scripts]
 ps1hood = "ps1_hood.cli:main"
