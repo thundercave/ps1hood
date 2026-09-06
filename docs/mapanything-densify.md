@@ -6,8 +6,10 @@
 `ignore_pose_inputs=True`. Discard any predicted poses from the API as
 authority (log median ΔC only).
 
-**Hardware:** needs **CUDA**. This box / AMD 6900 XT have no CUDA — export the
-bundle here, run infer on cloud. Prefer Apache weights.
+**Hardware:** needs a GPU torch stack (**CUDA** preferred). This box / AMD 6900 XT
+have no NVIDIA CUDA — export the bundle here, run infer on cloud CUDA, or try
+best-effort ROCm on gfx1030 ([mapanything-rocm-gfx1030.md](mapanything-rocm-gfx1030.md)).
+Prefer Apache weights.
 
 Upstream: [facebookresearch/map-anything](https://github.com/facebookresearch/map-anything)  
 Recipe: `/workspace/mapanything-enu-recipe.md` (Scrapy).
@@ -142,4 +144,4 @@ and CUDA fail-loud — no GPU required.
 - https://github.com/facebookresearch/map-anything  
 - `scripts/demo_inference_on_colmap_outputs.py`  
 - https://huggingface.co/facebook/map-anything-apache  
-- Related: [rd-interp-and-v2pc.md](rd-interp-and-v2pc.md), [openmvs-densify.md](openmvs-densify.md)
+- Related: [rd-interp-and-v2pc.md](rd-interp-and-v2pc.md), [openmvs-densify.md](openmvs-densify.md), [mapanything-rocm-gfx1030.md](mapanything-rocm-gfx1030.md) (RX 6900 XT / ROCm)
