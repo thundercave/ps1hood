@@ -111,6 +111,14 @@ uv run ps1hood reconstruct my-block --backend flow
 uv run ps1hood densify my-block --backend openmvs
 # → openmvs/scene_dense.ply from posed sparse (recon/colmap/sparse_posed)
 # See docs/openmvs-densify.md for install + AGPL notes.
+
+# MapAnything densify (Meta, CUDA, ENU pose-lock — not vendored):
+uv run ps1hood export mapanything-bundle my-block --stride 2
+# → runs/my-block/mapanything/bundle (images + K + cam2world); CPU OK
+uv run ps1hood densify my-block --backend mapanything --apache --stride 2
+# needs CUDA; without GPU use --export-only then scripts/run_mapanything_bundle.py
+# NEVER --ignore_pose_inputs. Prefer facebook/map-anything-apache.
+# See docs/mapanything-densify.md
 ```
 
 AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-ubuntu.md`](docs/gpu-mast3r-ubuntu.md) for an honest ROCm feasibility note, uv setup on Ubuntu, denser `smoke-dense` capture, COLMAP posed fallbacks, and cloud-CUDA MASt3R commands.
@@ -130,6 +138,10 @@ see [`docs/openmvs-denser-sparse.md`](docs/openmvs-denser-sparse.md) and
 **Optional OpenMVS densify** is AGPL-3.0; the binary is **not** redistributed in this
 MIT repo. Install `InterfaceCOLMAP` + `DensifyPointCloud` yourself, then
 `ps1hood densify <run> --backend openmvs`. Details: [`docs/openmvs-densify.md`](docs/openmvs-densify.md).
+
+**Optional MapAnything densify** (Apache code / prefer `map-anything-apache` weights)
+feeds locked ENU cam2world + K — never `ignore_pose_inputs`. Export works without
+GPU; infer needs CUDA. Details: [`docs/mapanything-densify.md`](docs/mapanything-densify.md).
 
 ## Layout of a run
 
@@ -152,6 +164,9 @@ runs/<name>/
   recon/textures/facade_XX.jpg
   recon/scene.json
   openmvs/scene_dense.ply      optional OpenMVS densify (AGPL binary)
+  mapanything/bundle/          pose-locked MapAnything export (CPU)
+  mapanything/cloud.ply        optional MapAnything densify (CUDA)
+  recon/cloud_mapanything.ply  Studio/import copy of MapAnything cloud
 ```
 
 ## Keys
