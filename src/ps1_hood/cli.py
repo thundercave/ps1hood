@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 import click
 
@@ -242,6 +243,65 @@ def reconstruct_cmd(name: str, backend: str | None) -> None:
         spec.recon_backend = backend
         project.save_spec(spec)
     stage_reconstruct(project)
+
+
+@main.command("densify")
+@click.argument("name")
+@click.option(
+    "--backend",
+    type=click.Choice(["openmvs"]),
+    default="openmvs",
+    help="optional densify backend (openmvs = external AGPL binary on PATH)",
+)
+@click.option("--resolution-level", default=2, show_default=True, type=int)
+@click.option("--number-views", default=4, show_default=True, type=int)
+@click.option(
+    "--images",
+    "images_path",
+    type=click.Path(path_type=Path, exists=False),
+    default=None,
+    help="override COLMAP images dir (default recon/colmap/images)",
+)
+@click.option(
+    "--sparse",
+    "sparse_path",
+    type=click.Path(path_type=Path, exists=False),
+    default=None,
+    help="override posed sparse model (default recon/colmap/sparse_posed)",
+)
+def densify_cmd(
+    name: str,
+    backend: str,
+    resolution_level: int,
+    number_views: int,
+    images_path: Path | None,
+    sparse_path: Path | None,
+) -> None:
+    """Optional MVS densify from posed COLMAP sparse seed (not flow street cloud).
+
+    OpenMVS is AGPL-3.0 and not vendored; requires InterfaceCOLMAP +
+    DensifyPointCloud on PATH. Writes openmvs/scene_dense.ply.
+    """
+    from ps1_hood.reconstruct.openmvs import INSTALL_HINT, run_openmvs_densify, which_openmvs
+
+    project = open_project(name)
+    if backend != "openmvs":
+        raise SystemExit(f"unsupported densify backend: {backend}")
+    if which_openmvs() is None:
+        click.echo(INSTALL_HINT, err=True)
+        raise SystemExit(1)
+    try:
+        meta = run_openmvs_densify(
+            project.root,
+            images_path=Path(images_path) if images_path else None,
+            sparse_path=Path(sparse_path) if sparse_path else None,
+            resolution_level=resolution_level,
+            number_views=number_views,
+        )
+    except Exception as exc:
+        click.echo(f"densify failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(f"densify ok  {meta['path']}  points={meta['points']}  backend={meta['backend']}")
 
 
 @main.command("studio")
