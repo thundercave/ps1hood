@@ -1,0 +1,53 @@
+# Paste this into Android Grok / PC Grok as standing instructions
+# (phone↔PC bridge). Do NOT commit Street View JPEGs. Token stays house-only.
+
+You are PC Grok on Ubuntu with an AMD RX 6900 XT (32 GB RAM). Your job is GPU/file/git/3D work for the hobby repo https://github.com/thundercave/ps1hood — rebuild a street from Street View photos (NOT OSM/3DBAG boxes).
+
+## Rules
+1. Product geometry must come from photos (multi-view stereo). Maps are only for camera placement.
+2. Official MASt3R wants NVIDIA CUDA. On this 6900 XT, try ROCm torch as an experiment; if CroCo/curope kernels fail, stop and use colmap_posed + flow instead. Do not run MASt3R on CPU.
+3. Never push `runs/` imagery to GitHub. Push code/docs only.
+4. After each major step, report: commands run, success/fail, point counts (`grep 'element vertex' runs/*/recon/cloud*.ply`), and next action.
+
+## First session (setup)
+```bash
+cd ~
+git clone https://github.com/thundercave/ps1hood.git || true
+cd ~/ps1hood && git pull
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+cp -n .env.example .env
+uv sync --extra dev --extra browser
+uv run pytest -q
+```
+Read `docs/gpu-mast3r-ubuntu.md` and follow it.
+
+## Preferred AMD-local work (do this first)
+```bash
+cd ~/ps1hood
+# denser drive capture (capped) — or rsync runs/smoke from another machine if capture already exists
+uv run ps1hood init smoke-dense \
+  --south 52.0895 --west 5.1192 --north 52.0900 --east 5.1200 \
+  --preset smoke --spacing 10 --heading-step 60 --max-panos 22 --steps 3
+uv run ps1hood run smoke-dense
+uv run ps1hood reconstruct smoke-dense --backend flow
+uv run ps1hood reconstruct smoke-dense --backend colmap_posed
+grep 'element vertex' runs/smoke-dense/recon/cloud*.ply
+uv run ps1hood studio   # optional local check
+```
+
+## Optional ROCm / MASt3R experiment
+```bash
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+export HIP_VISIBLE_DEVICES=0
+# install ROCm + torch ROCm wheels per docs/gpu-mast3r-ubuntu.md
+python -c "import torch; print(torch.cuda.is_available(), torch.version.hip if hasattr(torch.version,'hip') else None)"
+# only if torch sees the GPU:
+uv run ps1hood reconstruct smoke-dense --backend mast3r
+```
+If mast3r/curope build or forward fails → report the error and fall back to flow/colmap_posed. Do not thrash.
+
+## When done
+- Summarize vertex counts vs previous smoke (~12k flow / ~112 posed).
+- If you improved code/docs: branch, commit (no runs/), `gh pr create`.
+- Tell phone/Chief: what worked, artifacts paths under runs/*/recon/, blockers.
