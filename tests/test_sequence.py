@@ -5,6 +5,7 @@ import pytest
 from ps1_hood.interpolate.sequence import (
     DENSIFY_MIDFRAME_STRIDE,
     MIN_LERP_BASELINE_M,
+    POSED_MATCH_MIDFRAME_BASELINE_M,
     assert_interp_frame_poses,
     enu_baseline_m,
     lerp_pose,
@@ -228,3 +229,25 @@ def test_select_densify_subsample_every_nth() -> None:
     chosen = select_densify_frames(frames, midframe_stride=3)
     # keyframes 0,9 + mids at mid_i 0,3,6 → frames index 1,4,7
     assert [f["index"] for f in chosen] == [0, 1, 4, 7, 9]
+
+
+def test_posed_match_baseline_default_is_harder_than_lerp() -> None:
+    assert POSED_MATCH_MIDFRAME_BASELINE_M >= 4.0
+    assert POSED_MATCH_MIDFRAME_BASELINE_M > MIN_LERP_BASELINE_M
+
+
+def test_select_posed_sparse_default_skips_near_mids() -> None:
+    """Default ≥4 m clearance drops FILM near-dupes that steal into 2-view tracks."""
+    keyframes = [_keyframe(0, 0.0, pano="a"), _keyframe(1, 20.0, pano="b")]
+    interp = [
+        _frame(0, interpolated=False, e=0.0),
+        _frame(1, interpolated=True, e=2.0),  # < 4 m from keyframe
+        _frame(2, interpolated=True, e=5.0),  # ok vs 0; stride mid_i=1 skipped if stride=2
+        _frame(3, interpolated=True, e=8.0),
+        _frame(4, interpolated=True, e=12.0),
+        _frame(5, interpolated=False, e=20.0),
+    ]
+    chosen = select_posed_sparse_frames(keyframes, interp, midframe_stride=1)
+    mids = [f for f in chosen if f.get("interpolated")]
+    assert all(m["e"] >= 4.0 - 1e-9 for m in mids)
+    assert 2.0 not in [m["e"] for m in mids]

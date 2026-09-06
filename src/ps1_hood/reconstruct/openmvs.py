@@ -128,6 +128,84 @@ def resolve_posed_inputs(
     return images, sparse
 
 
+def _parse_images_txt_ids(images_txt: Path) -> dict[str, int]:
+    """Map image basename → IMAGE_ID from a COLMAP images.txt.
+
+    COLMAP text format: each image is two lines (pose header + POINTS2D).
+    """
+    out: dict[str, int] = {}
+    lines = images_txt.read_text(encoding="utf-8", errors="replace").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+        if len(parts) < 10:
+            continue
+        try:
+            image_id = int(parts[0])
+            float(parts[1])  # qw — distinguishes pose lines from POINTS2D
+        except ValueError:
+            continue
+        name = parts[9]
+        out[name] = image_id
+        # Consume the following POINTS2D line (may be empty).
+        if i < len(lines) and not lines[i].lstrip().startswith("#"):
+            i += 1
+    return out
+
+
+def write_view_neighbors_file(
+    name_to_id: dict[str, int],
+    pairs: list[tuple[str, str]],
+    path: Path,
+) -> int:
+    """Write OpenMVS ``--view-neighbors-file`` (IMAGE_ID nbr nbr …).
+
+    Built from stereo / forward pair names so densify can bypass a thin
+    auto-neighbor graph while posed tracks catch up.
+    """
+    neighbors: dict[int, set[int]] = {}
+    for a, b in pairs:
+        if a not in name_to_id or b not in name_to_id:
+            continue
+        ia, ib = name_to_id[a], name_to_id[b]
+        neighbors.setdefault(ia, set()).add(ib)
+        neighbors.setdefault(ib, set()).add(ia)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii") as fh:
+        for image_id in sorted(neighbors):
+            nbrs = " ".join(str(n) for n in sorted(neighbors[image_id]))
+            fh.write(f"{image_id} {nbrs}\n")
+    log.info(
+        "OpenMVS view-neighbors-file: %s images → %s",
+        len(neighbors),
+        path,
+    )
+    return len(neighbors)
+
+
+def write_view_neighbors_from_match_list(
+    images_txt: Path,
+    match_list: Path,
+    out_path: Path,
+) -> int:
+    """Build view-neighbors-file from COLMAP images.txt + pairs.txt names."""
+    name_to_id = _parse_images_txt_ids(images_txt)
+    pairs: list[tuple[str, str]] = []
+    for line in match_list.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) >= 2:
+            pairs.append((parts[0], parts[1]))
+    return write_view_neighbors_file(name_to_id, pairs, out_path)
+
+
 def densify_argv(
     densify_bin: str,
     scene_mvs: Path,
@@ -137,9 +215,10 @@ def densify_argv(
     min_resolution: int = DEFAULT_MIN_RESOLUTION,
     max_resolution: int = DEFAULT_MAX_RESOLUTION,
     number_views_fuse: int = DEFAULT_NUMBER_VIEWS_FUSE,
+    view_neighbors_file: Path | None = None,
 ) -> list[str]:
     """Build DensifyPointCloud argv (smoke-friendly CPU flags)."""
-    return [
+    cmd = [
         densify_bin,
         str(scene_mvs),
         "--resolution-level",
@@ -153,6 +232,9 @@ def densify_argv(
         "--number-views-fuse",
         str(int(number_views_fuse)),
     ]
+    if view_neighbors_file is not None:
+        cmd.extend(["--view-neighbors-file", str(view_neighbors_file)])
+    return cmd
 
 
 def interface_colmap_argv(
@@ -212,11 +294,18 @@ def run_openmvs_densify(
     min_resolution: int = DEFAULT_MIN_RESOLUTION,
     max_resolution: int = DEFAULT_MAX_RESOLUTION,
     number_views_fuse: int = DEFAULT_NUMBER_VIEWS_FUSE,
+    view_neighbors_file: Path | None = None,
+    use_match_list_neighbors: bool = True,
 ) -> dict[str, Any]:
     """Densify posed COLMAP sparse → ``openmvs/scene_dense.ply``.
 
     Fails loud if OpenMVS / colmap missing, sparse seed missing, or PLY empty.
     Does not vendor OpenMVS; does not use OSM/BAG meshes.
+
+    When ``use_match_list_neighbors`` and ``recon/colmap/cross_pano_pairs.txt``
+    exist, builds ``--view-neighbors-file`` from that pair list (same geometry
+    as ``select_stereo_pairs`` / forward mates) so thin auto-neighbors do not
+    starve densify while tracks catch up.
     """
     bins = require_openmvs()
     colmap = require_colmap()
@@ -258,6 +347,32 @@ def run_openmvs_densify(
     if not scene_mvs.is_file():
         raise RuntimeError(f"InterfaceCOLMAP did not write {scene_mvs}")
 
+    neighbors_path = view_neighbors_file
+    if neighbors_path is None and use_match_list_neighbors:
+        match_list = run_root.resolve() / "recon" / "colmap" / "cross_pano_pairs.txt"
+        # Prefer undistorter sparse images.txt (IDs OpenMVS sees); fall back to seed.
+        images_txt_candidates = [
+            dense_ws / "sparse" / "images.txt",
+            dense_ws / "0" / "images.txt",
+            sparse / "images.txt",
+        ]
+        images_txt = next((p for p in images_txt_candidates if p.is_file()), None)
+        if match_list.is_file() and images_txt is not None:
+            neighbors_path = openmvs_dir / "view_neighbors.txt"
+            try:
+                n_imgs = write_view_neighbors_from_match_list(
+                    images_txt, match_list, neighbors_path
+                )
+                if n_imgs < 1:
+                    log.warning("view-neighbors-file empty — densify without it")
+                    neighbors_path = None
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "could not build view-neighbors-file (%s); densify without it",
+                    exc,
+                )
+                neighbors_path = None
+
     _run(
         densify_argv(
             bins["DensifyPointCloud"],
@@ -267,6 +382,7 @@ def run_openmvs_densify(
             min_resolution=min_resolution,
             max_resolution=max_resolution,
             number_views_fuse=number_views_fuse,
+            view_neighbors_file=neighbors_path,
         ),
         cwd=openmvs_dir,
     )
@@ -305,6 +421,7 @@ def run_openmvs_densify(
         "scene_mvs": str(scene_mvs),
         "resolution_level": int(resolution_level),
         "number_views": int(number_views),
+        "view_neighbors_file": str(neighbors_path) if neighbors_path else None,
         "agpl": True,
     }
 

@@ -66,3 +66,60 @@ def sequential_pairs(n: int, pair_step: int = 2) -> list[tuple[int, int]]:
     if n < 2 or pair_step < 1:
         return []
     return [(i, i + pair_step) for i in range(0, n - pair_step)]
+
+
+def forward_drive_pairs(
+    frames: list[dict[str, Any]],
+    *,
+    n_forward: int = 3,
+    min_baseline_m: float = 2.0,
+    max_baseline_m: float = 25.0,
+    order_indices: list[int] | None = None,
+    quadratic_overlap: bool = True,
+) -> list[tuple[int, int]]:
+    """Each frame links to up to ``n_forward`` later mates along the drive.
+
+    Ordering defaults to list order (caller should pass track-ordered frames or
+    ``order_indices`` from ``order_track``). Skips pairs outside
+    ``[min_baseline_m, max_baseline_m]``. Builds 3-cycles so the same keypoint
+    can enter multi-view tracks after ``point_triangulator`` — unlike a pure
+    matching of nearest neighbors (mean track ≈ 2.0).
+
+    When ``quadratic_overlap`` is True, also add i↔i+2, i+4, i+8… (COLMAP
+    sequential_matcher style) so longer skip edges reinforce multi-view tracks.
+    """
+    n = len(frames)
+    if n < 2 or n_forward < 1:
+        return []
+    order = list(order_indices) if order_indices is not None else list(range(n))
+    if sorted(order) != list(range(n)):
+        raise ValueError("order_indices must be a permutation of 0..n-1")
+
+    selected: set[tuple[int, int]] = set()
+    pos = {idx: k for k, idx in enumerate(order)}
+
+    def _try_add(i: int, j: int) -> bool:
+        baseline = _baseline_m(frames[i], frames[j])
+        if baseline < min_baseline_m or baseline > max_baseline_m:
+            return False
+        selected.add((min(i, j), max(i, j)))
+        return True
+
+    for i in order:
+        taken = 0
+        start = pos[i] + 1
+        for k in range(start, n):
+            if taken >= n_forward:
+                break
+            j = order[k]
+            if _try_add(i, j):
+                taken += 1
+        if quadratic_overlap:
+            step = 2
+            while True:
+                k = pos[i] + step
+                if k >= n:
+                    break
+                _try_add(i, order[k])
+                step *= 2
+    return sorted(selected)

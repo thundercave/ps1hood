@@ -82,7 +82,7 @@ The original build interpolated between Street Views, then fed the resulting vid
 - [FILM](https://github.com/google-research/frame-interpolation) — Google, made for big motion between stills. Most likely what we used or meant to use.
 - [RIFE](https://github.com/hzwer/Practical-RIFE) / Practical-RIFE.
 
-This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of the pipeline runs today. Point `interp_backend` at `film` or `rife` in `project.yaml` once those weights live on the machine; until then it falls back to flow. Midframe poses always come from `lerp_pose` (ENU); see [`docs/correct-geometry-ghost-duplicates.md`](docs/correct-geometry-ghost-duplicates.md) (assert full FILM-rate ENU + PINHOLE size; densify every Nth midframe; skip legs ≪ 2 m).
+This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of the pipeline runs today. Point `interp_backend` at `film` or `rife` in `project.yaml` once those weights live on the machine; until then it falls back to flow. Midframe poses always come from `lerp_pose` (ENU); see [`docs/correct-geometry-ghost-duplicates.md`](docs/correct-geometry-ghost-duplicates.md) (assert full FILM-rate ENU + PINHOLE size; densify every Nth midframe; skip legs ≪ 2 m; posed matching prefers ≥4 m mid clearance).
 
 **Video → point cloud / splat:**
 
@@ -117,14 +117,15 @@ AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-u
 
 `colmap_posed` seeds `cameras.txt`/`images.txt` from align ENU + FOV PINHOLE,
 optionally adds **subsampled FILM midframes** with `lerp_pose` ENU
-(`select_posed_sparse_frames`; min ≥2 m baseline, stride every Nth mid),
+(`select_posed_sparse_frames`; min ≥4 m baseline for matching, stride every Nth mid),
 remaps IMAGE_IDs to the COLMAP database (colmap#497), matches **cross-pano**
-pairs only (same-center orbit headings are pure rotation; guided matching on),
+forward mates (3 along the drive; guided matching off by default),
 keeps two-view tracks, then runs `point_triangulator`. On success writes
 `recon/cloud_photo.ply` as primary. If too few points, fails loud and falls
 back to OpenCV SIFT. Geometry stays photo-derived — OSM/BAG shells are align
 priors only, not Studio hero mesh. Thin covisibility → OpenMVS empty densify:
-see [`docs/openmvs-denser-sparse.md`](docs/openmvs-denser-sparse.md).
+see [`docs/openmvs-denser-sparse.md`](docs/openmvs-denser-sparse.md) and
+[`docs/longer-tracks-no-oom.md`](docs/longer-tracks-no-oom.md).
 
 **Optional OpenMVS densify** is AGPL-3.0; the binary is **not** redistributed in this
 MIT repo. Install `InterfaceCOLMAP` + `DensifyPointCloud` yourself, then

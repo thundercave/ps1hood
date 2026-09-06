@@ -25,7 +25,8 @@ import cv2
 import numpy as np
 
 from ps1_hood.geo import camera_rotation_cv
-from ps1_hood.reconstruct.known_pose import select_stereo_pairs
+from ps1_hood.interpolate.sequence import order_track
+from ps1_hood.reconstruct.known_pose import forward_drive_pairs, select_stereo_pairs
 
 log = logging.getLogger(__name__)
 
@@ -108,17 +109,28 @@ def _count_model_points(model: Path) -> int:
     return 0
 
 
-def mean_track_length(model: Path) -> float | None:
-    """Mean observations/point from points3D.bin (None if unavailable)."""
+def track_length_stats(model: Path) -> dict[str, float | int] | None:
+    """Track-length stats from points3D.bin (None if unavailable).
+
+    Returns ``n_points``, ``mean_track_length``, ``n_ge3`` (points with ≥3 views),
+    and ``frac_ge3``. Mean ≈ 2.0 means the match graph is a matching of edges,
+    not multi-view tracks — OpenMVS neighbor select starves.
+    """
     bin_path = model / "points3D.bin"
     if not bin_path.is_file() or bin_path.stat().st_size < 8:
         return None
     raw = bin_path.read_bytes()
     n = int(struct.unpack("<Q", raw[:8])[0])
     if n < 1:
-        return 0.0
+        return {
+            "n_points": 0,
+            "mean_track_length": 0.0,
+            "n_ge3": 0,
+            "frac_ge3": 0.0,
+        }
     off = 8
     total = 0
+    n_ge3 = 0
     for _ in range(n):
         if off + 8 + 24 + 3 + 8 + 8 > len(raw):
             return None
@@ -129,10 +141,25 @@ def mean_track_length(model: Path) -> float | None:
         track_len = int(struct.unpack_from("<Q", raw, off)[0])
         off += 8
         total += track_len
+        if track_len >= 3:
+            n_ge3 += 1
         off += track_len * 8  # (image_id, point2D_idx) pairs
         if off > len(raw) + 1:
             return None
-    return total / float(n)
+    return {
+        "n_points": n,
+        "mean_track_length": total / float(n),
+        "n_ge3": n_ge3,
+        "frac_ge3": n_ge3 / float(n),
+    }
+
+
+def mean_track_length(model: Path) -> float | None:
+    """Mean observations/point from points3D.bin (None if unavailable)."""
+    stats = track_length_stats(model)
+    if stats is None:
+        return None
+    return float(stats["mean_track_length"])
 
 
 def _validate_sparse_model(model: Path, *, min_points: int = 1, label: str = "COLMAP") -> int:
@@ -217,6 +244,16 @@ def _pano_key(frame: dict[str, Any]) -> str:
     return f"{round(float(frame['e']), 2)}_{round(float(frame['n']), 2)}"
 
 
+def _is_cross_pano_baseline(
+    frames: list[dict[str, Any]], i: int, j: int, *, min_xy_m: float = 1.5
+) -> bool:
+    if _pano_key(frames[i]) == _pano_key(frames[j]):
+        return False
+    be = abs(float(frames[i]["e"]) - float(frames[j]["e"]))
+    bn = abs(float(frames[i]["n"]) - float(frames[j]["n"]))
+    return math.hypot(be, bn) >= min_xy_m
+
+
 def cross_pano_pair_indices(
     frames: list[dict[str, Any]],
     *,
@@ -227,6 +264,8 @@ def cross_pano_pair_indices(
 
     Defaults prefer **more** cross-pano matches (``max_pairs_per_frame=8``) so
     posed sparse covisibility is denser for OpenMVS neighbor selection.
+    Prefer ``cross_pano_forward_pairs`` for multi-view track growth (3 forward
+    mates along the drive); this helper remains for stereo / OpenMVS neighbors.
     """
     pairs = select_stereo_pairs(
         frames,
@@ -235,14 +274,80 @@ def cross_pano_pair_indices(
     )
     out: list[tuple[int, int]] = []
     for i, j in pairs:
-        if _pano_key(frames[i]) == _pano_key(frames[j]):
-            continue
-        # Extra guard: near-zero XY baseline is pure rotation.
-        be = abs(float(frames[i]["e"]) - float(frames[j]["e"]))
-        bn = abs(float(frames[i]["n"]) - float(frames[j]["n"]))
-        if math.hypot(be, bn) < 1.5:
-            continue
-        out.append((i, j))
+        if _is_cross_pano_baseline(frames, i, j):
+            out.append((i, j))
+    return out
+
+
+def cross_pano_forward_pairs(
+    frames: list[dict[str, Any]],
+    *,
+    n_forward: int = 3,
+    min_baseline_m: float = 2.0,
+    max_baseline_m: float = 25.0,
+) -> list[tuple[int, int]]:
+    """Match pairs: each frame → up to ``n_forward`` later drive mates (cross-pano).
+
+    Orders frames with ``order_track`` so sequential + skip-1/skip-2 edges form
+    3-cycles after triangulation (mean track ≫ 2.0). Same-pano orbit mates are
+    dropped. Falls back to ``cross_pano_pair_indices`` if the drive order yields
+    no usable pairs.
+    """
+    if len(frames) < 2:
+        return []
+    # order_track returns pose dicts; map back to indices by identity.
+    ordered = order_track(frames)
+    if len(ordered) < 2:
+        # Degenerate path — keep list order.
+        order_indices = list(range(len(frames)))
+    else:
+        # Match by object identity first, then by (e,n,heading,pano) for copies.
+        id_map = {id(f): i for i, f in enumerate(frames)}
+        used: set[int] = set()
+        order_indices: list[int] = []
+        for fr in ordered:
+            idx = id_map.get(id(fr))
+            if idx is None:
+                for i, f in enumerate(frames):
+                    if i in used:
+                        continue
+                    if (
+                        abs(float(f["e"]) - float(fr["e"])) < 1e-6
+                        and abs(float(f["n"]) - float(fr["n"])) < 1e-6
+                        and abs(float(f["heading"]) - float(fr["heading"])) < 1e-3
+                        and _pano_key(f) == _pano_key(fr)
+                    ):
+                        idx = i
+                        break
+            if idx is None or idx in used:
+                continue
+            used.add(idx)
+            order_indices.append(idx)
+        # Append any frames order_track dropped (orbit leftovers).
+        for i in range(len(frames)):
+            if i not in used:
+                order_indices.append(i)
+
+    pairs = forward_drive_pairs(
+        frames,
+        n_forward=n_forward,
+        min_baseline_m=min_baseline_m,
+        max_baseline_m=max_baseline_m,
+        order_indices=order_indices,
+        quadratic_overlap=True,
+    )
+    out_set: set[tuple[int, int]] = {
+        (i, j) for i, j in pairs if _is_cross_pano_baseline(frames, i, j)
+    }
+    # Union preferred-baseline stereo pairs for extra redundant edges.
+    out_set.update(cross_pano_pair_indices(frames, min_baseline_m=min_baseline_m))
+    out = sorted(out_set)
+    if not out:
+        log.warning(
+            "forward drive pairs empty after cross-pano filter — "
+            "falling back to select_stereo_pairs"
+        )
+        return cross_pano_pair_indices(frames, min_baseline_m=min_baseline_m)
     return out
 
 
@@ -480,14 +585,25 @@ def write_cross_pano_match_list(
     frames: list[dict[str, Any]],
     image_names: list[str],
     path: Path,
+    *,
+    n_forward: int = 3,
 ) -> int:
-    """Write image-name pairs for matches_importer (cross-pano only)."""
-    pairs = cross_pano_pair_indices(frames)
+    """Write image-name pairs for matches_importer (cross-pano forward mates).
+
+    Default: each frame ↔ up to ``n_forward`` later drive neighbors so tracks
+    can chain across 3+ views. Same-pano orbit mates stay excluded.
+    """
+    pairs = cross_pano_forward_pairs(frames, n_forward=n_forward)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="ascii") as fh:
         for i, j in pairs:
             fh.write(f"{image_names[i]} {image_names[j]}\n")
-    log.info("COLMAP match list: %s cross-pano pairs → %s", len(pairs), path)
+    log.info(
+        "COLMAP match list: %s cross-pano forward pairs (n_forward=%s) → %s",
+        len(pairs),
+        n_forward,
+        path,
+    )
     return len(pairs)
 
 
@@ -654,12 +770,14 @@ def matches_importer_argv(
     database: Path,
     match_list: Path,
     *,
-    guided_matching: bool = True,
+    guided_matching: bool = False,
+    max_num_matches: int | None = None,
 ) -> list[str]:
     """Build ``matches_importer`` argv for cross-pano pair lists.
 
-    Enables ``SiftMatching.guided_matching`` when available (denser inliers
-    under known geometry). Falls back without the flag if help omits it.
+    Guided matching is **off by default** (OOM risk on dense FILM sets). When
+    enabled, constrain with ``max_num_matches`` (2048–4096) and keep matching
+    on the custom pair list only — never exhaustive+guided.
     """
     _extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
     cmd = [
@@ -673,11 +791,20 @@ def matches_importer_argv(
         "pairs",
         *match_gpu,
     ]
-    if guided_matching:
+    help_txt = ""
+    if guided_matching or max_num_matches is not None:
         help_txt = _colmap_subcommand_help(colmap, "matches_importer")
+    if guided_matching:
         if "guided_matching" in help_txt or not help_txt:
             # Empty help → still try the flag (COLMAP 3.10+ has it).
             cmd.extend(["--SiftMatching.guided_matching", "1"])
+        # Cap matches when guiding to reduce OOM (pair list already scoped).
+        cap = 4096 if max_num_matches is None else int(max_num_matches)
+        if "max_num_matches" in help_txt or not help_txt:
+            cmd.extend(["--SiftMatching.max_num_matches", str(cap)])
+    elif max_num_matches is not None:
+        if "max_num_matches" in help_txt or not help_txt:
+            cmd.extend(["--SiftMatching.max_num_matches", str(int(max_num_matches))])
     return cmd
 
 
@@ -787,6 +914,8 @@ def feature_extractor_argv(
     database: Path,
     image_path: Path,
     frames: list[dict[str, Any]],
+    *,
+    max_image_size: int | None = None,
 ) -> list[str]:
     """Build ``colmap feature_extractor`` argv for the posed path.
 
@@ -794,6 +923,9 @@ def feature_extractor_argv(
     ``camera_params`` (COLMAP then silently omits odd-sized images). Prefer
     per-image cameras so intrinsics stay honest for known-pose triangulation;
     ``write_known_pose_model`` already emits one PINHOLE per (w, h, fov).
+
+    Optional ``max_image_size`` (1200–1600) downscales before SIFT — use when
+    enabling guided matching to avoid OOM.
     """
     extract_gpu, _match_gpu = colmap_cpu_gpu_flags(colmap)
     cmd = [
@@ -807,6 +939,8 @@ def feature_extractor_argv(
         "PINHOLE",
         *extract_gpu,
     ]
+    if max_image_size is not None:
+        cmd.extend(["--SiftExtraction.max_image_size", str(int(max_image_size))])
     if frame_sizes_uniform(frames):
         first_w, first_h = _frame_size(frames[0])
         first_fov = float(frames[0].get("fov") or 90.0)
@@ -836,13 +970,18 @@ def run_colmap_posed(
     *,
     ply_out: Path | None = None,
     min_points: int = _MIN_PHOTO_POINTS,
+    guided_matching: bool = False,
+    max_image_size: int | None = None,
+    max_num_matches: int | None = None,
+    n_forward: int = 3,
 ) -> Path:
     """Triangulate with known poses via point_triangulator (never mapper).
 
     Critical steps for SV orbits:
     - PINHOLE from crop FoV; t = -R @ C
     - Remap IMAGE_ID to database after feature_extractor (colmap#497)
-    - Match cross-pano pairs only (same-center headings = pure rotation)
+    - Match cross-pano **forward** mates (3 along drive) — not just nearest
+    - Guided matching **off** by default (OOM); optional with size/match caps
     - Triangulator: clear_points, allow two-view tracks, low min tri angle
     - No PatchMatch / dense (needs GPU)
     """
@@ -853,7 +992,7 @@ def run_colmap_posed(
     if len(frames) != len(image_names):
         raise ValueError("frames / image_names mismatch")
 
-    pair_count = len(cross_pano_pair_indices(frames))
+    pair_count = len(cross_pano_forward_pairs(frames, n_forward=n_forward))
     if pair_count < 1:
         raise RuntimeError(
             "no cross-pano stereo pairs (need drive-adjacent views with baseline). "
@@ -870,7 +1009,18 @@ def run_colmap_posed(
         shutil.rmtree(sparse_prior)
     write_known_pose_model(frames, image_names, sparse_prior)
 
-    _run(feature_extractor_argv(colmap, db, images, frames))
+    # When guiding, downscale SIFT (1200–1600) to reduce OOM risk.
+    extract_size = max_image_size
+    if guided_matching and extract_size is None:
+        extract_size = 1600
+    match_cap = max_num_matches
+    if guided_matching and match_cap is None:
+        match_cap = 4096
+    _run(
+        feature_extractor_argv(
+            colmap, db, images, frames, max_image_size=extract_size
+        )
+    )
 
     # colmap#497: IMAGE_ID in images.txt MUST match database after extraction.
     # May drop a minority of images COLMAP omitted (odd crop sizes).
@@ -879,22 +1029,37 @@ def run_colmap_posed(
     )
 
     match_list = workspace / "cross_pano_pairs.txt"
-    n_pairs = write_cross_pano_match_list(frames, image_names, match_list)
+    n_pairs = write_cross_pano_match_list(
+        frames, image_names, match_list, n_forward=n_forward
+    )
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
-    # Guided matching densifies inliers under known geometry but can OOM on
-    # large SV sets — clear partial matcher tables and retry without it.
+    # Guided matching off by default. If enabled and it OOMs, clear + retry plain.
     try:
-        _run(matches_importer_argv(colmap, db, match_list, guided_matching=True))
+        _run(
+            matches_importer_argv(
+                colmap,
+                db,
+                match_list,
+                guided_matching=guided_matching,
+                max_num_matches=match_cap,
+            )
+        )
     except (subprocess.CalledProcessError, OSError) as exc:
+        if not guided_matching:
+            raise
         log.warning(
             "COLMAP matches_importer with guided_matching failed (%s); "
             "retrying without guided matching",
             exc,
         )
         clear_db_matches(db)
-        _run(matches_importer_argv(colmap, db, match_list, guided_matching=False))
+        _run(
+            matches_importer_argv(
+                colmap, db, match_list, guided_matching=False
+            )
+        )
 
     # Images with only failed geometric verification can SIGABRT point_triangulator.
     frames, image_names = filter_frames_registered_in_matches(
@@ -948,20 +1113,28 @@ def run_colmap_posed(
     out = ply_out if ply_out is not None else workspace.parent / "cloud_photo.ply"
     _convert_model_to_ply(colmap, model, out)
     n = _count_model_points(model)
-    mtl = mean_track_length(model)
-    if mtl is not None:
+    stats = track_length_stats(model)
+    if stats is not None:
+        mtl = float(stats["mean_track_length"])
+        frac_ge3 = float(stats["frac_ge3"])
+        n_ge3 = int(stats["n_ge3"])
         log.info(
-            "COLMAP posed → %s (%s points, mean track length %.2f, %s cross-pano pairs)",
+            "COLMAP posed → %s (%s points, mean track length %.2f, "
+            "%.1f%% ≥3 views (%s pts), %s cross-pano forward pairs)",
             out,
             n,
             mtl,
+            100.0 * frac_ge3,
+            n_ge3,
             n_pairs,
         )
         if mtl < 2.2:
             log.warning(
-                "posed sparse covisibility thin (mean track length %.2f < 2.2) — "
-                "OpenMVS SelectNeighborViews may still fail; grow midframes / matches",
+                "posed sparse covisibility thin (mean track length %.2f < 2.2; "
+                "%.1f%% ≥3-view) — OpenMVS SelectNeighborViews may still fail; "
+                "grow midframes / forward matches (target mean ≳ 2.5–3)",
                 mtl,
+                100.0 * frac_ge3,
             )
     else:
         log.info("COLMAP posed → %s (%s points, %s cross-pano pairs)", out, n, n_pairs)

@@ -20,6 +20,8 @@ from ps1_hood.reconstruct.colmap import (
     frames_have_known_poses,
     matches_importer_argv,
     mean_track_length,
+    track_length_stats,
+    cross_pano_forward_pairs,
     read_db_cameras,
     read_db_image_ids,
     remap_known_pose_model_to_db,
@@ -539,3 +541,92 @@ def test_matches_importer_argv_can_disable_guided(monkeypatch):
         "colmap", Path("db.db"), Path("pairs.txt"), guided_matching=False
     )
     assert "--SiftMatching.guided_matching" not in argv
+
+
+def test_matches_importer_argv_default_guided_off(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    argv = matches_importer_argv("colmap", Path("db.db"), Path("pairs.txt"))
+    assert "--SiftMatching.guided_matching" not in argv
+
+
+def test_matches_importer_guided_caps_max_matches(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help",
+        lambda _c, _s: "--SiftMatching.guided_matching\n--SiftMatching.max_num_matches\n",
+    )
+    argv = matches_importer_argv(
+        "colmap", Path("db.db"), Path("pairs.txt"), guided_matching=True
+    )
+    assert argv[argv.index("--SiftMatching.guided_matching") + 1] == "1"
+    assert argv[argv.index("--SiftMatching.max_num_matches") + 1] == "4096"
+
+
+def test_feature_extractor_max_image_size(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    frames = [_fr(0, 0, 0, "p1"), _fr(8, 0, 0, "p2")]
+    argv = feature_extractor_argv(
+        "colmap", Path("db.db"), Path("images"), frames, max_image_size=1600
+    )
+    assert "--SiftExtraction.max_image_size" in argv
+    assert argv[argv.index("--SiftExtraction.max_image_size") + 1] == "1600"
+
+
+def test_cross_pano_forward_pairs_chains_along_drive():
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(5, 0, 0, "p2"),
+        _fr(10, 0, 0, "p3"),
+        _fr(15, 0, 0, "p4"),
+        _fr(20, 0, 0, "p5"),
+    ]
+    pairs = cross_pano_forward_pairs(frames, n_forward=3)
+    # 0 should reach 1,2,3
+    assert (0, 1) in pairs and (0, 2) in pairs and (0, 3) in pairs
+    # Overlap creates multi-view potential
+    assert (1, 2) in pairs and (1, 3) in pairs
+
+
+def test_cross_pano_forward_skips_same_pano_orbit():
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(0, 0, 90, "p1"),
+        _fr(8, 0, 0, "p2"),
+        _fr(16, 0, 0, "p3"),
+    ]
+    pairs = cross_pano_forward_pairs(frames, n_forward=3)
+    for i, j in pairs:
+        assert frames[i]["pano_id"] != frames[j]["pano_id"]
+
+
+def test_track_length_stats_frac_ge3(tmp_path: Path):
+    import struct
+
+    model = tmp_path / "model"
+    model.mkdir()
+    # 2 points: track lens 2 and 4
+    blob = struct.pack("<Q", 2)
+    for pid, tlen in ((1, 2), (2, 4)):
+        blob += struct.pack("<Q", pid)
+        blob += struct.pack("<ddd", 1.0, 2.0, 3.0)
+        blob += bytes([10, 20, 30])
+        blob += struct.pack("<d", 0.5)
+        blob += struct.pack("<Q", tlen)
+        for img in range(tlen):
+            blob += struct.pack("<II", img + 1, 0)
+    (model / "points3D.bin").write_bytes(blob)
+    stats = track_length_stats(model)
+    assert stats is not None
+    assert stats["n_points"] == 2
+    assert stats["mean_track_length"] == pytest.approx(3.0)
+    assert stats["n_ge3"] == 1
+    assert stats["frac_ge3"] == pytest.approx(0.5)
