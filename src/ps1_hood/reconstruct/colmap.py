@@ -11,6 +11,7 @@ and colmap#497 (IMAGE_ID must match database or you get empty clouds).
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import shutil
@@ -311,20 +312,57 @@ def remap_known_pose_model_to_db(
     frames: list[dict[str, Any]],
     image_names: list[str],
     database: Path,
-) -> Path:
-    """Rewrite images.txt IMAGE_IDs to match feature_extractor DB (colmap#497)."""
+    *,
+    max_missing_frac: float = 0.10,
+    min_images: int = 4,
+) -> tuple[Path, list[dict[str, Any]], list[str]]:
+    """Rewrite images.txt IMAGE_IDs to match feature_extractor DB (colmap#497).
+
+    If a small minority of ``image_names`` are absent from the DB (e.g. COLMAP
+    silently skipped odd-sized crops under ``single_camera``), drop those frames,
+    rewrite the prior with survivors, and return the filtered lists. Hard-fail
+    when too many are missing, too few remain, or no cross-pano pairs survive.
+    """
+    if len(frames) != len(image_names):
+        raise ValueError("frames / image_names mismatch")
     db_map = read_db_image_ids(database)
     missing = [n for n in image_names if n not in db_map]
+    kept_frames = frames
+    kept_names = image_names
     if missing:
-        raise RuntimeError(
-            f"COLMAP database missing {len(missing)} images after feature_extractor "
-            f"(e.g. {missing[0]}). Cannot remap IMAGE_IDs."
+        frac = len(missing) / max(len(image_names), 1)
+        survivors = [(f, n) for f, n in zip(frames, image_names, strict=True) if n in db_map]
+        if frac > max_missing_frac or len(survivors) < min_images:
+            raise RuntimeError(
+                f"COLMAP database missing {len(missing)}/{len(image_names)} images "
+                f"after feature_extractor (e.g. {missing[0]}). Cannot remap IMAGE_IDs "
+                f"(frac={frac:.1%} > {max_missing_frac:.0%} or survivors={len(survivors)} "
+                f"< {min_images})."
+            )
+        kept_frames = [f for f, _ in survivors]
+        kept_names = [n for _, n in survivors]
+        if not cross_pano_pair_indices(kept_frames):
+            raise RuntimeError(
+                f"COLMAP database missing {len(missing)} images (e.g. {missing[0]}); "
+                "after filtering survivors there are no cross-pano stereo pairs left."
+            )
+        log.warning(
+            "COLMAP DB missing %s/%s images after feature_extractor (e.g. %s); "
+            "continuing with %s survivors",
+            len(missing),
+            len(image_names),
+            missing[0],
+            len(kept_names),
         )
-    image_ids = [db_map[n][0] for n in image_names]
-    camera_ids = [db_map[n][1] for n in image_names]
-    return write_known_pose_model(
-        frames, image_names, model_dir, image_ids=image_ids, camera_ids=camera_ids
+    image_ids = [db_map[n][0] for n in kept_names]
+    camera_ids_raw = [db_map[n][1] for n in kept_names]
+    # One PINHOLE per (w,h,fov) keeps intrinsics honest when sizes differ.
+    # Only pin DB camera_ids when feature_extractor used a single shared camera.
+    camera_ids = camera_ids_raw if len(set(camera_ids_raw)) == 1 else None
+    path = write_known_pose_model(
+        kept_frames, kept_names, model_dir, image_ids=image_ids, camera_ids=camera_ids
     )
+    return path, kept_frames, kept_names
 
 
 def write_cross_pano_match_list(
@@ -340,6 +378,145 @@ def write_cross_pano_match_list(
             fh.write(f"{image_names[i]} {image_names[j]}\n")
     log.info("COLMAP match list: %s cross-pano pairs → %s", len(pairs), path)
     return len(pairs)
+
+
+def _pair_id_to_image_ids(pair_id: int) -> tuple[int, int]:
+    """Decode COLMAP ``pair_id`` → ``(image_id1, image_id2)`` with id1 < id2."""
+    # Database::PairIdToImagePair — kMaxNumImages = 2^31 - 1
+    max_images = 2147483647
+    id2 = int(pair_id % max_images)
+    id1 = int((pair_id - id2) // max_images)
+    return id1, id2
+
+
+def image_ids_with_two_view_tracks(database: Path) -> set[int]:
+    """Image IDs that appear in at least one non-empty ``two_view_geometries`` row."""
+    con = sqlite3.connect(str(database))
+    try:
+        rows = con.execute(
+            "SELECT pair_id, rows FROM two_view_geometries WHERE rows IS NOT NULL AND rows > 0"
+        ).fetchall()
+    finally:
+        con.close()
+    out: set[int] = set()
+    for pair_id, _n in rows:
+        a, b = _pair_id_to_image_ids(int(pair_id))
+        out.add(a)
+        out.add(b)
+    return out
+
+
+def filter_frames_registered_in_matches(
+    frames: list[dict[str, Any]],
+    image_names: list[str],
+    database: Path,
+    *,
+    model_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Drop images with no successful two-view geometry (COLMAP may SIGABRT on them).
+
+    If ``model_dir`` is set, rewrite the known-pose prior for survivors (DB IMAGE_IDs).
+    """
+    if len(frames) != len(image_names):
+        raise ValueError("frames / image_names mismatch")
+    db_map = read_db_image_ids(database)
+    tracked = image_ids_with_two_view_tracks(database)
+    kept_frames: list[dict[str, Any]] = []
+    kept_names: list[str] = []
+    dropped: list[str] = []
+    for fr, name in zip(frames, image_names, strict=True):
+        if name not in db_map:
+            dropped.append(name)
+            continue
+        iid = db_map[name][0]
+        if iid not in tracked:
+            dropped.append(name)
+            continue
+        kept_frames.append(fr)
+        kept_names.append(name)
+    if dropped:
+        log.warning(
+            "COLMAP: dropping %s/%s images with no verified two-view tracks "
+            "(e.g. %s); continuing with %s",
+            len(dropped),
+            len(image_names),
+            dropped[0],
+            len(kept_names),
+        )
+    if len(kept_names) < 4:
+        raise RuntimeError(
+            f"Too few images with verified matches after filtering "
+            f"({len(kept_names)} left; dropped {len(dropped)})."
+        )
+    if not cross_pano_pair_indices(kept_frames):
+        raise RuntimeError(
+            "No cross-pano pairs left after dropping images without two-view tracks."
+        )
+    if model_dir is not None:
+        image_ids = [db_map[n][0] for n in kept_names]
+        camera_ids_raw = [db_map[n][1] for n in kept_names]
+        camera_ids = camera_ids_raw if len(set(camera_ids_raw)) == 1 else None
+        write_known_pose_model(
+            kept_frames, kept_names, model_dir, image_ids=image_ids, camera_ids=camera_ids
+        )
+    return kept_frames, kept_names
+
+
+
+def choose_colmap_cpu_gpu_flags(
+    feature_help: str,
+    matching_help: str = "",
+) -> tuple[list[str], list[str]]:
+    """Pick ``use_gpu=0`` argv for feature extraction and matching.
+
+    COLMAP ≤3.12 uses ``--SiftExtraction.use_gpu`` / ``--SiftMatching.use_gpu``.
+    COLMAP 3.13+ renamed these to ``--FeatureExtraction.use_gpu`` /
+    ``--FeatureMatching.use_gpu``. Prefer the names present in ``*-h`` output;
+    if help is empty/unknown, keep the legacy Sift* names.
+    """
+    extract_key = (
+        "FeatureExtraction"
+        if "FeatureExtraction.use_gpu" in feature_help
+        else "SiftExtraction"
+    )
+    match_src = matching_help if matching_help else feature_help
+    match_key = (
+        "FeatureMatching"
+        if "FeatureMatching.use_gpu" in match_src
+        else "SiftMatching"
+    )
+    return (
+        [f"--{extract_key}.use_gpu", "0"],
+        [f"--{match_key}.use_gpu", "0"],
+    )
+
+
+def _colmap_subcommand_help(colmap: str, subcommand: str) -> str:
+    try:
+        proc = subprocess.run(
+            [colmap, subcommand, "-h"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+@functools.lru_cache(maxsize=8)
+def colmap_cpu_gpu_flags(colmap: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Probe COLMAP help and return cached CPU ``use_gpu=0`` flag tuples.
+
+    Returns ``(extract_flags, match_flags)`` suitable for ``list.extend`` /
+    splat into feature_extractor / matcher argv. Always forces GPU off (AMD /
+    no-CUDA boxes).
+    """
+    feat_help = _colmap_subcommand_help(colmap, "feature_extractor")
+    match_help = _colmap_subcommand_help(colmap, "exhaustive_matcher")
+    extract, matching = choose_colmap_cpu_gpu_flags(feat_help, match_help)
+    return tuple(extract), tuple(matching)
 
 
 def _colmap_bin() -> str:
@@ -384,6 +561,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
     if sparse.exists():
         shutil.rmtree(sparse)
     sparse.mkdir(parents=True, exist_ok=True)
+    extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
     _run(
         [
             colmap,
@@ -396,8 +574,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
             "1",
             "--ImageReader.camera_model",
             "PINHOLE",
-            "--SiftExtraction.use_gpu",
-            "0",
+            *extract_gpu,
         ]
     )
     _run(
@@ -406,8 +583,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
             "exhaustive_matcher",
             "--database_path",
             str(db),
-            "--SiftMatching.use_gpu",
-            "0",
+            *match_gpu,
         ]
     )
     _run(
@@ -433,6 +609,62 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
     _convert_model_to_ply(colmap, model, out)
     log.info("COLMAP mapper %s → %s (%s points)", model, out, n)
     return out
+
+
+
+def frame_sizes_uniform(frames: list[dict[str, Any]]) -> bool:
+    """True when every frame reports the same (width, height)."""
+    if not frames:
+        return True
+    sizes = {_frame_size(f) for f in frames}
+    return len(sizes) <= 1
+
+
+def feature_extractor_argv(
+    colmap: str,
+    database: Path,
+    image_path: Path,
+    frames: list[dict[str, Any]],
+) -> list[str]:
+    """Build ``colmap feature_extractor`` argv for the posed path.
+
+    When crop sizes differ, do **not** force ``single_camera`` + global
+    ``camera_params`` (COLMAP then silently omits odd-sized images). Prefer
+    per-image cameras so intrinsics stay honest for known-pose triangulation;
+    ``write_known_pose_model`` already emits one PINHOLE per (w, h, fov).
+    """
+    extract_gpu, _match_gpu = colmap_cpu_gpu_flags(colmap)
+    cmd = [
+        colmap,
+        "feature_extractor",
+        "--database_path",
+        str(database),
+        "--image_path",
+        str(image_path),
+        "--ImageReader.camera_model",
+        "PINHOLE",
+        *extract_gpu,
+    ]
+    if frame_sizes_uniform(frames):
+        first_w, first_h = _frame_size(frames[0])
+        first_fov = float(frames[0].get("fov") or 90.0)
+        fx = _focal_px(first_w, first_fov)
+        cam_params = f"{fx:.6f},{fx:.6f},{first_w / 2.0:.6f},{first_h / 2.0:.6f}"
+        cmd.extend(
+            [
+                "--ImageReader.single_camera",
+                "1",
+                "--ImageReader.camera_params",
+                cam_params,
+            ]
+        )
+    else:
+        # Multi-camera: let COLMAP register each image with its own size.
+        cmd.extend(["--ImageReader.single_camera", "0"])
+        log.info(
+            "COLMAP posed: frame sizes differ — using single_camera=0 (no global camera_params)"
+        )
+    return cmd
 
 
 def run_colmap_posed(
@@ -476,39 +708,20 @@ def run_colmap_posed(
         shutil.rmtree(sparse_prior)
     write_known_pose_model(frames, image_names, sparse_prior)
 
-    first_w, first_h = _frame_size(frames[0])
-    first_fov = float(frames[0].get("fov") or 90.0)
-    fx = _focal_px(first_w, first_fov)
-    # PINHOLE params: fx, fy, cx, cy
-    cam_params = f"{fx:.6f},{fx:.6f},{first_w / 2.0:.6f},{first_h / 2.0:.6f}"
-
-    _run(
-        [
-            colmap,
-            "feature_extractor",
-            "--database_path",
-            str(db),
-            "--image_path",
-            str(images),
-            "--ImageReader.single_camera",
-            "1",
-            "--ImageReader.camera_model",
-            "PINHOLE",
-            "--ImageReader.camera_params",
-            cam_params,
-            "--SiftExtraction.use_gpu",
-            "0",
-        ]
-    )
+    _run(feature_extractor_argv(colmap, db, images, frames))
 
     # colmap#497: IMAGE_ID in images.txt MUST match database after extraction.
-    remap_known_pose_model_to_db(sparse_prior, frames, image_names, db)
+    # May drop a minority of images COLMAP omitted (odd crop sizes).
+    _, frames, image_names = remap_known_pose_model_to_db(
+        sparse_prior, frames, image_names, db
+    )
 
     match_list = workspace / "cross_pano_pairs.txt"
     n_pairs = write_cross_pano_match_list(frames, image_names, match_list)
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
+    _extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
     _run(
         [
             colmap,
@@ -519,9 +732,13 @@ def run_colmap_posed(
             str(match_list),
             "--match_type",
             "pairs",
-            "--SiftMatching.use_gpu",
-            "0",
+            *match_gpu,
         ]
+    )
+
+    # Images with only failed geometric verification can SIGABRT point_triangulator.
+    frames, image_names = filter_frames_registered_in_matches(
+        frames, image_names, db, model_dir=sparse_prior
     )
 
     sparse_out = workspace / "sparse_posed"

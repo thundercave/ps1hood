@@ -9,7 +9,12 @@ import numpy as np
 from ps1_hood.reconstruct.colmap import (
     _focal_px,
     _rotmat_to_qvec,
+    choose_colmap_cpu_gpu_flags,
+    colmap_cpu_gpu_flags,
     cross_pano_pair_indices,
+    feature_extractor_argv,
+    filter_frames_registered_in_matches,
+    frame_sizes_uniform,
     frames_have_known_poses,
     read_db_image_ids,
     remap_known_pose_model_to_db,
@@ -103,7 +108,10 @@ def test_remap_image_ids(tmp_path: Path):
     con.execute("INSERT INTO images VALUES (9, 'bbb.jpg', 1)")
     con.commit()
     con.close()
-    remap_known_pose_model_to_db(model, frames, names, db)
+    path, kept_frames, kept_names = remap_known_pose_model_to_db(model, frames, names, db)
+    assert path == model
+    assert kept_names == names
+    assert len(kept_frames) == 2
     text = (model / "images.txt").read_text()
     assert text.splitlines()[3].startswith("7 ") or any(
         ln.startswith("7 ") for ln in text.splitlines()
@@ -125,3 +133,259 @@ def test_match_list_cross_pano(tmp_path: Path):
     assert n == len(lines)
     for ln in lines:
         assert "a.jpg b.jpg" not in ln  # same pano excluded
+
+def test_remap_filters_missing_db_images(tmp_path: Path):
+    import sqlite3
+
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(8, 0, 0, "p2"),
+        _fr(16, 0, 0, "p3"),
+        _fr(24, 0, 5, "p4"),
+        _fr(32, 0, 5, "p5"),
+    ]
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+    model = write_known_pose_model(frames, names, tmp_path / "sparse")
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    # Omit one image (20% would hard-fail; 1/5=20% > 10%). Use 10 frames so 1 missing = 10%.
+    con.execute("INSERT INTO images VALUES (1, 'a.jpg', 1)")
+    con.execute("INSERT INTO images VALUES (2, 'b.jpg', 1)")
+    con.execute("INSERT INTO images VALUES (3, 'c.jpg', 2)")
+    con.execute("INSERT INTO images VALUES (4, 'd.jpg', 2)")
+    # e.jpg missing
+    con.commit()
+    con.close()
+
+    # 1/5 = 20% > 10% → hard fail
+    try:
+        remap_known_pose_model_to_db(model, frames, names, db)
+        raise AssertionError("expected RuntimeError for >10% missing")
+    except RuntimeError as exc:
+        assert "missing" in str(exc).lower()
+
+    # 10 frames, 1 missing → 10% exactly allowed (frac > max, so use 0.10 and 1/11)
+    frames10 = [_fr(i * 8, 0, 0 if i % 2 == 0 else 5, f"p{i}") for i in range(10)]
+    # ensure cross-pano: alternate pano ids with baseline
+    frames10 = []
+    names10 = []
+    for i in range(10):
+        frames10.append(_fr((i // 2) * 8, 0, (i % 2) * 90, f"pano{i // 2}"))
+        names10.append(f"img{i}.jpg")
+    model2 = write_known_pose_model(frames10, names10, tmp_path / "sparse2")
+    db2 = tmp_path / "database2.db"
+    con = sqlite3.connect(db2)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    for i, n in enumerate(names10):
+        if n == "img9.jpg":
+            continue  # 1/10 = 10% — frac > 0.10 is False for ==? 0.1 > 0.1 is False
+        con.execute("INSERT INTO images VALUES (?, ?, 1)", (i + 1, n))
+    con.commit()
+    con.close()
+    path, kept_f, kept_n = remap_known_pose_model_to_db(model2, frames10, names10, db2)
+    assert "img9.jpg" not in kept_n
+    assert len(kept_n) == 9
+    assert len(kept_f) == 9
+    text_imgs = (path / "images.txt").read_text()
+    assert "img9.jpg" not in text_imgs
+    assert "img0.jpg" in text_imgs
+
+
+def test_remap_hard_fails_when_too_few_remain(tmp_path: Path):
+    import sqlite3
+
+    frames = [_fr(0, 0, 0, "p1"), _fr(8, 0, 0, "p2"), _fr(16, 0, 0, "p3")]
+    names = ["a.jpg", "b.jpg", "c.jpg"]
+    model = write_known_pose_model(frames, names, tmp_path / "sparse")
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    con.execute("INSERT INTO images VALUES (1, 'a.jpg', 1)")
+    con.commit()
+    con.close()
+    try:
+        remap_known_pose_model_to_db(model, frames, names, db)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "missing" in str(exc).lower()
+
+
+def test_feature_extractor_argv_uniform_uses_single_camera(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
+    frames = [_fr(0, 0, 0, "p1"), _fr(8, 0, 0, "p2")]
+    assert frame_sizes_uniform(frames)
+    argv = feature_extractor_argv("colmap", Path("db.db"), Path("images"), frames)
+    assert "--ImageReader.single_camera" in argv
+    i = argv.index("--ImageReader.single_camera")
+    assert argv[i + 1] == "1"
+    assert "--ImageReader.camera_params" in argv
+    assert "PINHOLE" in argv
+
+
+def test_feature_extractor_argv_mixed_sizes_omits_global_params(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--FeatureExtraction.use_gpu", "0"), ("--FeatureMatching.use_gpu", "0")),
+    )
+    a = _fr(0, 0, 0, "p1")
+    b = _fr(8, 0, 0, "p2")
+    b["width"] = 1728  # differ from 640
+    b["height"] = 1004
+    assert not frame_sizes_uniform([a, b])
+    argv = feature_extractor_argv("colmap", Path("db.db"), Path("images"), [a, b])
+    assert "--FeatureExtraction.use_gpu" in argv
+    assert argv[argv.index("--FeatureExtraction.use_gpu") + 1] == "0"
+    assert "--ImageReader.single_camera" in argv
+    i = argv.index("--ImageReader.single_camera")
+    assert argv[i + 1] == "0"
+    assert "--ImageReader.camera_params" not in argv
+    assert argv[argv.index("--ImageReader.camera_model") + 1] == "PINHOLE"
+
+
+def test_choose_colmap_cpu_gpu_flags_legacy_sift():
+    feat = "  --SiftExtraction.use_gpu arg (=1)\n  --SiftExtraction.gpu_index arg (=-1)\n"
+    match = "  --SiftMatching.use_gpu arg (=1)\n  --SiftMatching.max_ratio arg (=0.8)\n"
+    extract, matching = choose_colmap_cpu_gpu_flags(feat, match)
+    assert extract == ["--SiftExtraction.use_gpu", "0"]
+    assert matching == ["--SiftMatching.use_gpu", "0"]
+
+
+def test_choose_colmap_cpu_gpu_flags_v313_feature():
+    feat = "  --FeatureExtraction.use_gpu arg (=1)\n  --FeatureExtraction.gpu_index arg (=-1)\n"
+    match = "  --FeatureMatching.use_gpu arg (=1)\n  --FeatureMatching.max_ratio arg (=0.8)\n"
+    extract, matching = choose_colmap_cpu_gpu_flags(feat, match)
+    assert extract == ["--FeatureExtraction.use_gpu", "0"]
+    assert matching == ["--FeatureMatching.use_gpu", "0"]
+
+
+def test_choose_colmap_cpu_gpu_flags_empty_help_defaults_legacy():
+    extract, matching = choose_colmap_cpu_gpu_flags("", "")
+    assert extract == ["--SiftExtraction.use_gpu", "0"]
+    assert matching == ["--SiftMatching.use_gpu", "0"]
+
+
+def test_colmap_cpu_gpu_flags_probes_help(monkeypatch):
+    colmap_cpu_gpu_flags.cache_clear()
+
+    def fake_help(_colmap: str, subcommand: str) -> str:
+        if subcommand == "feature_extractor":
+            return "--FeatureExtraction.use_gpu arg (=1)\n"
+        if subcommand == "exhaustive_matcher":
+            return "--FeatureMatching.use_gpu arg (=1)\n"
+        return ""
+
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help", fake_help
+    )
+    extract, matching = colmap_cpu_gpu_flags("/fake/colmap")
+    assert extract == ("--FeatureExtraction.use_gpu", "0")
+    assert matching == ("--FeatureMatching.use_gpu", "0")
+    colmap_cpu_gpu_flags.cache_clear()
+
+
+def test_colmap_cpu_gpu_flags_probes_legacy(monkeypatch):
+    colmap_cpu_gpu_flags.cache_clear()
+
+    def fake_help(_colmap: str, subcommand: str) -> str:
+        if subcommand == "feature_extractor":
+            return "--SiftExtraction.use_gpu arg (=1)\n"
+        return "--SiftMatching.use_gpu arg (=1)\n"
+
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help", fake_help
+    )
+    extract, matching = colmap_cpu_gpu_flags("/fake/colmap-legacy")
+    assert extract == ("--SiftExtraction.use_gpu", "0")
+    assert matching == ("--SiftMatching.use_gpu", "0")
+    colmap_cpu_gpu_flags.cache_clear()
+
+
+def test_filter_frames_drops_images_without_tvg(tmp_path: Path):
+    import sqlite3
+
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(8, 0, 0, "p2"),
+        _fr(16, 0, 5, "p3"),
+        _fr(24, 0, 5, "p4"),
+        _fr(32, 0, 0, "p5"),
+    ]
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    con.execute(
+        "CREATE TABLE two_view_geometries (pair_id INTEGER PRIMARY KEY, rows INTEGER)"
+    )
+    for i, n in enumerate(names, start=1):
+        con.execute("INSERT INTO images VALUES (?, ?, 1)", (i, n))
+    # COLMAP pair_id: id1 * max + id2 with id1 < id2, max=2147483647
+    max_images = 2147483647
+    # Successful track between 1-2 and 3-4; image 5 orphan
+    con.execute(
+        "INSERT INTO two_view_geometries VALUES (?, ?)",
+        (1 * max_images + 2, 10),
+    )
+    con.execute(
+        "INSERT INTO two_view_geometries VALUES (?, ?)",
+        (3 * max_images + 4, 8),
+    )
+    con.execute(
+        "INSERT INTO two_view_geometries VALUES (?, ?)",
+        (1 * max_images + 5, 0),  # empty — must not count
+    )
+    con.commit()
+    con.close()
+    model = write_known_pose_model(frames, names, tmp_path / "sparse")
+    kept_f, kept_n = filter_frames_registered_in_matches(
+        frames, names, db, model_dir=model
+    )
+    assert "e.jpg" not in kept_n
+    assert set(kept_n) == {"a.jpg", "b.jpg", "c.jpg", "d.jpg"}
+    assert "e.jpg" not in (model / "images.txt").read_text()
+
+
+def test_remap_uses_size_grouped_cameras_when_db_multi_cam(tmp_path: Path):
+    import sqlite3
+
+    frames = [
+        _fr(0, 0, 0, "p1"),
+        _fr(8, 0, 0, "p2"),
+        _fr(16, 0, 5, "p3"),
+        _fr(24, 0, 5, "p4"),
+    ]
+    frames[1]["width"] = 800
+    frames[1]["height"] = 480
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    model = write_known_pose_model(frames, names, tmp_path / "sparse")
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+    )
+    # Per-image cameras as single_camera=0 would create
+    for i, n in enumerate(names, start=1):
+        con.execute("INSERT INTO images VALUES (?, ?, ?)", (i, n, i))
+    con.commit()
+    con.close()
+    path, kept_f, kept_n = remap_known_pose_model_to_db(model, frames, names, db)
+    assert kept_n == names
+    cams = (path / "cameras.txt").read_text()
+    # Size-grouped: 640x480 and 800x480 → 2 cameras, not 4
+    cam_lines = [ln for ln in cams.splitlines() if ln and not ln.startswith("#")]
+    assert len(cam_lines) == 2
+    assert "PINHOLE 640 480" in cams
+    assert "PINHOLE 800 480" in cams
+
