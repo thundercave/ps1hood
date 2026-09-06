@@ -9,6 +9,8 @@ import numpy as np
 from ps1_hood.reconstruct.colmap import (
     _focal_px,
     _rotmat_to_qvec,
+    choose_colmap_cpu_gpu_flags,
+    colmap_cpu_gpu_flags,
     cross_pano_pair_indices,
     feature_extractor_argv,
     filter_frames_registered_in_matches,
@@ -215,7 +217,11 @@ def test_remap_hard_fails_when_too_few_remain(tmp_path: Path):
         assert "missing" in str(exc).lower()
 
 
-def test_feature_extractor_argv_uniform_uses_single_camera():
+def test_feature_extractor_argv_uniform_uses_single_camera(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--SiftExtraction.use_gpu", "0"), ("--SiftMatching.use_gpu", "0")),
+    )
     frames = [_fr(0, 0, 0, "p1"), _fr(8, 0, 0, "p2")]
     assert frame_sizes_uniform(frames)
     argv = feature_extractor_argv("colmap", Path("db.db"), Path("images"), frames)
@@ -226,18 +232,83 @@ def test_feature_extractor_argv_uniform_uses_single_camera():
     assert "PINHOLE" in argv
 
 
-def test_feature_extractor_argv_mixed_sizes_omits_global_params():
+def test_feature_extractor_argv_mixed_sizes_omits_global_params(monkeypatch):
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap.colmap_cpu_gpu_flags",
+        lambda _c: (("--FeatureExtraction.use_gpu", "0"), ("--FeatureMatching.use_gpu", "0")),
+    )
     a = _fr(0, 0, 0, "p1")
     b = _fr(8, 0, 0, "p2")
     b["width"] = 1728  # differ from 640
     b["height"] = 1004
     assert not frame_sizes_uniform([a, b])
     argv = feature_extractor_argv("colmap", Path("db.db"), Path("images"), [a, b])
+    assert "--FeatureExtraction.use_gpu" in argv
+    assert argv[argv.index("--FeatureExtraction.use_gpu") + 1] == "0"
     assert "--ImageReader.single_camera" in argv
     i = argv.index("--ImageReader.single_camera")
     assert argv[i + 1] == "0"
     assert "--ImageReader.camera_params" not in argv
     assert argv[argv.index("--ImageReader.camera_model") + 1] == "PINHOLE"
+
+
+def test_choose_colmap_cpu_gpu_flags_legacy_sift():
+    feat = "  --SiftExtraction.use_gpu arg (=1)\n  --SiftExtraction.gpu_index arg (=-1)\n"
+    match = "  --SiftMatching.use_gpu arg (=1)\n  --SiftMatching.max_ratio arg (=0.8)\n"
+    extract, matching = choose_colmap_cpu_gpu_flags(feat, match)
+    assert extract == ["--SiftExtraction.use_gpu", "0"]
+    assert matching == ["--SiftMatching.use_gpu", "0"]
+
+
+def test_choose_colmap_cpu_gpu_flags_v313_feature():
+    feat = "  --FeatureExtraction.use_gpu arg (=1)\n  --FeatureExtraction.gpu_index arg (=-1)\n"
+    match = "  --FeatureMatching.use_gpu arg (=1)\n  --FeatureMatching.max_ratio arg (=0.8)\n"
+    extract, matching = choose_colmap_cpu_gpu_flags(feat, match)
+    assert extract == ["--FeatureExtraction.use_gpu", "0"]
+    assert matching == ["--FeatureMatching.use_gpu", "0"]
+
+
+def test_choose_colmap_cpu_gpu_flags_empty_help_defaults_legacy():
+    extract, matching = choose_colmap_cpu_gpu_flags("", "")
+    assert extract == ["--SiftExtraction.use_gpu", "0"]
+    assert matching == ["--SiftMatching.use_gpu", "0"]
+
+
+def test_colmap_cpu_gpu_flags_probes_help(monkeypatch):
+    colmap_cpu_gpu_flags.cache_clear()
+
+    def fake_help(_colmap: str, subcommand: str) -> str:
+        if subcommand == "feature_extractor":
+            return "--FeatureExtraction.use_gpu arg (=1)\n"
+        if subcommand == "exhaustive_matcher":
+            return "--FeatureMatching.use_gpu arg (=1)\n"
+        return ""
+
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help", fake_help
+    )
+    extract, matching = colmap_cpu_gpu_flags("/fake/colmap")
+    assert extract == ("--FeatureExtraction.use_gpu", "0")
+    assert matching == ("--FeatureMatching.use_gpu", "0")
+    colmap_cpu_gpu_flags.cache_clear()
+
+
+def test_colmap_cpu_gpu_flags_probes_legacy(monkeypatch):
+    colmap_cpu_gpu_flags.cache_clear()
+
+    def fake_help(_colmap: str, subcommand: str) -> str:
+        if subcommand == "feature_extractor":
+            return "--SiftExtraction.use_gpu arg (=1)\n"
+        return "--SiftMatching.use_gpu arg (=1)\n"
+
+    monkeypatch.setattr(
+        "ps1_hood.reconstruct.colmap._colmap_subcommand_help", fake_help
+    )
+    extract, matching = colmap_cpu_gpu_flags("/fake/colmap-legacy")
+    assert extract == ("--SiftExtraction.use_gpu", "0")
+    assert matching == ("--SiftMatching.use_gpu", "0")
+    colmap_cpu_gpu_flags.cache_clear()
+
 
 def test_filter_frames_drops_images_without_tvg(tmp_path: Path):
     import sqlite3

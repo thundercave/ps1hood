@@ -11,6 +11,7 @@ and colmap#497 (IMAGE_ID must match database or you get empty clouds).
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import shutil
@@ -461,6 +462,63 @@ def filter_frames_registered_in_matches(
     return kept_frames, kept_names
 
 
+
+def choose_colmap_cpu_gpu_flags(
+    feature_help: str,
+    matching_help: str = "",
+) -> tuple[list[str], list[str]]:
+    """Pick ``use_gpu=0`` argv for feature extraction and matching.
+
+    COLMAP ≤3.12 uses ``--SiftExtraction.use_gpu`` / ``--SiftMatching.use_gpu``.
+    COLMAP 3.13+ renamed these to ``--FeatureExtraction.use_gpu`` /
+    ``--FeatureMatching.use_gpu``. Prefer the names present in ``*-h`` output;
+    if help is empty/unknown, keep the legacy Sift* names.
+    """
+    extract_key = (
+        "FeatureExtraction"
+        if "FeatureExtraction.use_gpu" in feature_help
+        else "SiftExtraction"
+    )
+    match_src = matching_help if matching_help else feature_help
+    match_key = (
+        "FeatureMatching"
+        if "FeatureMatching.use_gpu" in match_src
+        else "SiftMatching"
+    )
+    return (
+        [f"--{extract_key}.use_gpu", "0"],
+        [f"--{match_key}.use_gpu", "0"],
+    )
+
+
+def _colmap_subcommand_help(colmap: str, subcommand: str) -> str:
+    try:
+        proc = subprocess.run(
+            [colmap, subcommand, "-h"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+@functools.lru_cache(maxsize=8)
+def colmap_cpu_gpu_flags(colmap: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Probe COLMAP help and return cached CPU ``use_gpu=0`` flag tuples.
+
+    Returns ``(extract_flags, match_flags)`` suitable for ``list.extend`` /
+    splat into feature_extractor / matcher argv. Always forces GPU off (AMD /
+    no-CUDA boxes).
+    """
+    feat_help = _colmap_subcommand_help(colmap, "feature_extractor")
+    match_help = _colmap_subcommand_help(colmap, "exhaustive_matcher")
+    extract, matching = choose_colmap_cpu_gpu_flags(feat_help, match_help)
+    return tuple(extract), tuple(matching)
+
+
 def _colmap_bin() -> str:
     colmap = shutil.which("colmap")
     if not colmap:
@@ -503,6 +561,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
     if sparse.exists():
         shutil.rmtree(sparse)
     sparse.mkdir(parents=True, exist_ok=True)
+    extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
     _run(
         [
             colmap,
@@ -515,8 +574,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
             "1",
             "--ImageReader.camera_model",
             "PINHOLE",
-            "--SiftExtraction.use_gpu",
-            "0",
+            *extract_gpu,
         ]
     )
     _run(
@@ -525,8 +583,7 @@ def run_colmap(workspace: Path, *, ply_out: Path | None = None) -> Path:
             "exhaustive_matcher",
             "--database_path",
             str(db),
-            "--SiftMatching.use_gpu",
-            "0",
+            *match_gpu,
         ]
     )
     _run(
@@ -576,6 +633,7 @@ def feature_extractor_argv(
     per-image cameras so intrinsics stay honest for known-pose triangulation;
     ``write_known_pose_model`` already emits one PINHOLE per (w, h, fov).
     """
+    extract_gpu, _match_gpu = colmap_cpu_gpu_flags(colmap)
     cmd = [
         colmap,
         "feature_extractor",
@@ -585,8 +643,7 @@ def feature_extractor_argv(
         str(image_path),
         "--ImageReader.camera_model",
         "PINHOLE",
-        "--SiftExtraction.use_gpu",
-        "0",
+        *extract_gpu,
     ]
     if frame_sizes_uniform(frames):
         first_w, first_h = _frame_size(frames[0])
@@ -664,6 +721,7 @@ def run_colmap_posed(
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
+    _extract_gpu, match_gpu = colmap_cpu_gpu_flags(colmap)
     _run(
         [
             colmap,
@@ -674,8 +732,7 @@ def run_colmap_posed(
             str(match_list),
             "--match_type",
             "pairs",
-            "--SiftMatching.use_gpu",
-            "0",
+            *match_gpu,
         ]
     )
 
