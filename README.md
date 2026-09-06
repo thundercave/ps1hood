@@ -106,6 +106,8 @@ uv run ps1hood reconstruct my-block --backend flow
 # or --backend mast3r         optional; needs GPU + naver/mast3r + weights
 ```
 
+AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-ubuntu.md`](docs/gpu-mast3r-ubuntu.md) for an honest ROCm feasibility note, uv setup on Ubuntu, denser `smoke-dense` capture, COLMAP posed fallbacks, and cloud-CUDA MASt3R commands.
+
 `colmap_posed` seeds `cameras.txt`/`images.txt` from align ENU + FOV PINHOLE,
 remaps IMAGE_IDs to the COLMAP database (colmap#497), matches **cross-pano**
 pairs only (same-center orbit headings are pure rotation), then runs

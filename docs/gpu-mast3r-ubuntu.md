@@ -7,6 +7,8 @@ This machine is **not** registered with Grok Bot yet — use it for capture / CP
 
 Smoke baseline (same Utrecht bbox): `colmap_posed` ≈ **112** points; flow cloud ≈ **12k**. Dense capture (`smoke-dense`) is meant to feed better stereo baselines into those photo backends — and into MASt3R once weights + a CUDA (or working ROCm) device exist.
 
+**smoke-dense result (2026-09-06, this bot box):** spacing 10 m, `heading_step` 60, `max_panos` 22 → discover capped **20**, capture yielded **13** unique panos / **91** frames (`pitches=[0]`). Flow recon → **`cloud.ply` ≈ 99 345** vertices (~8× smoke’s ~12k). `colmap_posed` failed (feature DB missing 2 images → IMAGE_ID remap) and fell back to OpenCV SIFT ≈ **449** pts (still better than smoke posed 112 / sift 83, but keep flow as the working dense cloud). `runs/` is gitignored; re-run on your PC with the init command in §3.
+
 ---
 
 ## 0. What works vs what doesn't on 6900 XT
