@@ -11,6 +11,7 @@ from ps1_hood.geo import BBox
 SOURCES = ("google_web", "google_js", "google_static", "mapillary")
 INTERP_BACKENDS = ("flow", "rife", "film")
 RECON_BACKENDS = ("flow", "colmap", "colmap_posed", "sift", "mast3r", "export")
+RECON_MATCHERS = ("sift", "mast3r")
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -80,6 +81,7 @@ class ProjectSpec:
     interp_steps: int = 8
     interp_backend: str = "flow"
     recon_backend: str = "flow"
+    recon_matcher: str = "sift"
     max_panos: int | None = None
 
     def to_dict(self) -> dict:
@@ -96,6 +98,7 @@ class ProjectSpec:
             "interp_steps": self.interp_steps,
             "interp_backend": self.interp_backend,
             "recon_backend": self.recon_backend,
+            "recon_matcher": self.recon_matcher,
         }
         if self.max_panos is not None:
             out["max_panos"] = int(self.max_panos)
@@ -118,5 +121,6 @@ class ProjectSpec:
             interp_steps=int(data.get("interp_steps", 8)),
             interp_backend=str(data.get("interp_backend", "flow")),
             recon_backend=str(data.get("recon_backend", "flow")),
+            recon_matcher=str(data.get("recon_matcher", "sift")),
             max_panos=int(max_raw) if max_raw is not None else None,
         )

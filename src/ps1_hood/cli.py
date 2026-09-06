@@ -234,13 +234,25 @@ def interpolate_cmd(name: str) -> None:
     type=click.Choice(["flow", "colmap", "colmap_posed", "sift", "mast3r", "export"]),
     default=None,
 )
-def reconstruct_cmd(name: str, backend: str | None) -> None:
+@click.option(
+    "--matcher",
+    type=click.Choice(["sift", "mast3r"]),
+    default=None,
+    help="posed COLMAP matcher: sift (default) or mast3r (GPU, ENU-locked). "
+    "Implied mast3r when --backend mast3r.",
+)
+def reconstruct_cmd(name: str, backend: str | None, matcher: str | None) -> None:
     from ps1_hood.pipeline import stage_reconstruct
 
     project = open_project(name)
-    if backend:
+    if backend or matcher:
         spec = project.load_spec()
-        spec.recon_backend = backend
+        if backend:
+            spec.recon_backend = backend
+            if backend == "mast3r" and matcher is None:
+                spec.recon_matcher = "mast3r"
+        if matcher:
+            spec.recon_matcher = matcher
         project.save_spec(spec)
     stage_reconstruct(project)
 

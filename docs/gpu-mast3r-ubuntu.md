@@ -160,11 +160,11 @@ cd ~/ps1hood
 uv run ps1hood reconstruct smoke --backend mast3r
 ```
 
-What that does:
+What that does (matcher → posed triangulator — see [`mast3r-matcher.md`](mast3r-matcher.md)):
 
-1. Exports keyframes to `runs/smoke/recon/mast3r_input/images/`.
+1. Exports keyframes to `runs/smoke/recon/colmap/images/` + ENU `sparse_prior/`.
 2. Loads MASt3R (local `.pth` if found under `~/mast3r`, cwd, or torch/HF cache; else HF hub id).
-3. Sparse global alignment → `runs/smoke/recon/cloud.ply`.
+3. Pairwise matches on the cross-pano forward list → COLMAP DB → `point_triangulator` → `cloud_photo.ply` / `cloud.ply`.
 
 Manual export-only if the package is missing: the same command still writes `mast3r_input/` then raises with install hints — you can feed those JPEGs to an upstream mast3r demo on a CUDA box.
 

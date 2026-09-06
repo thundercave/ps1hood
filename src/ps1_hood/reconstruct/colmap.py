@@ -39,7 +39,12 @@ Reconstruction prefers aligned Street View keyframes (align/cameras.json).
 
   Classic mapper often fails to init on SV orbits; do not retry it.
 
-  MASt3R / flow / OpenCV SIFT stereo are the photo fallbacks.
+  MASt3R-as-matcher (learned matches → same posed triangulator):
+    ps1hood reconstruct <run> --backend mast3r
+    # or: --backend colmap_posed --matcher mast3r
+    # NEVER free-pose MASt3R / GLOMAP as product — ENU poses stay fixed.
+
+  Flow / OpenCV SIFT stereo are CPU photo fallbacks.
 """
 
 _MIN_POINTS3D_BYTES = 1024
@@ -974,17 +979,23 @@ def run_colmap_posed(
     max_image_size: int | None = None,
     max_num_matches: int | None = None,
     n_forward: int = 3,
+    matcher: str = "sift",
 ) -> Path:
     """Triangulate with known poses via point_triangulator (never mapper).
 
     Critical steps for SV orbits:
     - PINHOLE from crop FoV; t = -R @ C
-    - Remap IMAGE_ID to database after feature_extractor (colmap#497)
-    - Match cross-pano **forward** mates (3 along drive) — not just nearest
-    - Guided matching **off** by default (OOM); optional with size/match caps
+    - ``matcher=sift`` (default): feature_extractor → remap IMAGE_ID (colmap#497)
+      → matches_importer on cross-pano forward mates
+    - ``matcher=mast3r``: bootstrap DB from ENU priors → MASt3R pairwise matches
+      into keypoints/matches (no free-pose SfM / GLOMAP)
     - Triangulator: clear_points, allow two-view tracks, low min tri angle
     - No PatchMatch / dense (needs GPU)
     """
+    matcher = (matcher or "sift").strip().lower()
+    if matcher not in MATCHERS:
+        raise ValueError(f"unknown matcher {matcher!r}; expected one of {MATCHERS}")
+
     colmap = _colmap_bin()
     images = workspace / "images"
     if not images.is_dir() or not any(images.iterdir()):
@@ -1009,25 +1020,6 @@ def run_colmap_posed(
         shutil.rmtree(sparse_prior)
     write_known_pose_model(frames, image_names, sparse_prior)
 
-    # When guiding, downscale SIFT (1200–1600) to reduce OOM risk.
-    extract_size = max_image_size
-    if guided_matching and extract_size is None:
-        extract_size = 1600
-    match_cap = max_num_matches
-    if guided_matching and match_cap is None:
-        match_cap = 4096
-    _run(
-        feature_extractor_argv(
-            colmap, db, images, frames, max_image_size=extract_size
-        )
-    )
-
-    # colmap#497: IMAGE_ID in images.txt MUST match database after extraction.
-    # May drop a minority of images COLMAP omitted (odd crop sizes).
-    _, frames, image_names = remap_known_pose_model_to_db(
-        sparse_prior, frames, image_names, db
-    )
-
     match_list = workspace / "cross_pano_pairs.txt"
     n_pairs = write_cross_pano_match_list(
         frames, image_names, match_list, n_forward=n_forward
@@ -1035,31 +1027,74 @@ def run_colmap_posed(
     if n_pairs < 1:
         raise RuntimeError("cross-pano match list empty")
 
-    # Guided matching off by default. If enabled and it OOMs, clear + retry plain.
-    try:
+    if matcher == "mast3r":
+        from ps1_hood.reconstruct.mast3r import fill_database_with_mast3r_matches
+
+        log.info(
+            "COLMAP posed matcher=mast3r (%s cross-pano pairs) — ENU priors locked",
+            n_pairs,
+        )
+        # IMAGE_IDs 1..N match write_known_pose_model; no feature_extractor remap.
+        bootstrap_posed_database(db, frames, image_names)
+        fill_database_with_mast3r_matches(
+            db,
+            images,
+            frames,
+            image_names,
+            pair_indices=cross_pano_forward_pairs(frames, n_forward=n_forward),
+        )
+    else:
+        # When guiding, downscale SIFT (1200–1600) to reduce OOM risk.
+        extract_size = max_image_size
+        if guided_matching and extract_size is None:
+            extract_size = 1600
+        match_cap = max_num_matches
+        if guided_matching and match_cap is None:
+            match_cap = 4096
         _run(
-            matches_importer_argv(
-                colmap,
-                db,
-                match_list,
-                guided_matching=guided_matching,
-                max_num_matches=match_cap,
+            feature_extractor_argv(
+                colmap, db, images, frames, max_image_size=extract_size
             )
         )
-    except (subprocess.CalledProcessError, OSError) as exc:
-        if not guided_matching:
-            raise
-        log.warning(
-            "COLMAP matches_importer with guided_matching failed (%s); "
-            "retrying without guided matching",
-            exc,
+
+        # colmap#497: IMAGE_ID in images.txt MUST match database after extraction.
+        # May drop a minority of images COLMAP omitted (odd crop sizes).
+        _, frames, image_names = remap_known_pose_model_to_db(
+            sparse_prior, frames, image_names, db
         )
-        clear_db_matches(db)
-        _run(
-            matches_importer_argv(
-                colmap, db, match_list, guided_matching=False
+
+        # Rewrite match list after possible survivor filter.
+        n_pairs = write_cross_pano_match_list(
+            frames, image_names, match_list, n_forward=n_forward
+        )
+        if n_pairs < 1:
+            raise RuntimeError("cross-pano match list empty after DB remap")
+
+        # Guided matching off by default. If enabled and it OOMs, clear + retry plain.
+        try:
+            _run(
+                matches_importer_argv(
+                    colmap,
+                    db,
+                    match_list,
+                    guided_matching=guided_matching,
+                    max_num_matches=match_cap,
+                )
             )
-        )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            if not guided_matching:
+                raise
+            log.warning(
+                "COLMAP matches_importer with guided_matching failed (%s); "
+                "retrying without guided matching",
+                exc,
+            )
+            clear_db_matches(db)
+            _run(
+                matches_importer_argv(
+                    colmap, db, match_list, guided_matching=False
+                )
+            )
 
     # Images with only failed geometric verification can SIGABRT point_triangulator.
     frames, image_names = filter_frames_registered_in_matches(
@@ -1071,32 +1106,7 @@ def run_colmap_posed(
         shutil.rmtree(sparse_out)
     sparse_out.mkdir(parents=True, exist_ok=True)
 
-    _run(
-        [
-            colmap,
-            "point_triangulator",
-            "--database_path",
-            str(db),
-            "--image_path",
-            str(images),
-            "--input_path",
-            str(sparse_prior),
-            "--output_path",
-            str(sparse_out),
-            "--clear_points",
-            "1",
-            "--Mapper.tri_ignore_two_view_tracks",
-            "0",
-            "--Mapper.filter_min_tri_angle",
-            "0.5",
-            "--Mapper.ba_refine_focal_length",
-            "0",
-            "--Mapper.ba_refine_extra_params",
-            "0",
-            "--Mapper.ba_refine_principal_point",
-            "0",
-        ]
-    )
+    _run(point_triangulator_argv(colmap, db, images, sparse_prior, sparse_out))
 
     model = find_sparse_model(sparse_out)
     if model is None and (
@@ -1146,3 +1156,201 @@ def run_colmap_posed(
             "Next photo-only step: denser drive spacing / more overlap, or OpenCV SIFT/flow stereo."
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# External matcher support (MASt3R etc.) — keypoints/matches into COLMAP DB
+# ---------------------------------------------------------------------------
+
+MATCHERS = ("sift", "mast3r")
+_MAX_NUM_IMAGES = 2147483647
+
+
+def image_ids_to_pair_id(image_id1: int, image_id2: int) -> int:
+    """COLMAP ``Database::ImagePairToPairId`` (id1 < id2)."""
+    i1, i2 = int(image_id1), int(image_id2)
+    if i1 > i2:
+        i1, i2 = i2, i1
+    return i1 * _MAX_NUM_IMAGES + i2
+
+
+def create_empty_database(database: Path) -> Path:
+    """Create an empty COLMAP SQLite DB via ``database_creator``."""
+    colmap = _colmap_bin()
+    database = Path(database)
+    if database.exists():
+        database.unlink()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    _run([colmap, "database_creator", "--database_path", str(database)])
+    return database
+
+
+def bootstrap_posed_database(
+    database: Path,
+    frames: list[dict[str, Any]],
+    image_names: list[str],
+) -> dict[str, tuple[int, int]]:
+    """Insert PINHOLE cameras + images so IMAGE_IDs match ``write_known_pose_model``.
+
+    Returns ``{name: (image_id, camera_id)}`` with image_id = 1..N in list order
+    (same convention as the pre-remap known-pose text model).
+    """
+    if len(frames) != len(image_names):
+        raise ValueError("frames / image_names mismatch")
+    if not frames_have_known_poses(frames):
+        raise RuntimeError("posed DB bootstrap needs e/n/u/heading on every frame")
+
+    create_empty_database(database)
+    cam_key_to_id: dict[tuple[int, int, float], int] = {}
+    frame_cam_ids: list[int] = []
+    cam_rows: list[tuple[int, int, int, int, bytes]] = []
+    for fr in frames:
+        w, h = _frame_size(fr)
+        fov = float(fr.get("fov") or 90.0)
+        key = (w, h, round(fov, 3))
+        if key not in cam_key_to_id:
+            cid = len(cam_key_to_id) + 1
+            cam_key_to_id[key] = cid
+            fx = _focal_px(w, fov)
+            params = np.asarray([fx, fx, w / 2.0, h / 2.0], dtype=np.float64)
+            cam_rows.append((cid, 1, w, h, params.tobytes()))  # model 1 = PINHOLE
+        frame_cam_ids.append(cam_key_to_id[key])
+
+    con = sqlite3.connect(str(database))
+    try:
+        for cid, model, w, h, blob in cam_rows:
+            con.execute(
+                "INSERT INTO cameras(camera_id, model, width, height, params, prior_focal_length) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (cid, model, w, h, blob),
+            )
+        name_to_ids: dict[str, tuple[int, int]] = {}
+        for idx, (name, cid) in enumerate(zip(image_names, frame_cam_ids, strict=True), start=1):
+            con.execute(
+                "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+                (idx, name, cid),
+            )
+            name_to_ids[name] = (idx, cid)
+        # Keep AUTOINCREMENT sequences consistent for later inserts.
+        con.execute("DELETE FROM sqlite_sequence WHERE name='cameras'")
+        con.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('cameras', ?)",
+            (max(cid for cid, *_ in cam_rows),),
+        )
+        con.execute("DELETE FROM sqlite_sequence WHERE name='images'")
+        con.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('images', ?)",
+            (len(image_names),),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return name_to_ids
+
+
+def write_keypoints_blob(xy: np.ndarray) -> tuple[int, int, bytes]:
+    """Pack Nx2 float32 keypoints for the COLMAP ``keypoints`` table."""
+    arr = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
+    return int(arr.shape[0]), 2, np.ascontiguousarray(arr).tobytes()
+
+
+def write_matches_blob(matches: np.ndarray) -> tuple[int, int, bytes]:
+    """Pack Nx2 uint32 match indices for ``matches`` / ``two_view_geometries``."""
+    arr = np.asarray(matches, dtype=np.uint32).reshape(-1, 2)
+    return int(arr.shape[0]), 2, np.ascontiguousarray(arr).tobytes()
+
+
+def import_keypoints_and_matches(
+    database: Path,
+    keypoints: dict[int, np.ndarray],
+    pair_matches: dict[tuple[int, int], np.ndarray],
+    *,
+    skip_geometric_verification: bool = True,
+) -> int:
+    """Write keypoints + matches (+ optional two_view_geometries) into ``database``.
+
+    ``keypoints`` maps image_id → Nx2 float32 xy in original image pixels.
+    ``pair_matches`` maps (image_id1, image_id2) with id1 < id2 → Mx2 uint32
+    keypoint indices. When ``skip_geometric_verification`` is True, also write
+    ``two_view_geometries`` with config=2 (CALIBRATED) so point_triangulator
+    can consume matches without a SIFT verify pass.
+    """
+    con = sqlite3.connect(str(database))
+    n_pairs = 0
+    try:
+        con.execute("DELETE FROM keypoints")
+        con.execute("DELETE FROM matches")
+        con.execute("DELETE FROM two_view_geometries")
+        for image_id, xy in keypoints.items():
+            rows, cols, blob = write_keypoints_blob(xy)
+            if rows == 0:
+                continue
+            con.execute(
+                "INSERT INTO keypoints(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                (int(image_id), rows, cols, blob),
+            )
+        # Match naver/mast3r COLMAPDatabase.add_two_view_geometry defaults:
+        # identity F/E/H + unit qvec. All-zero blobs make COLMAP ignore pairs
+        # ("connected 0" / SIGABRT on point_triangulator).
+        eye3 = np.eye(3, dtype=np.float64).tobytes()
+        qvec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64).tobytes()
+        tvec = np.zeros(3, dtype=np.float64).tobytes()
+        for (id1, id2), matches in pair_matches.items():
+            i1, i2 = int(id1), int(id2)
+            if i1 > i2:
+                i1, i2 = i2, i1
+                matches = np.asarray(matches)[:, ::-1]
+            rows, cols, blob = write_matches_blob(matches)
+            if rows == 0:
+                continue
+            pair_id = image_ids_to_pair_id(i1, i2)
+            con.execute(
+                "INSERT INTO matches(pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                (pair_id, rows, cols, blob),
+            )
+            if skip_geometric_verification:
+                con.execute(
+                    "INSERT INTO two_view_geometries("
+                    "pair_id, rows, cols, data, config, F, E, H, qvec, tvec) "
+                    "VALUES (?, ?, ?, ?, 2, ?, ?, ?, ?, ?)",
+                    (pair_id, rows, cols, blob, eye3, eye3, eye3, qvec, tvec),
+                )
+            n_pairs += 1
+        con.commit()
+    finally:
+        con.close()
+    return n_pairs
+
+
+def point_triangulator_argv(
+    colmap: str,
+    database: Path,
+    image_path: Path,
+    input_path: Path,
+    output_path: Path,
+) -> list[str]:
+    """Build ``point_triangulator`` argv with extrinsics locked (no BA refine)."""
+    return [
+        colmap,
+        "point_triangulator",
+        "--database_path",
+        str(database),
+        "--image_path",
+        str(image_path),
+        "--input_path",
+        str(input_path),
+        "--output_path",
+        str(output_path),
+        "--clear_points",
+        "1",
+        "--Mapper.tri_ignore_two_view_tracks",
+        "0",
+        "--Mapper.filter_min_tri_angle",
+        "0.5",
+        "--Mapper.ba_refine_focal_length",
+        "0",
+        "--Mapper.ba_refine_extra_params",
+        "0",
+        "--Mapper.ba_refine_principal_point",
+        "0",
+    ]
