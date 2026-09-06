@@ -334,8 +334,14 @@ def cross_pano_forward_pairs(
         min_baseline_m=min_baseline_m,
         max_baseline_m=max_baseline_m,
         order_indices=order_indices,
+        quadratic_overlap=True,
     )
-    out = [(i, j) for i, j in pairs if _is_cross_pano_baseline(frames, i, j)]
+    out_set: set[tuple[int, int]] = {
+        (i, j) for i, j in pairs if _is_cross_pano_baseline(frames, i, j)
+    }
+    # Union preferred-baseline stereo pairs for extra redundant edges.
+    out_set.update(cross_pano_pair_indices(frames, min_baseline_m=min_baseline_m))
+    out = sorted(out_set)
     if not out:
         log.warning(
             "forward drive pairs empty after cross-pano filter — "

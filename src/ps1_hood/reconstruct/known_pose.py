@@ -75,6 +75,7 @@ def forward_drive_pairs(
     min_baseline_m: float = 2.0,
     max_baseline_m: float = 25.0,
     order_indices: list[int] | None = None,
+    quadratic_overlap: bool = True,
 ) -> list[tuple[int, int]]:
     """Each frame links to up to ``n_forward`` later mates along the drive.
 
@@ -83,6 +84,9 @@ def forward_drive_pairs(
     ``[min_baseline_m, max_baseline_m]``. Builds 3-cycles so the same keypoint
     can enter multi-view tracks after ``point_triangulator`` — unlike a pure
     matching of nearest neighbors (mean track ≈ 2.0).
+
+    When ``quadratic_overlap`` is True, also add i↔i+2, i+4, i+8… (COLMAP
+    sequential_matcher style) so longer skip edges reinforce multi-view tracks.
     """
     n = len(frames)
     if n < 2 or n_forward < 1:
@@ -93,6 +97,14 @@ def forward_drive_pairs(
 
     selected: set[tuple[int, int]] = set()
     pos = {idx: k for k, idx in enumerate(order)}
+
+    def _try_add(i: int, j: int) -> bool:
+        baseline = _baseline_m(frames[i], frames[j])
+        if baseline < min_baseline_m or baseline > max_baseline_m:
+            return False
+        selected.add((min(i, j), max(i, j)))
+        return True
+
     for i in order:
         taken = 0
         start = pos[i] + 1
@@ -100,9 +112,14 @@ def forward_drive_pairs(
             if taken >= n_forward:
                 break
             j = order[k]
-            baseline = _baseline_m(frames[i], frames[j])
-            if baseline < min_baseline_m or baseline > max_baseline_m:
-                continue
-            selected.add((min(i, j), max(i, j)))
-            taken += 1
+            if _try_add(i, j):
+                taken += 1
+        if quadratic_overlap:
+            step = 2
+            while True:
+                k = pos[i] + step
+                if k >= n:
+                    break
+                _try_add(i, order[k])
+                step *= 2
     return sorted(selected)
