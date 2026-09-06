@@ -109,7 +109,8 @@ Links: Instant Meshes https://github.com/wjakob/instant-meshes · Open3D mesh si
 - Success: walls line up with windows/doors in SV when textured; wrong walls rejected.
 
 ### Milestone B (parallel / next) — **Posed densify**
-- Export known poses + sparse seed → OpenMVS DensifyPointCloud (CPU) → mesh/texture.  
+- Wired: `ps1hood densify <run> --backend openmvs` (optional AGPL binary on PATH).  
+  See [`openmvs-densify.md`](openmvs-densify.md). Seed = posed COLMAP sparse, not flow street cloud.  
 - Or minimal PyTorch plane-sweep depth → fuse → same plane fit.  
 - Success: denser façade points that still photo-validate.
 

@@ -104,6 +104,11 @@ uv run ps1hood reconstruct my-block --backend flow
 # or --backend sift           OpenCV SIFT stereo on cross-pano pairs
 # or --backend export
 # or --backend mast3r         optional; needs GPU + naver/mast3r + weights
+
+# Optional densify (AGPL OpenMVS binary on PATH — not vendored):
+uv run ps1hood densify my-block --backend openmvs
+# → openmvs/scene_dense.ply from posed sparse (recon/colmap/sparse_posed)
+# See docs/openmvs-densify.md for install + AGPL notes.
 ```
 
 AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-ubuntu.md`](docs/gpu-mast3r-ubuntu.md) for an honest ROCm feasibility note, uv setup on Ubuntu, denser `smoke-dense` capture, COLMAP posed fallbacks, and cloud-CUDA MASt3R commands.
@@ -114,6 +119,10 @@ pairs only (same-center orbit headings are pure rotation), then runs
 `point_triangulator`. On success writes `recon/cloud_photo.ply` as primary.
 If too few points, fails loud and falls back to OpenCV SIFT. Geometry stays
 photo-derived — OSM/BAG shells are align priors only, not Studio hero mesh.
+
+**Optional OpenMVS densify** is AGPL-3.0; the binary is **not** redistributed in this
+MIT repo. Install `InterfaceCOLMAP` + `DensifyPointCloud` yourself, then
+`ps1hood densify <run> --backend openmvs`. Details: [`docs/openmvs-densify.md`](docs/openmvs-densify.md).
 
 ## Layout of a run
 
@@ -131,9 +140,11 @@ runs/<name>/
   interp/drive.mp4
   recon/cloud.ply
   recon/cloud_colmap.ply        optional COLMAP export
+  recon/cloud_photo.ply         optional posed triangulator
   recon/facades.obj + .mtl
   recon/textures/facade_XX.jpg
   recon/scene.json
+  openmvs/scene_dense.ply      optional OpenMVS densify (AGPL binary)
 ```
 
 ## Keys
