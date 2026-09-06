@@ -4,6 +4,13 @@ MapAnything (Meta, Apache-2.0 code; prefer ``facebook/map-anything-apache``
 weights) accepts images + intrinsics + OpenCV cam2world poses. We feed our
 align / lerp_pose ENU and never enable ``ignore_pose_inputs``.
 
+Product PLY hard rule (Studio frame-fix):
+  WORLD_ENU = R_c2w @ X_cam + C_enu
+using **our** cam2world from ``camera_rotation_cv`` + (e,n,u) — never MA
+predicted poses. Prefer ``pts3d_cam`` / ``depth_z``; refuse dumping raw
+``pts3d`` (model world) as ENU. Fail-loud if cloud centroid / z p50 diverge
+from camera centers (the ~+50 m float symptom).
+
 Two paths:
   A) Posed COLMAP folder → upstream
      ``scripts/demo_inference_on_colmap_outputs.py --apache …``
@@ -576,55 +583,234 @@ def load_bundle_views_for_infer(
     return views, manifest
 
 
+# Sanity gates for product PLY (Studio: MA cloud floated at z~50 when raw pts3d dumped).
+DEFAULT_CENTROID_DELTA_MAX_M = 25.0
+DEFAULT_Z_P50_DELTA_MAX_M = 15.0
+
+
+def cam_points_to_enu(
+    pts_cam: np.ndarray,
+    R_c2w: np.ndarray,
+    C_enu: np.ndarray,
+) -> np.ndarray:
+    """WORLD_ENU = R_c2w @ X_cam + C_enu (our poses — never MA predicted)."""
+    pts = np.asarray(pts_cam, dtype=np.float64).reshape(-1, 3)
+    R = np.asarray(R_c2w, dtype=np.float64).reshape(3, 3)
+    C = np.asarray(C_enu, dtype=np.float64).reshape(3)
+    return (pts @ R.T) + C
+
+
+def _squeeze_hw3(arr: np.ndarray) -> np.ndarray:
+    """Normalize MapAnything (B,H,W,3) / (H,W,3) tensors to HxWx3."""
+    a = np.asarray(arr)
+    while a.ndim > 3 and a.shape[0] == 1:
+        a = a[0]
+    if a.ndim != 3 or a.shape[-1] != 3:
+        raise RuntimeError(f"expected HxWx3 geometry, got shape {a.shape}")
+    return a
+
+
+def _squeeze_hw1(arr: np.ndarray) -> np.ndarray:
+    a = np.asarray(arr)
+    while a.ndim > 2 and a.shape[0] == 1:
+        a = a[0]
+    if a.ndim == 3 and a.shape[-1] == 1:
+        a = a[..., 0]
+    if a.ndim != 2:
+        raise RuntimeError(f"expected HxW depth/mask, got shape {arr.shape}")
+    return a
+
+
+def pts_cam_from_prediction(pred: dict[str, Any]) -> np.ndarray:
+    """Camera-frame points per pixel (HxWx3). Prefer ``pts3d_cam``, else depth_z.
+
+    Hard rule: product export must transform these with **our** cam2world.
+    Raw ``pts3d`` (model "world") is intentionally not returned — Studio saw
+    floating islands when it was dumped as ENU while predicted |ΔC|~50m.
+    """
+    if pred.get("pts3d_cam") is not None:
+        return _squeeze_hw3(_as_numpy(pred["pts3d_cam"])).astype(np.float64)
+
+    depth = pred.get("depth_z")
+    rays = pred.get("ray_directions")
+    if depth is not None and rays is not None:
+        d = _squeeze_hw1(_as_numpy(depth)).astype(np.float64)
+        r = _squeeze_hw3(_as_numpy(rays)).astype(np.float64)
+        # ray_directions are camera-frame; MapAnything depth_z is Z-depth.
+        # Prefer depth_along_ray if present for ray * t; else scale rays so Z=depth_z.
+        along = pred.get("depth_along_ray")
+        if along is not None:
+            t = _squeeze_hw1(_as_numpy(along)).astype(np.float64)
+            return r * t[..., None]
+        # Scale each ray so its Z component equals depth_z (pinhole Z-depth).
+        z_comp = np.clip(r[..., 2], 1e-8, None)
+        return r * (d / z_comp)[..., None]
+
+    if depth is not None and pred.get("intrinsics") is not None:
+        d = _squeeze_hw1(_as_numpy(depth)).astype(np.float64)
+        K = _as_numpy(pred["intrinsics"])
+        while K.ndim > 2 and K.shape[0] == 1:
+            K = K[0]
+        K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        h, w = d.shape
+        us, vs = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        z = d
+        x = (us - cx) / fx * z
+        y = (vs - cy) / fy * z
+        return np.stack([x, y, z], axis=-1)
+
+    raise RuntimeError(
+        "MapAnything prediction lacks pts3d_cam (and depth_z fallback). "
+        "Refusing to export raw pts3d as ENU — that caused the Studio frame bug "
+        "(centroid z~50m vs street cameras)."
+    )
+
+
+def _colors_for_pred(
+    pred: dict[str, Any], mask_flat: np.ndarray | None, n_pts: int
+) -> np.ndarray:
+    img = pred.get("img_no_norm")
+    if img is None:
+        return np.full((n_pts, 3), 200, dtype=np.uint8)
+    img_np = _as_numpy(img)
+    if img_np.ndim == 4:
+        img_np = img_np[0]
+    flat = (img_np.reshape(-1, 3) * 255.0).clip(0, 255).astype(np.uint8)
+    if mask_flat is not None and flat.shape[0] == mask_flat.shape[0]:
+        return flat[mask_flat]
+    return flat[:n_pts] if flat.shape[0] >= n_pts else np.full((n_pts, 3), 200, dtype=np.uint8)
+
+
+def assert_cloud_near_cameras(
+    xyz: np.ndarray,
+    camera_centers: np.ndarray,
+    *,
+    centroid_delta_max_m: float = DEFAULT_CENTROID_DELTA_MAX_M,
+    z_p50_delta_max_m: float = DEFAULT_Z_P50_DELTA_MAX_M,
+) -> dict[str, float]:
+    """Fail loud if fused cloud is not in the same ENU street frame as cameras.
+
+    Studio symptom of the raw-pts3d bug: cloud z p50~60 while cameras u~3–4,
+    centroid ΔC tens of metres.
+    """
+    pts = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    cams = np.asarray(camera_centers, dtype=np.float64).reshape(-1, 3)
+    if len(pts) == 0:
+        raise RuntimeError("ENU check: empty cloud")
+    if len(cams) == 0:
+        raise RuntimeError("ENU check: no camera centers")
+
+    cloud_c = pts.mean(axis=0)
+    cam_c = cams.mean(axis=0)
+    delta_c = float(np.linalg.norm(cloud_c - cam_c))
+    z_p50 = float(np.median(pts[:, 2]))
+    cam_u_p50 = float(np.median(cams[:, 2]))
+    z_delta = abs(z_p50 - cam_u_p50)
+
+    stats = {
+        "cloud_centroid_e": float(cloud_c[0]),
+        "cloud_centroid_n": float(cloud_c[1]),
+        "cloud_centroid_u": float(cloud_c[2]),
+        "cam_centroid_e": float(cam_c[0]),
+        "cam_centroid_n": float(cam_c[1]),
+        "cam_centroid_u": float(cam_c[2]),
+        "centroid_delta_m": delta_c,
+        "cloud_z_p50": z_p50,
+        "cam_u_p50": cam_u_p50,
+        "z_p50_delta_m": float(z_delta),
+    }
+
+    problems: list[str] = []
+    if delta_c > centroid_delta_max_m:
+        problems.append(
+            f"cloud centroid |ΔC|={delta_c:.1f}m > {centroid_delta_max_m}m vs cameras "
+            f"(cloud={cloud_c.round(2).tolist()}, cams={cam_c.round(2).tolist()})"
+        )
+    if z_delta > z_p50_delta_max_m:
+        problems.append(
+            f"cloud z p50={z_p50:.1f}m vs camera u p50={cam_u_p50:.1f}m "
+            f"(|Δ|={z_delta:.1f}m > {z_p50_delta_max_m}m) — likely camera-frame "
+            "pts dumped as world / wrong cam2world (Studio frame bug)"
+        )
+    if problems:
+        raise RuntimeError(
+            "MapAnything ENU frame check failed (refusing product PLY): "
+            + "; ".join(problems)
+        )
+    return stats
+
+
 def fuse_predictions_to_ply(
     predictions: list[dict[str, Any]],
     dest_ply: Path,
     *,
-    locked_poses: list[np.ndarray] | None = None,
+    locked_poses: list[np.ndarray],
     max_points: int = 2_000_000,
+    centroid_delta_max_m: float = DEFAULT_CENTROID_DELTA_MAX_M,
+    z_p50_delta_max_m: float = DEFAULT_Z_P50_DELTA_MAX_M,
+    skip_enu_check: bool = False,
 ) -> dict[str, Any]:
-    """Fuse masked ``pts3d`` → ASCII PLY; discard predicted poses as authority."""
+    """Fuse masked camera-frame geometry → ENU PLY with **our** cam2world.
+
+    Hard rule: ``WORLD = R_c2w @ X_cam + C_enu`` using locked poses from
+    align/lerp — never MapAnything predicted ``camera_poses`` for product.
+    Prefer ``pts3d_cam`` / ``depth_z``; refuse raw ``pts3d`` as ENU.
+    """
+    if not locked_poses or len(locked_poses) != len(predictions):
+        raise RuntimeError(
+            f"fuse requires locked_poses matching predictions "
+            f"(got {0 if not locked_poses else len(locked_poses)} poses, "
+            f"{len(predictions)} preds)"
+        )
+
     xyz_parts: list[np.ndarray] = []
     rgb_parts: list[np.ndarray] = []
     predicted_poses: list[np.ndarray] = []
+    export_source = "pts3d_cam"
 
-    for pred in predictions:
-        pts = pred.get("pts3d")
-        if pts is None:
-            continue
-        pts_np = _as_numpy(pts).reshape(-1, 3)
+    for i, (pred, T_lock) in enumerate(zip(predictions, locked_poses, strict=True)):
+        T = np.asarray(T_lock, dtype=np.float64)
+        if T.shape != (4, 4):
+            raise RuntimeError(f"view {i}: locked pose must be 4×4 cam2world, got {T.shape}")
+        R = T[:3, :3]
+        C = T[:3, 3]
+
+        try:
+            pts_hw = pts_cam_from_prediction(pred)
+        except RuntimeError as exc:
+            keys = sorted(str(k) for k in pred.keys())
+            raise RuntimeError(
+                f"view {i}: cannot build camera-frame points (keys={keys}): {exc}"
+            ) from exc
+
+        if pred.get("pts3d_cam") is None and pred.get("depth_z") is not None:
+            export_source = "depth_z"
+
+        flat_cam = pts_hw.reshape(-1, 3)
         mask = pred.get("mask")
+        mask_flat: np.ndarray | None = None
         if mask is not None:
-            m = _as_numpy(mask).reshape(-1).astype(bool)
-            if m.shape[0] == pts_np.shape[0]:
-                pts_np = pts_np[m]
-        conf = pred.get("conf")
-        if conf is not None and pts_np.shape[0] > 0:
-            # conf may already be applied via mask; keep points as-is
-            pass
-        img = pred.get("img_no_norm")
-        if img is not None:
-            img_np = _as_numpy(img)
-            if img_np.ndim == 4:
-                img_np = img_np[0]
-            if mask is not None:
-                m = _as_numpy(mask).reshape(-1).astype(bool)
-                flat = (img_np.reshape(-1, 3) * 255.0).clip(0, 255).astype(np.uint8)
-                if flat.shape[0] == m.shape[0]:
-                    colors = flat[m]
-                else:
-                    colors = np.full((len(pts_np), 3), 200, dtype=np.uint8)
+            mask_flat = _as_numpy(mask).reshape(-1).astype(bool)
+            if mask_flat.shape[0] == flat_cam.shape[0]:
+                flat_cam = flat_cam[mask_flat]
             else:
-                colors = (
-                    (img_np.reshape(-1, 3) * 255.0)
-                    .clip(0, 255)
-                    .astype(np.uint8)[: len(pts_np)]
-                )
-        else:
-            colors = np.full((len(pts_np), 3), 200, dtype=np.uint8)
-        if len(pts_np):
-            xyz_parts.append(pts_np.astype(np.float64))
-            rgb_parts.append(colors[: len(pts_np)])
+                mask_flat = None
+
+        if flat_cam.shape[0] == 0:
+            cam = pred.get("camera_poses")
+            if cam is not None:
+                cam_np = _as_numpy(cam)
+                if cam_np.ndim == 3:
+                    cam_np = cam_np[0]
+                predicted_poses.append(cam_np.astype(np.float64))
+            continue
+
+        xyz_enu = cam_points_to_enu(flat_cam, R, C)
+        colors = _colors_for_pred(pred, mask_flat, len(xyz_enu))
+        xyz_parts.append(xyz_enu)
+        rgb_parts.append(colors[: len(xyz_enu)])
 
         # Capture predicted pose only for drift log — never write as authority.
         cam = pred.get("camera_poses")
@@ -635,13 +821,31 @@ def fuse_predictions_to_ply(
             predicted_poses.append(cam_np.astype(np.float64))
 
     if not xyz_parts:
-        raise RuntimeError("MapAnything produced no pts3d under mask")
+        raise RuntimeError("MapAnything produced no camera-frame points under mask")
 
     xyz = np.concatenate(xyz_parts, axis=0)
     rgb = np.concatenate(rgb_parts, axis=0)
     if len(xyz) > max_points:
         idx = np.linspace(0, len(xyz) - 1, max_points).astype(np.int64)
         xyz, rgb = xyz[idx], rgb[idx]
+
+    centers = np.stack(
+        [np.asarray(T, dtype=np.float64)[:3, 3] for T in locked_poses], axis=0
+    )
+    enu_stats: dict[str, float] | None = None
+    if not skip_enu_check:
+        enu_stats = assert_cloud_near_cameras(
+            xyz,
+            centers,
+            centroid_delta_max_m=centroid_delta_max_m,
+            z_p50_delta_max_m=z_p50_delta_max_m,
+        )
+        log.info(
+            "MapAnything ENU check OK: centroid|ΔC|=%.2fm z_p50=%.2f (cam_u_p50=%.2f)",
+            enu_stats["centroid_delta_m"],
+            enu_stats["cloud_z_p50"],
+            enu_stats["cam_u_p50"],
+        )
 
     dest_ply = Path(dest_ply)
     dest_ply.parent.mkdir(parents=True, exist_ok=True)
@@ -651,8 +855,8 @@ def fuse_predictions_to_ply(
     write_ply(dest_ply, xyz, bgr)
 
     drift = None
-    if locked_poses is not None and predicted_poses:
-        drift = _median_pose_drift_m(locked_poses, predicted_poses)
+    if predicted_poses:
+        drift = _median_pose_drift_m(list(locked_poses), predicted_poses)
         if drift is not None:
             log.info(
                 "MapAnything predicted-pose median |ΔC|=%.3f m (discarded; ENU lock kept)",
@@ -664,6 +868,10 @@ def fuse_predictions_to_ply(
         "points": int(len(xyz)),
         "predicted_pose_median_delta_m": drift,
         "predicted_poses_discarded": True,
+        "export_frame": "ENU",
+        "export_source": export_source,
+        "transform": "R_c2w @ pts_cam + C_enu (locked poses)",
+        "enu_check": enu_stats,
     }
 
 

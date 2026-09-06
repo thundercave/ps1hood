@@ -104,8 +104,29 @@ Infer flags (also stored under `manifest.infer_flags`):
 | `amp_dtype` | **`bf16` on CUDA**; **`fp16` when `torch.version.hip` is set** (ROCm / RDNA2 — see [mapanything-rocm-gfx1030.md](mapanything-rocm-gfx1030.md)) |
 | `--ignore_pose_inputs` (CLI) | **never** |
 
-Fuse masked `pts3d` → `mapanything/cloud.ply`, copy to
-`recon/cloud_mapanything.ply` and `recon/cloud.ply` (Studio load path).
+### Product PLY frame (hard rule)
+
+Studio (smoke-dense) once showed MapAnything ~591k pts in the **wrong frame**:
+centroid ~(20.5, -0.5, 50.3)m, z p50~60.6m, ΔC vs cameras ~(+27,-3,+47)m,
+while flow stayed on-street ~(−20,5,4). Predicted-pose |ΔC|~53–60m was
+**discarded as authority** (correct), but fused geometry was still wrong because
+raw model-world `pts3d` was written to PLY.
+
+**Fix:** export camera-frame geometry with **our** locked cam2world only:
+
+```text
+WORLD_ENU = R_c2w @ X_cam + C_enu
+```
+
+- `R_c2w`, `C_enu=(e,n,u)` from `camera_rotation_cv` / align — never MA predicted pose
+- Prefer `pts3d_cam` (else `depth_z` + rays/K); **refuse** dumping raw `pts3d` as ENU
+- After fuse, **fail-loud** if cloud centroid is ≫20–25 m from camera centroid or
+  cloud z p50 diverges from camera u p50 (the ~+50 m float symptom)
+
+KEEP FLOW as product until these gates pass on a live re-run (PC).
+
+Fuse → `mapanything/cloud.ply`, copy to `recon/cloud_mapanything.ply` and
+`recon/cloud.ply` (Studio load path) only when the ENU check passes.
 
 ---
 
@@ -126,6 +147,8 @@ there. Reload Studio / re-open the run. Scene cameras remain align ENU
 | <2 posed frames | Fail loud — run align (and optionally interpolate) |
 | Bundle pose drift vs `enu` | Fail loud on export / load assert |
 | `--ignore_pose_inputs` | Refused in our argv builder |
+| Raw `pts3d` without `pts3d_cam`/`depth_z` | Fail loud — refuse model-world as ENU |
+| Cloud centroid / z p50 far from cameras | Fail loud ENU frame check (Studio +50 m bug) |
 
 ---
 
@@ -135,8 +158,9 @@ there. Reload Studio / re-open the run. Scene cameras remain align ENU
 uv run pytest -q tests/test_mapanything.py
 ```
 
-Mocks cover bundle shape, cam2world lock, COLMAP demo argv (no ignore flag),
-CUDA fail-loud, and HIP → `fp16` AMP default — no GPU required.
+Mocks cover bundle shape, cam2world vs w2c convention, `pts3d_cam`→ENU fuse
+(locked poses), refuse-raw-`pts3d`, ENU centroid/z gates, COLMAP demo argv
+(no ignore flag), CUDA fail-loud, and HIP → `fp16` AMP default — no GPU required.
 
 ---
 
