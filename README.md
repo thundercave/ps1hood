@@ -91,6 +91,8 @@ This repo ships a no-weight **optical-flow (DIS)** interpolator so the rest of t
 - COLMAP — still the reliable ordered-video baseline.
 - Luma / Postshot / Polycam — drag `runs/<name>/interp/drive.mp4` in.
 
+R&D ranking for OSS interpolators, pose-locked densifiers (MapAnything, OpenMVS, …), and preferred toolchains: [`docs/rd-interp-and-v2pc.md`](docs/rd-interp-and-v2pc.md).
+
 Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, prefer near-horizon shots) + a **photo-consistency** vertical-plane façade pass (ZNCC under known poses; fail-loud if none pass — not flow-RANSAC walls). Pairs are chosen by ENU baseline (2–25 m) and overlapping heading (≤60°), not list order alone. DIS midframes are only a fallback if fewer than two keyframes exist. Export / COLMAP / MASt3R use the same keyframes.
 
 **Textured façades:** after photo-consistency accept, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.

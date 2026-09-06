@@ -143,6 +143,7 @@ After the capture-budget PR:
 1. **Textured facades + load OBJ in viewer** — first “hood” screenshot from BAG planes or RANSAC quads + SV projection.
 2. **MASt3R optional backend** — real cloud quality on the smoke run.
 3. **PS1 viewer mode** — affine sampling, palette/dither, vertex quantize on export.
+4. **Pose-locked densify / interp R&D** — MapAnything + GIMM-VFI vs FILM experiments; see [docs/rd-interp-and-v2pc.md](docs/rd-interp-and-v2pc.md).
 
 ---
 
