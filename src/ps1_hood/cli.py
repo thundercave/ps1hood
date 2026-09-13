@@ -449,6 +449,111 @@ def export_mapanything_bundle_cmd(
     )
 
 
+@main.command("facades")
+@click.argument("name")
+@click.option(
+    "--source",
+    type=click.Choice(["mapanything", "recon", "auto"]),
+    default="mapanything",
+    show_default=True,
+    help="dense ENU PLY: mapanything/cloud.ply (or cloud_mapanything) / recon/cloud.ply / auto",
+)
+@click.option(
+    "--planarize/--no-planarize",
+    default=True,
+    show_default=True,
+    help="Path α Open3D/numpy segment_plane peel (auto-on for dense MA PLY in extract_facades)",
+)
+@click.option("--zncc-accept", default=0.40, show_default=True, type=float)
+@click.option("--voxel", "voxel_m", default=0.08, show_default=True, type=float)
+@click.option("--plane-dist", "plane_dist_m", default=0.08, show_default=True, type=float)
+@click.option("--max-planes", default=12, show_default=True, type=int)
+def facades_cmd(
+    name: str,
+    source: str,
+    planarize: bool,
+    zncc_accept: float,
+    voxel_m: float,
+    plane_dist_m: float,
+    max_planes: int,
+) -> None:
+    """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
+
+    Prefer MapAnything product PLY for plane seeds; still photo-ZNCC gate.
+    No OSM/BAG hero. Residual organic omitted (no Poisson in α1).
+    """
+    from ps1_hood.geo import LocalFrame
+    from ps1_hood.reconstruct.facades import extract_facades
+    from ps1_hood.reconstruct.keyframes import load_keyframes
+    from ps1_hood.reconstruct.planarize import resolve_dense_ply
+
+    project = open_project(name)
+
+    try:
+        ply = resolve_dense_ply(project.root, source=source)
+    except FileNotFoundError as exc:
+        click.echo(f"facades: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    frames = load_keyframes(project)
+    for fr in frames:
+        if "path" not in fr and fr.get("shot_path"):
+            fr["path"] = fr["shot_path"]
+
+    sat = None
+    sat_meta = project.satellite_dir / "meta.json"
+    if sat_meta.is_file():
+        sat = project.read_json(sat_meta)
+        if isinstance(sat, dict) and sat.get("path"):
+            p = Path(sat["path"])
+            if not p.is_file():
+                cand = project.root / sat["path"]
+                if cand.is_file():
+                    sat["path"] = str(cand)
+
+    try:
+        frame = LocalFrame.from_bbox(project.load_spec().bbox)
+    except Exception:
+        frame = None
+
+    try:
+        meta = extract_facades(
+            ply,
+            project.recon_dir / "facades.obj",
+            n_planes=max_planes,
+            frames=frames,
+            satellite=sat if isinstance(sat, dict) else None,
+            local_frame=frame,
+            zncc_accept=zncc_accept,
+            planarize=planarize,
+            voxel_m=voxel_m,
+            plane_dist_m=plane_dist_m,
+        )
+    except Exception as exc:
+        click.echo(f"facades failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    # Merge into scene.json if present
+    scene_path = project.recon_dir / "scene.json"
+    if scene_path.is_file():
+        import json
+
+        payload = json.loads(scene_path.read_text(encoding="utf-8"))
+        cloud = payload.get("cloud") if isinstance(payload.get("cloud"), dict) else {}
+        cloud = dict(cloud or {})
+        cloud["facades"] = meta
+        cloud["planar_source"] = meta.get("source")
+        payload["cloud"] = cloud
+        payload["facades"] = meta
+        scene_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    click.echo(
+        f"facades ok  planes={meta.get('planes')}  textured={meta.get('textured')}  "
+        f"source={meta.get('source')}  mean_zncc={meta.get('mean_zncc')}  "
+        f"ply={ply}"
+    )
+
+
 @main.command("studio")
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)

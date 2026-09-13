@@ -324,14 +324,21 @@ def extract_facades(
     satellite: dict[str, Any] | None = None,
     local_frame: LocalFrame | None = None,
     min_points: int = 80,
-    zncc_accept: float = 0.35,
+    zncc_accept: float | None = None,
+    planarize: bool | None = None,
+    voxel_m: float = 0.08,
+    plane_dist_m: float = 0.08,
 ) -> dict:
-    """Photo-consistent vertical façades under known poses (Milestone A).
+    """Photo-consistent vertical façades under known poses.
 
-    Hypothesize vertical planes (sparse seeds + Manhattan heading×distance),
-    score cross-pano ZNCC via plane-induced homography, keep only accepts,
-    ortho-bake textures. Fail-loud: empty wall list + clear log — never
-    invent flow-cloud RANSAC walls as product geometry. OSM/BAG are not used.
+    Path α (planarize): when ``planarize=True`` or auto (dense PLY ≳50k pts),
+    seed vertical planes from MapAnything ENU cloud via Open3D/numpy
+    ``segment_plane`` peel, then ZNCC-gate + ortho bake (Milestone A).
+
+    Milestone A fallback: heading×distance / sparse hypotheses + ZNCC.
+
+    Fail-loud: empty wall list + clear log — never invent flow-RANSAC or
+    OSM/BAG walls as product geometry.
     """
     import logging
 
@@ -339,31 +346,89 @@ def extract_facades(
         plane_dict_for_obj,
         search_photo_consistent_planes,
     )
+    from ps1_hood.reconstruct.planarize import (
+        DEFAULT_ZNCC_ACCEPT_MA,
+        PLANARIZE_AUTO_MIN_POINTS,
+        planes_from_mapanything_ply,
+        score_planar_hyps,
+        write_planes_json,
+    )
 
     log = logging.getLogger(__name__)
     frames = list(frames or [])
 
-    xyz = np.zeros((0, 3), dtype=np.float64)
+    xyz_raw = np.zeros((0, 3), dtype=np.float64)
     if ply_path is not None and Path(ply_path).is_file():
         try:
-            xyz = _read_ply_xyz(Path(ply_path))
+            xyz_raw = _read_ply_xyz(Path(ply_path))
         except Exception as exc:  # noqa: BLE001
             log.warning("facades: could not read seed PLY %s (%s)", ply_path, exc)
-    if len(xyz) >= 20:
-        xyz = _voxel_downsample_xyz(xyz, 0.20)
+
+    use_planarize = planarize if planarize is not None else (
+        len(xyz_raw) >= PLANARIZE_AUTO_MIN_POINTS
+    )
+    if zncc_accept is None:
+        zncc_accept = DEFAULT_ZNCC_ACCEPT_MA if use_planarize else 0.35
+
+    residual_pts = 0
+    source_tag = "photo_consistency"
+
+    if len(xyz_raw) >= 20:
+        xyz = _voxel_downsample_xyz(xyz_raw, 0.20 if not use_planarize else voxel_m)
         ground_z = _fit_ground_z(xyz)
     else:
+        xyz = xyz_raw
         ground_z = 0.0
         if frames:
             ground_z = float(np.median([float(f.get("u") or 0.0) for f in frames])) - 2.5
 
-    accepted = search_photo_consistent_planes(
-        frames,
-        xyz if len(xyz) >= 30 else None,
-        zncc_accept=zncc_accept,
-        ground_z=ground_z,
-        max_keep=n_planes,
-    )
+    if use_planarize and ply_path is not None and Path(ply_path).is_file() and len(xyz_raw) >= 100:
+        cam_c = (
+            np.mean(
+                [[float(f["e"]), float(f["n"]), float(f["u"])] for f in frames],
+                axis=0,
+            )
+            if frames
+            else xyz.mean(axis=0)
+        )
+        hyps, ground, residual_pts = planes_from_mapanything_ply(
+            Path(ply_path),
+            cam_c,
+            xyz=xyz_raw,
+            ground_z=ground_z,
+            voxel=voxel_m,
+            distance_threshold=plane_dist_m,
+            max_planes=max(n_planes, 24),
+        )
+        if ground is not None and ground.get("z") is not None:
+            ground_z = float(ground["z"])
+        accepted = score_planar_hyps(
+            hyps,
+            frames,
+            zncc_accept=float(zncc_accept),
+            max_keep=n_planes,
+        )
+        source_tag = "mapanything_planarize"
+        log.info(
+            "facades Path α: %s segmented → %s ZNCC-kept (ply=%s pts)",
+            len(hyps),
+            len(accepted),
+            len(xyz_raw),
+        )
+    else:
+        if planarize is True and len(xyz_raw) < 100:
+            log.warning(
+                "facades: planarize requested but PLY too thin (%s pts) — "
+                "falling back to Milestone A heading×distance",
+                len(xyz_raw),
+            )
+        accepted = search_photo_consistent_planes(
+            frames,
+            xyz if len(xyz) >= 30 else None,
+            zncc_accept=float(zncc_accept),
+            ground_z=ground_z,
+            max_keep=n_planes,
+        )
 
     planes: list[dict] = []
     for pl in accepted:
@@ -434,25 +499,58 @@ def extract_facades(
 
     if not planes:
         log.error(
-            "facades.obj: 0 photo-consistent walls (ZNCC≥%.2f). "
-            "Studio will show ground only — not uncorrelated RANSAC blocks.",
+            "facades.obj: 0 photo-consistent walls (ZNCC≥%.2f, source=%s). "
+            "Studio will show ground only — not uncorrelated RANSAC/OSM blocks.",
             zncc_accept,
+            source_tag,
         )
 
     mtl_path = dest_obj.with_suffix(".mtl")
     _write_mtl(mtl_path, materials)
     _write_obj(dest_obj, planes, extent_xyz, materials, mtl_path.name)
+
+    # Enrich plane dicts with width/height for planes.json
+    for i, pl in enumerate(planes):
+        if accepted and i < len(accepted):
+            pl["width_m"] = float(accepted[i].get("width_m") or 0.0)
+            pl["height_m"] = float(accepted[i].get("height_m") or 0.0)
+            pl["zncc"] = accepted[i].get("zncc")
+            pl["inliers"] = accepted[i].get("inliers") or accepted[i].get("count") or 0
+            if "n" not in pl and "nx" in pl:
+                pl["n"] = np.array([pl["nx"], pl["ny"], 0.0], dtype=np.float64)
+
+    tex_maps = [m.get("map") for m in materials[1:]]
+    planes_json = dest_obj.parent / "planes.json"
+    write_planes_json(
+        planes_json,
+        planes=planes,
+        ground_z=ground_z,
+        residual_points=residual_pts,
+        source=source_tag,
+        textured_maps=tex_maps,
+    )
+
+    mean_zncc = (
+        float(np.mean([p.get("zncc", 0.0) for p in planes if p.get("zncc") is not None]))
+        if any(p.get("zncc") is not None for p in planes)
+        else None
+    )
     return {
         "path": str(dest_obj),
         "mtl": str(mtl_path),
+        "planes_json": str(planes_json),
         "planes": len(planes),
         "textured": textured,
         "ground_textured": has_ground_tex,
-        "source": "photo_consistency",
+        "source": source_tag,
+        "planarize": bool(use_planarize and source_tag == "mapanything_planarize"),
         "zncc_accept": float(zncc_accept),
         "ground_z": ground_z,
-        "points_used": int(len(xyz)),
-        "mean_zncc": float(np.mean([p.get("zncc", 0.0) for p in planes])) if planes else None,
+        "points_used": int(len(xyz_raw) if len(xyz_raw) else len(xyz)),
+        "points_voxel": int(len(xyz)),
+        "residual_points": int(residual_pts),
+        "mean_zncc": mean_zncc,
+        "path_alpha": source_tag == "mapanything_planarize",
     }
 
 
