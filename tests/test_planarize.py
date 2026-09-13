@@ -12,10 +12,13 @@ from ps1_hood.reconstruct.facades import extract_facades
 from ps1_hood.reconstruct.planarize import (
     DEFAULT_VERTICAL_DOT,
     HAS_OPEN3D,
+    expand_hyps_for_scoring,
     inliers_to_quad,
     planes_from_mapanything_ply,
     resolve_dense_ply,
+    score_planar_hyps,
     segment_vertical_planes_numpy,
+    split_long_hyp,
     write_planes_json,
 )
 
@@ -568,3 +571,251 @@ def test_score_planar_hyps_fail_loud_marks_sentinel(caplog: pytest.LogCaptureFix
     joined = " ".join(r.message for r in caplog.records)
     assert "SENTINEL" in joined
     assert "scored=0" in joined
+
+
+def test_split_long_hyp_overlapping_windows() -> None:
+    """Wide peel → overlapping ~10 m windows with same n,d."""
+    n = np.array([1.0, 0.0, 0.0])
+    d = -5.0
+    # 24 m wide wall along +Y at x=5
+    corners = np.array(
+        [
+            [5.0, -12.0, 0.5],
+            [5.0, 12.0, 0.5],
+            [5.0, 12.0, 8.0],
+            [5.0, -12.0, 8.0],
+        ],
+        dtype=np.float64,
+    )
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": corners.mean(axis=0),
+        "width_m": 24.0,
+        "height_m": 7.5,
+        "corners": corners,
+        "source": "ma_segment",
+    }
+    parts = split_long_hyp(hyp)
+    assert len(parts) >= 2
+    for p in parts:
+        assert abs(float(p["n"] @ n)) > 0.99
+        assert abs(float(p["d"]) - d) < 1e-6
+        assert 1.5 <= float(p["width_m"]) <= 12.0 + 1e-6
+        # Centers closer to ends / mid than original mid-block-only crop
+        assert abs(float(p["center"][0]) - 5.0) < 0.2
+    expanded = expand_hyps_for_scoring([hyp])
+    assert len(expanded) == len(parts)
+
+
+def test_score_planar_hyps_street_parallel_not_depth_sentinel(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cams beside a façade (small |n·C+d|, ok Euclidean) must not all skip as SENTINEL.
+
+    PR#16 signed-depth min-over-cams gate zeroed scored on street-parallel peels.
+    Soft Euclidean + deferred refine must still reach score_vertical_plane (or
+    fail for views/load — not hard depth) when images are missing.
+    """
+    import logging
+
+    # Wall at x=8; cams at x=0 along +Y (beside wall) — signed |n·C+d|=8,
+    # Euclidean center→cam depends on Y. Place a LONG peel whose AABB center
+    # is far in Y so old euclidean gate at mid-block would fail; split brings
+    # windows near cams.
+    n = np.array([1.0, 0.0, 0.0])
+    d = -8.0
+    corners = np.array(
+        [
+            [8.0, -20.0, 0.5],
+            [8.0, 20.0, 0.5],
+            [8.0, 20.0, 9.0],
+            [8.0, -20.0, 9.0],
+        ],
+        dtype=np.float64,
+    )
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": corners.mean(axis=0),  # (8, 0, ~4.75)
+        "width_m": 40.0,
+        "height_m": 8.5,
+        "corners": corners,
+        "source": "ma_segment",
+        "inliers": 5000,
+    }
+    # Missing images → load skip after views picked; but must NOT be depth-only sentinel
+    frames = []
+    for i, y in enumerate((-5.0, 5.0)):
+        frames.append(
+            {
+                "path": str(tmp_path / f"missing_{i}.jpg"),
+                "e": 0.0,
+                "n": y,
+                "u": 2.0,
+                "heading": 90.0,  # look +E toward wall
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"p{i}",
+            }
+        )
+    with caplog.at_level(logging.ERROR, logger="ps1_hood.reconstruct.planarize"):
+        kept = score_planar_hyps([hyp], frames, zncc_accept=0.40)
+    assert kept == []
+    joined = " ".join(r.message for r in caplog.records)
+    assert "SENTINEL" in joined
+    # Hard depth should not consume the long peel after split (windows near cams)
+    assert "depth=0" in joined or "depth=0;" in joined or "depth=0 " in joined
+    # Failure is views/load (no images), not systematic depth wipe of all windows
+    assert ("load=" in joined) or ("views=" in joined)
+
+
+def _write_textured_views_for_wall(tmp_path: Path) -> tuple[list[dict], np.ndarray, float, np.ndarray]:
+    """Two cams looking +E at vertical wall x=8 with photo-consistent textures."""
+    from ps1_hood.reconstruct.photo_planes import (
+        View,
+        plane_homography,
+        Rt_from_frame,
+        K_from_frame,
+        score_vertical_plane,
+    )
+
+    rng = np.random.default_rng(7)
+    # Distinctive façade pattern
+    img0 = np.zeros((480, 640, 3), dtype=np.uint8)
+    noise = rng.integers(40, 220, (480, 640), dtype=np.uint8)
+    img0[:, :, 0] = noise
+    img0[:, :, 1] = np.roll(noise, 11, axis=1)
+    img0[:, :, 2] = np.roll(noise, 5, axis=0)
+    cv2.rectangle(img0, (120, 60), (520, 420), (40, 160, 230), -1)
+    cv2.putText(img0, "WALL", (200, 260), cv2.FONT_HERSHEY_SIMPLEX, 3.0, (255, 255, 255), 4)
+
+    n = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    d = -8.0
+    center = np.array([8.0, 0.0, 4.0], dtype=np.float64)
+
+    frames = []
+    for i, (e, north, heading) in enumerate(
+        [(0.0, -1.5, 90.0), (0.5, 1.5, 90.0)]
+    ):
+        fr = {
+            "e": e,
+            "n": north,
+            "u": 2.0,
+            "heading": heading,
+            "pitch": 0.0,
+            "fov": 90.0,
+            "pano_id": f"tex{i}",
+        }
+        frames.append(fr)
+
+    # Build consistent src image via plane H from cam0 pattern
+    R0, t0 = Rt_from_frame({**frames[0], "path": "x"})
+    R1, t1 = Rt_from_frame({**frames[1], "path": "x"})
+    K0 = K_from_frame(640, 480, 90.0)
+    K1 = K_from_frame(640, 480, 90.0)
+    H = plane_homography(K0, R0, t0, K1, R1, t1, n, d)
+    img1 = cv2.warpPerspective(img0, H, (640, 480), flags=cv2.INTER_LINEAR)
+
+    paths = []
+    for i, im in enumerate((img0, img1)):
+        p = tmp_path / f"tex_wall_{i}.jpg"
+        cv2.imwrite(str(p), im)
+        frames[i]["path"] = str(p)
+        paths.append(p)
+
+    # Sanity: direct score_vertical_plane should accept
+    v0 = View(img0, K0, R0, t0, 0, "tex0")
+    v1 = View(img1, K1, R1, t1, 1, "tex1")
+    direct = score_vertical_plane(
+        [v0, v1], n, d, center, width_m=6.0, height_m=6.0, zncc_accept=0.35, patch=64
+    )
+    assert direct["ok"], f"sanity direct score failed: {direct}"
+    return frames, n, d, center
+
+
+def test_score_planar_hyps_synthetic_facade_finite_zncc(tmp_path: Path) -> None:
+    """Plausible MA peel + photo-consistent views → finite ZNCC ≥ 0.35 (not sentinel)."""
+    frames, n, d, center = _write_textured_views_for_wall(tmp_path)
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": center,
+        "width_m": 8.0,
+        "height_m": 7.0,
+        "corners": np.array(
+            [
+                [8.0, -4.0, 0.5],
+                [8.0, 4.0, 0.5],
+                [8.0, 4.0, 7.5],
+                [8.0, -4.0, 7.5],
+            ],
+            dtype=np.float64,
+        ),
+        "source": "ma_segment",
+        "inliers": 800,
+    }
+    kept = score_planar_hyps([hyp], frames, zncc_accept=0.35, refine=True)
+    assert len(kept) >= 1, "expected ≥1 accept on synthetic photo-consistent façade"
+    assert float(kept[0]["zncc"]) >= 0.35
+    assert not (isinstance(kept[0]["zncc"], float) and kept[0]["zncc"] == -1.0)
+
+
+def test_score_planar_hyps_refine_rescues_depth_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """±n refine must try depth offsets (Milestone A parity) and can beat as-is seed."""
+    frames, n, d, center = _write_textured_views_for_wall(tmp_path)
+    bad_center = center - n * 2.0
+    bad_d = float(-n @ bad_center)
+    hyp = {
+        "n": n,
+        "d": bad_d,
+        "center": bad_center,
+        "width_m": 8.0,
+        "height_m": 7.0,
+        "source": "ma_segment",
+        "inliers": 800,
+    }
+
+    # Instrument: true depth candidate returns higher ZNCC than seed.
+    import ps1_hood.reconstruct.photo_planes as pp
+
+    real = pp.score_vertical_plane
+    calls: list[float] = []
+
+    def wrapped(views, n_c, d_c, c_c, **kwargs):  # noqa: ANN001
+        # Signed offset from true wall along original +n
+        depth_err = abs(float(n @ c_c) - float(n @ center))
+        calls.append(depth_err)
+        out = real(views, n_c, d_c, c_c, **kwargs)
+        # Force clear preference for near-true depth so refine wins over seed.
+        if isinstance(out.get("zncc"), float) and not __import__("math").isnan(out["zncc"]):
+            if depth_err < 0.25:
+                out = {**out, "zncc": 0.95, "ok": True, "reason": "accept"}
+            elif depth_err > 1.5:
+                out = {**out, "zncc": 0.20, "ok": False, "reason": "zncc below threshold"}
+        return out
+
+    monkeypatch.setattr(pp, "score_vertical_plane", wrapped)
+    kept = score_planar_hyps([hyp], frames, zncc_accept=0.35, refine=True)
+    assert len(kept) >= 1
+    assert float(kept[0]["zncc"]) >= 0.35
+    assert abs(float(kept[0]["refine_delta_m"])) >= 1.0
+    # Refine must have scored multiple depth offsets (not seed-only).
+    assert len(calls) >= 3
+    assert min(calls) < 0.5  # at least one candidate near true wall
+
+
+def test_plane_homography_rejects_near_camera() -> None:
+    """Ill-conditioned |c|<0.5 must raise (anti-fold / sentinel-ish warps)."""
+    import pytest
+    from ps1_hood.reconstruct.photo_planes import plane_homography
+
+    K = np.eye(3, dtype=np.float64)
+    R = np.eye(3, dtype=np.float64)
+    t = np.zeros(3, dtype=np.float64)  # cam at origin
+    n = np.array([0.0, 0.0, 1.0])
+    d = -0.2  # plane 0.2 m in front → |c|=0.2
+    with pytest.raises(ValueError, match="near reference"):
+        plane_homography(K, R, t, K, R, t - np.array([1.0, 0, 0]), n, d)
