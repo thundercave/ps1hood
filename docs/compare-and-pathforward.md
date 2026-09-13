@@ -397,17 +397,21 @@ Expect a_kept nearer ~7 if `cloud_flow` / flow `cloud.ply` present; ma_added non
 
 **Problem after #28:** mean photometric NCC ≈ 0.26 (soft); MA cloud floaters outside Ortho tile distract Studio.
 
-**This PR:**
+**This PR (#29):**
 1. Fuse Ortho road/roof **Canny** (remap + Chamfer vs photo edges) with NCC in `align_camera_to_satellite`: `score = w_ncc·ncc + w_edge·edge` (default **0.35 / 0.65**). Telemetry: `sat_score`, `sat_ncc`, `sat_edge`, means in `georef.json`.
 2. PR1 shortcut: per-cam fused search + existing `_bundle_se2` (relative kept). Fine stage ±2 m / ±4°.
-3. After sat seat: **clip** `cloud.ply` / `cloud_photo.ply` to `Ortho.enu_corners` ± margin (default **2 m**); sidecar `*_satclipped.ply`; façades untouched.
+3. Optional floater tool: **clip** `cloud.ply` / `cloud_photo.ply` to `Ortho.enu_corners` ± margin (default margin **2 m** when clipping); sidecar `*_satclipped.ply`; façades untouched.
 4. CLI: `--sat-edge-weight`, `--cloud-clip-sat/--no-cloud-clip-sat`, `--sat-cloud-margin-m`.
+
+**Follow-up (cloud clip opt-in):** PR #29’s default clip-on dropped ~42% of the MA cloud. Product default is now **`--no-cloud-clip-sat`** / `cloud_clip_sat=False` — **prefer the unclipped product cloud**; use `--cloud-clip-sat` only as an optional floater tool when Studio needs a tighter Ortho AABB.
 
 **PC after merge:**
 ```
 ps1hood align smoke-dense --align-prior sat
-# optional: --sat-edge-weight 0.65 --sat-cloud-margin-m 5
+# full unclipped MA cloud (default)
+# optional floater clip: --cloud-clip-sat --sat-cloud-margin-m 5
+# optional: --sat-edge-weight 0.65
 ```
-Expect higher `sat_edge` / fused `sat_score_mean`; fewer MA pts outside Ortho; Studio cleaner.
+Expect higher `sat_edge` / fused `sat_score_mean`; full MA kept unless you opt into clip.
 
 **R&D pack:** [`sat-edge-ncc-tighten-rd.md`](sat-edge-ncc-tighten-rd.md)

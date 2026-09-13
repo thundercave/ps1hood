@@ -1,4 +1,4 @@
-"""Sat edge+NCC fuse + Ortho ENU floater clip (PR1)."""
+"""Sat edge+NCC fuse + Ortho ENU floater clip (opt-in; prefer unclipped product)."""
 
 from __future__ import annotations
 
@@ -150,3 +150,17 @@ def test_clip_ply_binary(tmp_path: Path) -> None:
     stats = clip_ply_to_ortho_enu(ply, -1.0, -1.0, 1.0, 1.0, margin_m=0.0)
     assert stats["kept"] == 1
     assert stats["dropped"] == 1
+
+
+def test_cloud_clip_sat_default_off() -> None:
+    """Pipeline / CLI default: cloud clip is opt-in (False), not clip-on."""
+    from click.core import Command
+    from ps1_hood import cli as cli_mod
+
+    align: Command = cli_mod.main.commands["align"]
+    opt = next(p for p in align.params if p.name == "cloud_clip_sat")
+    assert opt.default is False
+
+    run: Command = cli_mod.main.commands["run"]
+    opt_run = next(p for p in run.params if p.name == "cloud_clip_sat")
+    assert opt_run.default is False

@@ -174,14 +174,20 @@ def bag_download_cmd() -> None:
     help="Absolute XY prior for align: sat (Ortho, default) or bag (legacy debug).",
 )
 @click.option("--sat-edge-weight", "sat_edge_weight", type=float, default=None)
-@click.option("--cloud-clip-sat/--no-cloud-clip-sat", "cloud_clip_sat", default=None)
+@click.option(
+    "--cloud-clip-sat/--no-cloud-clip-sat",
+    "cloud_clip_sat",
+    default=False,
+    show_default=True,
+    help="Opt-in floater tool: clip MA cloud to Ortho ENU ± margin. Prefer unclipped product cloud.",
+)
 @click.option("--sat-cloud-margin-m", "sat_cloud_margin_m", type=float, default=None)
 def run_cmd(
     name: str,
     from_stage: str,
     align_prior: str | None,
     sat_edge_weight: float | None,
-    cloud_clip_sat: bool | None,
+    cloud_clip_sat: bool,
     sat_cloud_margin_m: float | None,
 ) -> None:
     """Run the pipeline (or resume from a stage)."""
@@ -261,9 +267,9 @@ def satellite_cmd(name: str) -> None:
 @click.option(
     "--cloud-clip-sat/--no-cloud-clip-sat",
     "cloud_clip_sat",
-    default=True,
+    default=False,
     show_default=True,
-    help="After sat seat, clip MA cloud.ply to Ortho ENU bbox ± margin.",
+    help="Opt-in floater tool: after sat seat, clip MA cloud.ply to Ortho ENU ± margin. Prefer unclipped product cloud.",
 )
 @click.option(
     "--sat-cloud-margin-m",

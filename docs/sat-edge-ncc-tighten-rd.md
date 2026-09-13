@@ -138,18 +138,21 @@ keep if:
 
 Source of truth: `scene.satellite.bbox` / `Ortho.bbox` → ENU via `LocalFrame`, **not** camera-hull AABB.
 
-### Where to clip (product)
+### Where to clip (optional floater tool)
+
+**Prefer the unclipped product cloud.** Default is **no clip** (`--no-cloud-clip-sat` / `cloud_clip_sat=False`). PR #29’s default clip dropped ~42% of MA on smoke-dense — keep the full cloud unless you explicitly want an Ortho AABB floater gate.
 
 | Stage | Action |
 |-------|--------|
-| **After `seat_recon_artefacts` / `apply_se2_to_ply`** | Filter `recon/cloud.ply` (and `cloud_photo.ply` if present) in-place or write `cloud_satclipped.ply` + point Studio at clipped |
-| **`scripts/apply_georef.py`** | Optional `--clip-sat-bbox` after SE(2) |
+| **After `seat_recon_artefacts` / `apply_se2_to_ply`** | **Opt-in** (`--cloud-clip-sat`): filter `recon/cloud.ply` (and `cloud_photo.ply` if present) or write `cloud_satclipped.ply` |
+| **`scripts/apply_georef.py`** | Optional `--clip-sat-bbox` after SE(2) (already opt-in) |
 | **Studio viewer** | GPU/CPU hide: discard pts with ENU outside sat plane extents (defence in depth if PLY not re-exported) |
 | **MapAnything export** (follow-up) | Optional early clip so Path α never sees out-of-tile junk |
 
 ### Semantics
 
-- **Drop** (preferred for product PLY): rewrite vertex list; update `georef.cloud_clipped = { kept, dropped, margin_m, bbox_enu }`.
+- **Prefer unclipped product PLY** (default). Clip is an optional floater tool, not the product path.
+- **Drop** (when `--cloud-clip-sat`): rewrite vertex list; update `georef.cloud_clipped = { kept, dropped, margin_m, bbox_enu }`.
 - **Hide** (viewer-only): leave full PLY for debug toggle “show floaters”.
 - Do **not** clip façades.obj by sat bbox aggressively (walls near tile edge may straddle); optional soft warn if >X% verts outside.
 - BAG remains off / not used for this gate.
@@ -162,7 +165,7 @@ def clip_ply_to_ortho_enu(path, sw, sh, ee, nn, margin_m=2.0) -> dict:
     # read xyz; keep inside expanded AABB; rewrite PLY; return counts
 ```
 
-Call from `pipeline.stage_align` after seat when `align_prior == "sat"`, and from `apply_georef.py`.
+Call from `pipeline.stage_align` after seat when `align_prior == "sat"` **and** `--cloud-clip-sat`, and from `apply_georef.py --clip-sat-bbox`.
 
 ---
 
@@ -173,7 +176,7 @@ Call from `pipeline.stage_align` after seat when `align_prior == "sat"`, and fro
 1. **`align/sat_edges.py`** (new) — Ortho Canny + optional road/roof mask; edge remap or Chamfer vs `photo_edge_dt`.  
 2. **`align/satellite_align.py`** — fused `score = w_ncc·ncc + w_edge·edge`; return `ncc`, `edge`, `score`; multi-scale fine step.  
 3. **`pose_graph.refine_poses`** — use fused score; keep accept floor but prefer edge-aware τ; telemetry on poses.  
-4. **Floater gate** — `clip_ply_to_ortho_enu` after sat seat; `georef` records clip stats; CLI `--sat-cloud-margin-m` (default 2).  
+4. **Floater gate (opt-in)** — `clip_ply_to_ortho_enu` after sat seat when `--cloud-clip-sat`; `georef` records clip stats; CLI `--sat-cloud-margin-m` (default 2 when clipping). Prefer unclipped product cloud.  
 5. **Tests** — fused score prefers edge-aligned shift on synthetic stripe; clip drops pts outside ENU ± margin; sat prior still never bag-snaps.  
 6. **Docs** — one § in `compare-and-pathforward.md` (pathforward).
 
@@ -194,16 +197,16 @@ Call from `pipeline.stage_align` after seat when `align_prior == "sat"`, and fro
 **Automated**
 - [ ] `sat_score_mean` (fused) **↑** vs 0.26 baseline on same run (target ≥ **0.40** or clear edge-term lift in telemetry).  
 - [ ] `georef.prior == "sat"`, `bag_snapped == 0`.  
-- [ ] After clip: **0** (or negligible) MA pts outside Ortho ENU ± `margin_m`; `georef.cloud_clipped.dropped` reported.  
+- [ ] Default align leaves full MA (no `cloud_clipped` unless `--cloud-clip-sat`). When clipped: **0** (or negligible) MA pts outside Ortho ENU ± `margin_m`; `georef.cloud_clipped.dropped` reported.  
 - [ ] Relative structure preserved: one SE(2) only; feature bundle still on.  
 - [ ] Unit tests green (fuse + clip + no bag snap).
 
 **Visual Studio**
 - [ ] Street centreline / kerb and **roofline** under cam arrows ≤ **~1 m** (tighter than “looks about right”).  
-- [ ] MA cloud hugs sat street **inside** tile; no halo of floaters past Ortho edges.  
+- [ ] MA cloud hugs sat street; full cloud by default; with `--cloud-clip-sat`, no halo of floaters past Ortho edges.  
 - [ ] Façades still seated; BAG off.
 
-**Gate phrase:** *Edge-fused sat lock; street/roofline ≤1 m; MA clipped to sat bbox; BAG not hero.*
+**Gate phrase:** *Edge-fused sat lock; street/roofline ≤1 m; full MA by default (clip opt-in floater tool); BAG not hero.*
 
 ---
 
@@ -214,11 +217,11 @@ PR #28 flipped authority to sat and seated the product ~metre — **done**. Rema
 | Track | Role after this pack |
 |-------|----------------------|
 | **Sat absolute XY** | Authority fixed (PR #27 plane + PR #28 prior). This PR = tighten cost + clip. |
-| **Path α** | Planarize/ZNCC on **clipped** MA inside sat tile — fewer bogus peels from floaters. |
+| **Path α** | Planarize/ZNCC on (optionally clipped) MA — clip only if floaters poison peels. |
 | **Studio** | Cleaner walkable block: cams on kerb, cloud bounded by Ortho, façades on sat footprints. |
 | **BAG** | Debug overlay only; never edge authority. |
 
-Sequence: **edge+NCC fuse + floater clip (this PR)** → optional global SE(2) polish → Path α coverage on cleaned cloud → PS1 mesh/texture.
+Sequence: **edge+NCC fuse (this PR) + optional floater clip** → optional global SE(2) polish → Path α on full (or opt-in clipped) cloud → PS1 mesh/texture.
 
 ---
 
@@ -228,6 +231,6 @@ Sequence: **edge+NCC fuse + floater clip (this PR)** → optional global SE(2) p
 |------|--|
 | **Pack path** | `/workspace/sat-edge-ncc-tighten-rd.md` |
 | **Top fix 1** | Fuse **Ortho road/roof Canny (Chamfer/edge-remap)** with photometric NCC in `satellite_align` / `refine_poses` — fix weak mean NCC 0.26 |
-| **Top fix 2** | **Clip/gate MA cloud** to `Ortho.enu_corners` (satellite.bbox ENU) ± margin after sat seat — kill floaters outside sat tile |
+| **Top fix 2** | **Optional clip/gate MA cloud** to `Ortho.enu_corners` ± margin (`--cloud-clip-sat`) — floater tool; prefer unclipped product |
 | **Depends** | PR #28 (sat prior + `T_sat` seat) — merged |
 | **Sacred** | Sat ortho = absolute XY; photo relative 3D; BAG not hero |
