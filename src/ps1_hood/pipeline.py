@@ -464,12 +464,21 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
 
     def _facade_pass(cloud_ply: Path, meta: dict) -> None:
         try:
+            # Path α: prefer MapAnything ENU product PLY for plane seeds when present
+            ma_ply = project.root / "mapanything" / "cloud.ply"
+            ma_recon = project.recon_dir / "cloud_mapanything.ply"
+            seed = cloud_ply
+            for cand in (ma_ply, ma_recon):
+                if cand.is_file():
+                    seed = cand
+                    break
             fac = extract_facades(
-                cloud_ply,
+                seed,
                 project.recon_dir / "facades.obj",
                 frames=frames,
                 satellite=sat,
                 local_frame=frame,
+                planarize=None,  # auto when dense ≳50k
             )
             meta["facades"] = fac
             if int(fac.get("planes") or 0) == 0:

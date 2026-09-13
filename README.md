@@ -95,6 +95,8 @@ R&D ranking for OSS interpolators, pose-locked densifiers (MapAnything, OpenMVS,
 
 Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, prefer near-horizon shots) + a **photo-consistency** vertical-plane façade pass (ZNCC under known poses; fail-loud if none pass — not flow-RANSAC walls). Pairs are chosen by ENU baseline (2–25 m) and overlapping heading (≤60°), not list order alone. DIS midframes are only a fallback if fewer than two keyframes exist. Export / COLMAP / MASt3R use the same keyframes.
 
+**Path α planar façades (MapAnything):** `uv sync --extra planarize` then `ps1hood facades <run> --source mapanything` — voxel + vertical `segment_plane` peel → ZNCC gate → `recon/facades.obj` + `planes.json`. Auto in `extract_facades` when PLY ≳50k. See `docs/path-alpha-planarize-recipe.md`.
+
 **Textured façades:** after photo-consistency accept, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.
 
 COLMAP is hardened for SV orbits: if the sparse model is missing/`points3D.bin` empty or <1 KB, reconstruct errors with a clear "use flow/mast3r/known poses" message; a valid model is converted to `recon/cloud_colmap.ply` (and copied to `cloud.ply`).

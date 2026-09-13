@@ -2,6 +2,8 @@
 
 **Implemented in-repo:** `ps1_hood.reconstruct.photo_planes` + `extract_facades`.
 
+**Path α (2026-09):** dense MapAnything ENU PLY → `planarize.planes_from_mapanything_ply` (Open3D `segment_plane` peel, numpy fallback) → same ZNCC gate + ortho bake. `extract_facades(..., planarize=True)` auto when PLY ≳50k; CLI `ps1hood facades <run> --source mapanything`. See `docs/path-alpha-planarize-recipe.md`. Residual organic omitted (no Poisson hero).
+
 - Hypotheses: sparse posed points (optional) + Manhattan / heading×distance along the drive — **not** flow-cloud RANSAC as product geometry.
 - Score: plane-induced homography `H = K_s (R_rel + t_rel n_refᵀ / c) K_r⁻¹` (n·X+d=0 → n_ref·x=c), ZNCC on ortho patches across **cross-pano** views (`zncc_accept` default 0.35).
 - Fail-loud: `facades.obj` with ground only + error log if nothing passes; Studio must not show invented RANSAC blocks.

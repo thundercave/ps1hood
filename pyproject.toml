@@ -30,6 +30,8 @@ mast3r = []
 # MapAnything: install from https://github.com/facebookresearch/map-anything (CUDA).
 # uv sync --extra mapanything  (documents optional path; package not on PyPI here)
 mapanything = []
+# Path α planarize: Open3D segment_plane peel (numpy fallback always available)
+planarize = ["open3d>=0.18"]
 
 [project.scripts]
 ps1hood = "ps1_hood.cli:main"
