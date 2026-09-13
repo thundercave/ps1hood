@@ -195,7 +195,7 @@ Call existing `photo_planes.score_vertical_plane` / wire hyps into `search_photo
 
 | Gate | Value | Rationale |
 |------|-------|-----------|
-| `zncc_accept` | **0.40** default for MA seeds | A was 0.35–0.48 on flow; denser support → slightly stricter |
+| `zncc_accept` | **0.35** default for MA seeds (same as Milestone A) | After PR #19 finite ZNCC ~0.379 still rejected at 0.40; align with A/fallback |
 | Soft warn | mean ZNCC of kept `< 0.42` | Log; don't hard-fail if count OK |
 | Hard fail | 0 planes after ZNCC | Existing fail-loud in `extract_facades` |
 | `patch` | 64 (A) or **96** if wall >12 m | Larger walls → bigger patch |
@@ -529,7 +529,7 @@ def detect_patches_vertical(pcd, *, min_num_points: int = 400, vertical_dot_max:
 
 ```python
 # In extract_facades(...):
-#   ..., planarize: bool | None = None, zncc_accept: float = 0.40
+#   ..., planarize: bool | None = None, zncc_accept: float = 0.35
 
 use_planarize = planarize if planarize is not None else (len(xyz) >= 50_000)
 if use_planarize:
@@ -548,13 +548,13 @@ else:
 ps1hood planarize <name> \
   --ply runs/<name>/recon/cloud_mapanything.ply \   # or densify product path
   --voxel 0.08 \
-  --zncc-accept 0.40 \
+  --zncc-accept 0.35 \
   --max-planes 12 \
   --out runs/<name>/recon/facades.obj
 
 # or extend densify / reconstruct:
 ps1hood densify <name> --backend mapanything
-ps1hood facades <name> --planarize --zncc-accept 0.40
+ps1hood facades <name> --planarize --zncc-accept 0.35
 ```
 
 Minimal: **no new command required** — gate inside `_facade_pass` when MA product PLY detected (`meta["backend"]=="mapanything"` or point count). Explicit `ps1hood facades --planarize` is clearer for Chief smoke.
