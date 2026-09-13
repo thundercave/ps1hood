@@ -534,6 +534,11 @@ def extract_facades(
     plane_dist_m: float = 0.08,
     keep_previous_on_fail: bool = True,
     fallback_heading: bool = True,
+    hybrid_heading: bool = True,
+    split_trigger_width_m: float | None = None,
+    split_window_m: float | None = None,
+    split_overlap_m: float | None = None,
+    max_heading_seeds: int = 24,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -541,8 +546,13 @@ def extract_facades(
     seed vertical planes from MapAnything ENU cloud via Open3D/numpy
     ``segment_plane`` peel, then ZNCC-gate + ortho bake (Milestone A).
 
-    If Path α keeps 0 planes and ``fallback_heading``, retry Milestone A
-    heading×distance on the same run (``photo_consistency_fallback``).
+    With ``hybrid_heading`` (default on for Path α), Milestone A
+    heading×distance seeds are injected into the same ``score_planar_hyps``
+    pass so NMS keeps a union(A, MA). Promote still uses
+    ``_is_strictly_better`` on the union bake metrics.
+
+    If hybrid/Path α keeps 0 planes and ``fallback_heading``, retry full
+    Milestone A search on the same run (``photo_consistency_fallback``).
 
     Fail-loud: never invent flow-RANSAC or OSM/BAG walls. When accepts==0 and
     ``keep_previous_on_fail`` (default), do **not** clobber non-empty product
@@ -558,10 +568,14 @@ def extract_facades(
     import logging
 
     from ps1_hood.reconstruct.photo_planes import (
+        hypothesize_vertical_planes,
         plane_dict_for_obj,
         search_photo_consistent_planes,
     )
     from ps1_hood.reconstruct.planarize import (
+        DEFAULT_SPLIT_OVERLAP_M,
+        DEFAULT_SPLIT_TRIGGER_WIDTH_M,
+        DEFAULT_SPLIT_WINDOW_M,
         DEFAULT_ZNCC_ACCEPT_MA,
         PLANARIZE_AUTO_MIN_POINTS,
         planes_from_mapanything_ply,
@@ -620,23 +634,81 @@ def extract_facades(
         )
         if ground is not None and ground.get("z") is not None:
             ground_z = float(ground["z"])
+
+        split_trigger = (
+            DEFAULT_SPLIT_TRIGGER_WIDTH_M
+            if split_trigger_width_m is None
+            else float(split_trigger_width_m)
+        )
+        split_window = (
+            DEFAULT_SPLIT_WINDOW_M if split_window_m is None else float(split_window_m)
+        )
+        split_overlap = (
+            DEFAULT_SPLIT_OVERLAP_M
+            if split_overlap_m is None
+            else float(split_overlap_m)
+        )
+
+        seed_hyps: list[dict] = []
+        if hybrid_heading and frames:
+            seed_hyps = hypothesize_vertical_planes(
+                frames,
+                xyz if len(xyz) >= 30 else None,
+                ground_z=ground_z,
+                max_heading_seeds=int(max_heading_seeds),
+            )
+            log.info(
+                "facades Path α hybrid: injecting %s A heading seeds into scorer",
+                len(seed_hyps),
+            )
+
         accepted = score_planar_hyps(
             hyps,
             frames,
             zncc_accept=float(zncc_accept),
             max_keep=n_planes,
+            seed_hyps=seed_hyps or None,
+            split_trigger_width_m=split_trigger,
+            split_window_m=split_window,
+            split_overlap_m=split_overlap,
         )
-        source_tag = "mapanything_planarize"
+
+        def _is_ma(src: str | None) -> bool:
+            s = (src or "ma_segment").lower()
+            return s.startswith("ma_") or s in {"ma_segment", "mapanything_planarize"}
+
+        def _is_a(src: str | None) -> bool:
+            s = (src or "").lower()
+            return s in {"heading_distance", "manhattan", "sparse"} or s.startswith(
+                "photo_"
+            )
+
+        ma_n = sum(1 for p in accepted if _is_ma(p.get("source")))
+        a_n = sum(1 for p in accepted if _is_a(p.get("source")))
+        if ma_n and a_n:
+            source_tag = "mapanything_hybrid"
+        elif ma_n:
+            source_tag = "mapanything_planarize"
+        elif a_n:
+            source_tag = "mapanything_hybrid" if seed_hyps else "photo_consistency"
+        else:
+            source_tag = "mapanything_planarize"
+
         log.info(
-            "facades Path α: %s segmented → %s ZNCC-kept (ply=%s pts)",
+            "facades Path α: %s segmented + %s A seeds → %s ZNCC-kept "
+            "(ma_kept=%s a_kept=%s; ply=%s pts; source=%s)",
             len(hyps),
+            len(seed_hyps),
             len(accepted),
+            ma_n,
+            a_n,
             len(xyz_raw),
+            source_tag,
         )
         if not accepted and fallback_heading:
             log.warning(
-                "facades Path α: 0 ZNCC accepts — falling back to Milestone A "
-                "heading×distance (same run; no OSM/BAG invent)"
+                "facades Path α: 0 ZNCC accepts after hybrid — falling back to "
+                "Milestone A heading×distance search (same run; no OSM/BAG invent)"
             )
             accepted = search_photo_consistent_planes(
                 frames,

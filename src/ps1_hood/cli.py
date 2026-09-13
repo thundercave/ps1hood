@@ -478,7 +478,37 @@ def export_mapanything_bundle_cmd(
     "--fallback-heading/--no-fallback-heading",
     default=True,
     show_default=True,
-    help="If Path α ZNCC keeps 0, retry Milestone A heading×distance on the same run",
+    help="If Path α ZNCC keeps 0 after hybrid, retry Milestone A heading×distance search",
+)
+@click.option(
+    "--hybrid-heading/--no-hybrid-heading",
+    default=True,
+    show_default=True,
+    help="Inject Milestone A heading×distance seeds into Path α score_planar_hyps (union promote)",
+)
+@click.option(
+    "--split-trigger",
+    "split_trigger_width_m",
+    default=8.0,
+    show_default=True,
+    type=float,
+    help="Split peels wider than this (m) into façade windows before ZNCC",
+)
+@click.option(
+    "--split-window",
+    "split_window_m",
+    default=8.0,
+    show_default=True,
+    type=float,
+    help="Façade window length along peel right-axis (m)",
+)
+@click.option(
+    "--split-overlap",
+    "split_overlap_m",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Overlap between consecutive split windows (m)",
 )
 def facades_cmd(
     name: str,
@@ -490,6 +520,10 @@ def facades_cmd(
     max_planes: int,
     keep_previous_on_fail: bool,
     fallback_heading: bool,
+    hybrid_heading: bool,
+    split_trigger_width_m: float,
+    split_window_m: float,
+    split_overlap_m: float,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -544,6 +578,10 @@ def facades_cmd(
             plane_dist_m=plane_dist_m,
             keep_previous_on_fail=keep_previous_on_fail,
             fallback_heading=fallback_heading,
+            hybrid_heading=hybrid_heading,
+            split_trigger_width_m=split_trigger_width_m,
+            split_window_m=split_window_m,
+            split_overlap_m=split_overlap_m,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)

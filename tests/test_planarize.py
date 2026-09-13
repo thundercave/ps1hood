@@ -601,7 +601,7 @@ def test_split_long_hyp_overlapping_windows() -> None:
     for p in parts:
         assert abs(float(p["n"] @ n)) > 0.99
         assert abs(float(p["d"]) - d) < 1e-6
-        assert 1.5 <= float(p["width_m"]) <= 12.0 + 1e-6
+        assert 1.5 <= float(p["width_m"]) <= 8.0 + 1e-6
         # Centers closer to ends / mid than original mid-block-only crop
         assert abs(float(p["center"][0]) - 5.0) < 0.2
     expanded = expand_hyps_for_scoring([hyp])
@@ -819,3 +819,291 @@ def test_plane_homography_rejects_near_camera() -> None:
     d = -0.2  # plane 0.2 m in front → |c|=0.2
     with pytest.raises(ValueError, match="near reference"):
         plane_homography(K, R, t, K, R, t - np.array([1.0, 0, 0]), n, d)
+
+
+def test_split_long_hyp_8m_windows() -> None:
+    """30 m peel, trigger=8, window=8, overlap=2 → ≥3 pieces; same n,d; ~6–8 m centers."""
+    n = np.array([1.0, 0.0, 0.0])
+    d = -5.0
+    corners = np.array(
+        [
+            [5.0, -15.0, 0.5],
+            [5.0, 15.0, 0.5],
+            [5.0, 15.0, 8.5],
+            [5.0, -15.0, 8.5],
+        ],
+        dtype=np.float64,
+    )
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": corners.mean(axis=0),
+        "width_m": 30.0,
+        "height_m": 8.0,
+        "corners": corners,
+        "source": "ma_segment",
+    }
+    parts = split_long_hyp(
+        hyp, trigger_width_m=8.0, window_m=8.0, overlap_m=2.0
+    )
+    assert len(parts) >= 3
+    ys = sorted(float(p["center"][1]) for p in parts)
+    # step = window - overlap = 6 m; last remainder window may tighten the gap
+    gaps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+    assert all(4.0 <= g <= 8.5 for g in gaps)
+    assert ys[-1] - ys[0] >= 12.0
+    for p in parts:
+        assert abs(float(p["n"] @ n)) > 0.99
+        assert abs(float(p["d"]) - d) < 1e-6
+        assert p.get("split_parent") is True
+
+
+def test_split_no_op_below_trigger() -> None:
+    """Width 7 m → single hyp when trigger=8."""
+    n = np.array([0.0, 1.0, 0.0])
+    d = -3.0
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": np.array([0.0, 3.0, 4.0]),
+        "width_m": 7.0,
+        "height_m": 6.0,
+        "source": "ma_segment",
+    }
+    parts = split_long_hyp(
+        hyp, trigger_width_m=8.0, window_m=8.0, overlap_m=2.0
+    )
+    assert len(parts) == 1
+    assert parts[0] is hyp or float(parts[0]["width_m"]) == 7.0
+
+
+def test_split_uses_raw_width_when_clamped() -> None:
+    """Pre-clamp raw_width_m > clamped width_m still expands façade windows."""
+    n = np.array([1.0, 0.0, 0.0])
+    d = -5.0
+    # Clamped 25 m corners, but raw was 40 m
+    corners = np.array(
+        [
+            [5.0, -12.5, 0.5],
+            [5.0, 12.5, 0.5],
+            [5.0, 12.5, 8.0],
+            [5.0, -12.5, 8.0],
+        ],
+        dtype=np.float64,
+    )
+    hyp = {
+        "n": n,
+        "d": d,
+        "center": corners.mean(axis=0),
+        "width_m": 25.0,
+        "raw_width_m": 40.0,
+        "height_m": 7.5,
+        "corners": corners,
+        "source": "ma_segment",
+    }
+    parts = split_long_hyp(
+        hyp, trigger_width_m=8.0, window_m=8.0, overlap_m=2.0
+    )
+    # 40 m / step 6 → more windows than 25 m alone
+    parts_clamped = split_long_hyp(
+        {**hyp, "raw_width_m": 25.0},
+        trigger_width_m=8.0,
+        window_m=8.0,
+        overlap_m=2.0,
+    )
+    assert len(parts) > len(parts_clamped)
+
+
+def test_union_promote_beats_product() -> None:
+    from ps1_hood.reconstruct.facades import _is_strictly_better
+
+    prev = {"textured": 5, "plane_count": 7, "mean_zncc": 0.42}
+    ok, why = _is_strictly_better(
+        {"textured": 6, "plane_count": 8, "mean_zncc": 0.41}, prev
+    )
+    assert ok is True
+    assert "textured" in why
+
+
+def test_union_no_promote_weaker() -> None:
+    """Mirrors PC post-#20: 1 textured @ 0.44 must not beat 7/5/0.42."""
+    from ps1_hood.reconstruct.facades import _is_strictly_better
+
+    prev = {"textured": 5, "plane_count": 7, "mean_zncc": 0.42}
+    ok, why = _is_strictly_better(
+        {"textured": 1, "plane_count": 1, "mean_zncc": 0.44}, prev
+    )
+    assert ok is False
+    assert "textured" in why
+
+
+def test_hybrid_seeds_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MA peel + A heading seeds share one score_planar_hyps / NMS pass."""
+    import logging
+
+    import ps1_hood.reconstruct.photo_planes as pp
+
+    # Two well-separated façades: MA at y=-20, A at y=+20
+    ma_hyp = {
+        "n": np.array([1.0, 0.0, 0.0]),
+        "d": -8.0,
+        "center": np.array([8.0, -20.0, 4.0]),
+        "width_m": 8.0,
+        "height_m": 8.0,
+        "source": "ma_segment",
+    }
+    a_hyp = {
+        "n": np.array([1.0, 0.0, 0.0]),
+        "d": -8.0,
+        "center": np.array([8.0, 20.0, 4.0]),
+        "width_m": 8.0,
+        "height_m": 9.0,
+        "source": "heading_distance",
+    }
+    frames = []
+    for i, y in enumerate((-20.0, 20.0)):
+        img = np.full((64, 64, 3), 80, dtype=np.uint8)
+        p = tmp_path / f"h{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": 0.0,
+                "n": y,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"h{i}",
+            }
+        )
+
+    def _fake_score(views, n, d, center, **kwargs):  # noqa: ANN001
+        cy = float(np.asarray(center)[1])
+        # Accept both; slightly higher ZNCC for MA so sort is stable
+        z = 0.50 if cy < 0 else 0.45
+        return {
+            "ok": True,
+            "zncc": z,
+            "n": np.asarray(n, dtype=np.float64),
+            "d": float(d),
+            "center": np.asarray(center, dtype=np.float64),
+        }
+
+    monkeypatch.setattr(pp, "score_vertical_plane", _fake_score)
+    monkeypatch.setattr(
+        pp,
+        "_pick_scoring_views",
+        lambda frames, n, c, max_views=4, min_frontal=0.25: [0, 1],
+    )
+    monkeypatch.setattr(
+        pp,
+        "load_view",
+        lambda fr, i: type(
+            "V",
+            (),
+            {
+                "Rcw": np.eye(3),
+                "t": np.array([0.0, 0.0, 0.0]),
+                "K": np.eye(3),
+                "image": np.zeros((64, 64), dtype=np.float32),
+                "gray": np.zeros((64, 64), dtype=np.float32),
+            },
+        )(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="ps1_hood.reconstruct.planarize"):
+        kept = score_planar_hyps(
+            [ma_hyp],
+            frames,
+            zncc_accept=0.35,
+            max_keep=8,
+            refine=False,
+            seed_hyps=[a_hyp],
+            split_long=False,
+        )
+    assert len(kept) >= 2
+    sources = {str(p.get("source")) for p in kept}
+    assert "ma_segment" in sources
+    assert "heading_distance" in sources
+    joined = " ".join(r.message for r in caplog.records)
+    assert "hybrid" in joined.lower() or "a_kept" in joined
+
+
+def test_extract_facades_hybrid_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Path α with hybrid_heading=True calls hypothesize even when MA would keep ≥1."""
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(21)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        p = tmp_path / f"hy{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": float(i * 5),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"hy{i}",
+            }
+        )
+
+    called = {"hypothesize": 0, "seed_hyps": None}
+    real_hyp = pp.hypothesize_vertical_planes
+
+    def _spy_hyp(*args, **kwargs):  # noqa: ANN001
+        called["hypothesize"] += 1
+        return real_hyp(*args, **kwargs)
+
+    def _score(hyps, frames, **kwargs):  # noqa: ANN001
+        called["seed_hyps"] = kwargs.get("seed_hyps")
+        # MA keeps 1 — old path would skip A; hybrid must still have seeded.
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -5.0,
+                "center": np.array([5.0, 0.0, 3.0]),
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "zncc": 0.439,
+                "ok": True,
+                "source": "ma_segment",
+                "count": 100,
+            }
+        ]
+
+    monkeypatch.setattr(pp, "hypothesize_vertical_planes", _spy_hyp)
+    monkeypatch.setattr(pl, "score_planar_hyps", _score)
+
+    dest = tmp_path / "facades.obj"
+    meta = extract_facades(
+        ply,
+        dest,
+        frames=frames,
+        n_planes=8,
+        zncc_accept=0.35,
+        planarize=True,
+        voxel_m=0.15,
+        plane_dist_m=0.10,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=True,
+    )
+    assert called["hypothesize"] >= 1
+    assert called["seed_hyps"] is not None
+    assert len(called["seed_hyps"]) >= 1
+    assert meta.get("path_alpha") is True
+
