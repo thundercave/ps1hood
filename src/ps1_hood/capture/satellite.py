@@ -70,9 +70,15 @@ class Ortho:
         self.bbox = bbox
         self.frame = frame
         self.h, self.w = image.shape[:2]
-        self.sw, self.sh = frame.to_enu(bbox.south, bbox.west)[:2]
-        self.ne = frame.to_enu(bbox.north, bbox.east)[:2]
-        self.ee, self.nn = self.ne
+        self.sw, self.sh, self.ee, self.nn = self.enu_corners(bbox, frame)
+        self.ne = (self.ee, self.nn)
+
+    @staticmethod
+    def enu_corners(bbox: BBox, frame: LocalFrame) -> tuple[float, float, float, float]:
+        """ENU (sw, sh, ee, nn) of ortho bbox corners — same mapping as ``Ortho.__init__``."""
+        sw, sh = frame.to_enu(bbox.south, bbox.west)[:2]
+        ee, nn = frame.to_enu(bbox.north, bbox.east)[:2]
+        return sw, sh, ee, nn
 
     @classmethod
     def load(cls, meta: dict[str, Any], frame: LocalFrame) -> "Ortho":

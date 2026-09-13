@@ -5,7 +5,33 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ps1_hood.capture.satellite import Ortho
 from ps1_hood.geo import BBox, LocalFrame
+
+
+def satellite_with_enu(
+    satellite: dict[str, Any] | None, frame: LocalFrame
+) -> dict[str, Any] | None:
+    """Copy satellite meta and attach Ortho ENU corners for Studio placement."""
+    if not satellite:
+        return None
+    out = dict(satellite)
+    raw = out.get("bbox")
+    if not isinstance(raw, dict):
+        return out
+    bbox = BBox.from_dict(raw)
+    sw, sh, ee, nn = Ortho.enu_corners(bbox, frame)
+    out["enu"] = {
+        "sw": sw,
+        "sh": sh,
+        "ee": ee,
+        "nn": nn,
+        "width_m": ee - sw,
+        "height_m": nn - sh,
+        "centre_e": (sw + ee) / 2.0,
+        "centre_n": (sh + nn) / 2.0,
+    }
+    return out
 
 
 def scene_payload(
@@ -43,7 +69,7 @@ def scene_payload(
         "cameras": cameras,
         "buildings": buildings or [],
         "frame_count": len(frames),
-        "satellite": satellite,
+        "satellite": satellite_with_enu(satellite, frame),
         "cloud": cloud,
     }
 

@@ -54,6 +54,7 @@
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
       + `<br><label><input type="checkbox" id="togCloud" checked> cloud</label>`
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
+      + ` <label><input type="checkbox" id="togBag"> BAG</label>`
       + `<br><a href="/">back</a>`;
 
     // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
@@ -70,27 +71,73 @@
       geom.computeVertexNormals();
     };
 
+    // LocalFrame ENU (matches ps1_hood.geo.LocalFrame) for sat plane when scene.satellite.enu absent
+    const WGS84_A = 6378137.0, WGS84_E2 = (1 / 298.257223563) * (2 - 1 / 298.257223563);
+    const geodeticToEcef = (lat, lon, alt = 0) => {
+      const phi = lat * Math.PI / 180, lam = lon * Math.PI / 180;
+      const sphi = Math.sin(phi), cphi = Math.cos(phi);
+      const N = WGS84_A / Math.sqrt(1 - WGS84_E2 * sphi * sphi);
+      return [(N + alt) * cphi * Math.cos(lam), (N + alt) * cphi * Math.sin(lam), (N * (1 - WGS84_E2) + alt) * sphi];
+    };
+    const makeLocalFrame = (lat0, lon0) => {
+      const origin = geodeticToEcef(lat0, lon0, 0);
+      const phi = lat0 * Math.PI / 180, lam = lon0 * Math.PI / 180;
+      const sphi = Math.sin(phi), cphi = Math.cos(phi);
+      const slam = Math.sin(lam), clam = Math.cos(lam);
+      const r = [
+        [-slam, clam, 0],
+        [-sphi * clam, -sphi * slam, cphi],
+        [cphi * clam, cphi * slam, sphi],
+      ];
+      return (lat, lon, alt = 0) => {
+        const [x, y, z] = geodeticToEcef(lat, lon, alt);
+        const dx = x - origin[0], dy = y - origin[1], dz = z - origin[2];
+        return [
+          r[0][0] * dx + r[0][1] * dy + r[0][2] * dz,
+          r[1][0] * dx + r[1][1] * dy + r[1][2] * dz,
+          r[2][0] * dx + r[2][1] * dy + r[2][2] * dz,
+        ];
+      };
+    };
+    // Sat ground plane from satellite.bbox Ortho ENU (NOT camera-hull AABB)
+    const satPlaneFromScene = (sj) => {
+      const enu = sj.satellite && sj.satellite.enu;
+      if (enu && Number.isFinite(enu.sw) && Number.isFinite(enu.ee)
+          && Number.isFinite(enu.sh) && Number.isFinite(enu.nn)) {
+        return { sw: enu.sw, sh: enu.sh, ee: enu.ee, nn: enu.nn };
+      }
+      const bb = (sj.satellite && sj.satellite.bbox) || sj.bbox;
+      const o = sj.origin;
+      if (!bb || !o) return null;
+      const toEnu = makeLocalFrame(o.lat, o.lon);
+      const [sw, sh] = toEnu(bb.south, bb.west);
+      const [ee, nn] = toEnu(bb.north, bb.east);
+      return { sw, sh, ee, nn };
+    };
     const satUrl = '/api/runs/' + encodeURIComponent(run) + '/satellite.jpg';
     const tex = new THREE.TextureLoader().load(satUrl);
     tex.colorSpace = THREE.SRGBColorSpace;
-    const bw = sceneJson.bbox;
-    // approximate ground size from cameras if present
-    let minE = Infinity, maxE = -Infinity, minN = Infinity, maxN = -Infinity;
-    for (const c of sceneJson.cameras) {
-      minE = Math.min(minE, c.e); maxE = Math.max(maxE, c.e);
-      minN = Math.min(minN, c.n); maxN = Math.max(maxN, c.n);
+    const satEnu = satPlaneFromScene(sceneJson);
+    let gw = 40, gh = 40, cx = 0, cz = 0;
+    if (satEnu) {
+      gw = Math.max(1e-3, satEnu.ee - satEnu.sw);
+      gh = Math.max(1e-3, satEnu.nn - satEnu.sh);
+      cx = (satEnu.sw + satEnu.ee) / 2;
+      cz = (satEnu.sh + satEnu.nn) / 2;
     }
-    if (!isFinite(minE)) { minE = -20; maxE = 20; minN = -20; maxN = 20; }
-    const gw = Math.max(20, maxE - minE + 16);
-    const gh = Math.max(20, maxN - minN + 16);
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(gw, gh),
       new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide })
     );
     ground.rotation.x = -Math.PI / 2;
-    ground.position.copy(to3((minE+maxE)/2, (minN+maxN)/2, 0));
+    ground.position.copy(to3(cx, cz, 0));
     scene.add(ground);
 
+    // BAG shells: default hidden (align prior / debug only — photo ENU is hero)
+    const bagGroup = new THREE.Group();
+    bagGroup.visible = false;
+    scene.add(bagGroup);
+    let bagUMin = Infinity, bagUMax = -Infinity, bagVertCount = 0;
     for (const b of (sceneJson.buildings || [])) {
       const verts = b.vertices || [];
       const faces = b.faces || [];
@@ -99,14 +146,25 @@
         const a = verts[f[0]], bb = verts[f[1]], c = verts[f[2]];
         if (!a || !bb || !c) continue;
         pos.push(a[0], a[2], -a[1], bb[0], bb[2], -bb[1], c[0], c[2], -c[1]);
+        for (const v of [a, bb, c]) {
+          bagUMin = Math.min(bagUMin, v[2]);
+          bagUMax = Math.max(bagUMax, v[2]);
+          bagVertCount++;
+        }
       }
       if (!pos.length) continue;
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
       geo.computeVertexNormals();
-      scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      bagGroup.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
         color: 0x8a6a3c, side: THREE.DoubleSide, transparent: true, opacity: 0.35
       })));
+    }
+    // Soft note: BAG Z often NAP-as-alt while SV cams force u≈2.5 ellipsoid
+    const camU = (sceneJson.cameras || []).map(c => c.u).filter(Number.isFinite);
+    const camUMed = camU.length ? camU.slice().sort((a,b)=>a-b)[Math.floor(camU.length/2)] : 2.5;
+    if (bagVertCount && Number.isFinite(bagUMin) && Math.abs(bagUMin - (camUMed - 2.5)) > 3) {
+      hud.innerHTML += `<br><span style="color:#c9a227">note: BAG Z may be NAP-as-alt vs cam u≈${camUMed.toFixed(1)} (debug only)</span>`;
     }
 
     const loader = new THREE.TextureLoader();
@@ -184,6 +242,9 @@
     });
     document.getElementById('togFacades')?.addEventListener('change', (ev) => {
       if (facadeRoot) facadeRoot.visible = ev.target.checked;
+    });
+    document.getElementById('togBag')?.addEventListener('change', (ev) => {
+      bagGroup.visible = ev.target.checked;
     });
 
     addEventListener('resize', () => {

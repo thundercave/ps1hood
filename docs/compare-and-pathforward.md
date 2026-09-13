@@ -347,3 +347,21 @@ ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35
 Expect a_kept nearer ~7 if `cloud_flow` / flow `cloud.ply` present; ma_added non-dup; promote only if beats 7/5/0.42.
 
 **R&D pack:** [`docs/path-alpha-flow-a-ma-union-rd.md`](path-alpha-flow-a-ma-union-rd.md).
+
+---
+
+## 19) Studio overlays join photo ENU (2026-09-13)
+
+**Sacred unchanged:** SV cameras + recon cloud + façades define LocalFrame ENU. Do **not** invent OSM/BAG as hero mesh. Do **not** re-solve cameras into BAG/RD for Studio.
+
+**PR1 (Studio align):**
+1. Sat ground plane sized/centred from `satellite.bbox` Ortho ENU corners (`Ortho.enu_corners` / `scene.satellite.enu`) — **not** camera-hull AABB (~12 m smoke shift fixed).
+2. BAG shells **default-hidden** in product `viewer.html` (`#togBag` off); live pane may still show BAG for align debug.
+3. Overlays register *to* photo ENU; BAG is optional debug.
+
+**Verify:** `viewer?run=smoke-dense` — reload viewer (no scene rebuild required for sat/BAG viewer fixes; JS falls back from `satellite.bbox` + `origin`). New reconstructs write `satellite.enu`.
+
+**Follow-ups (not PR1):** NAP-as-alt vs cam `u≈2.5`; rigid BAG XY register; metre gate / `overlay_registered`.
+
+**Survey / R&D:** [`studio-layer-alignment-survey.md`](studio-layer-alignment-survey.md) · [`studio-overlay-enu-align-rd.md`](studio-overlay-enu-align-rd.md)
+
