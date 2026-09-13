@@ -301,3 +301,22 @@ ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35
 Keep soft floors (min textured 3 / mean 0.35). Do **not** lower `zncc_accept`. Log which clause fired.
 
 **R&D:** [`docs/path-alpha-zncc-neg1-and-quality-keep.md`](path-alpha-zncc-neg1-and-quality-keep.md) (promote rule).
+
+
+---
+
+## 17) Path α after PR #23 (2026-09-13) — reclaim A a_kept≈4 → ~7
+
+**PC:** `a_priority` hybrid **a_kept=4, ma_added=2, union 6, mean 0.377** (earlier `nms` a_kept=2–3). Historic Milestone A product still **~7 / 5 / ~0.42**.
+
+**Stippy digest:** same `zncc_accept=0.35` & NMS radii (6 m / 0.85 / 2.5); hybrid `max_keep=16` is **looser** than A default 12 — not the cutter. Historic 7 from full `search_photo_consistent_planes`; hybrid scores A via `hypothesize`→`score_planar_hyps` with **extra tilt / cam-depth / xy40 gates + opposite-n**.
+
+**Top cause:** A arm ≠ full Milestone A search. **★ Fix A (dual arm):** A arm = `search_photo_consistent_planes`, MA arm = peels → `score_planar_hyps` (no A seed inject), union via existing `a_priority`. CLI `--hybrid-a-full-search` default **on** (`--no-hybrid-a-full-search` restores seed inject). Quality-keep from §16 / PR #24 unchanged. Acceptance: smoke **a_kept≥6–7** (or ≥ `--no-planarize` control on same frames); promote only if beats 7/5/0.42 under tightened keep.
+
+**R&D pack:** [`docs/path-alpha-a-reclaim-rd.md`](path-alpha-a-reclaim-rd.md).
+
+**PC recipe after merge:**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --union-strategy a_priority --max-planes 16
+```
