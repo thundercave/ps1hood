@@ -209,3 +209,13 @@ First PR: smoke-block planarize only (no Instant Meshes / organic remesh). See r
 
 **R&D:** `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` (also fold into `docs/path-alpha-zncc-fail-rd.md`). Path α real ZNCC / warp sign remains follow-up if greps show finite anti-corr.
 
+---
+
+## 12) NL street measures — validation gate (not MA scale)
+
+Codified NL public-space sizes (kenteken 520×110 mm, zebra 0.50/0.50, Type-I signs, tegels, …) for **SV ↔ ENU checks** and lens/crop residuals.
+
+**Hard rule:** use as a **validation gate** only — **do not replace MapAnything metric scale** (`is_metric_scale` + locked ENU). Disagreeing calibrators → inspect crop/FOV/date; do not average into the MA product cloud.
+
+Full note: [`docs/nl-codified-street-measures.md`](nl-codified-street-measures.md).
+
