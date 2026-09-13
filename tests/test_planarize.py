@@ -20,6 +20,7 @@ from ps1_hood.reconstruct.planarize import (
     score_planar_hyps,
     segment_vertical_planes_numpy,
     split_long_hyp,
+    union_keep_planes,
     write_planes_json,
 )
 
@@ -1252,6 +1253,7 @@ def test_extract_facades_peel_knobs_forwarded(
     sk = seen["score_kwargs"]
     assert sk["nms_xy_m"] == pytest.approx(6.0)
     assert sk["nms_xy_split_m"] == pytest.approx(4.0)
+    assert sk["union_strategy"] == "a_priority"
 
 
 def test_facades_cli_exposes_peel_knobs() -> None:
@@ -1270,5 +1272,191 @@ def test_facades_cli_exposes_peel_knobs() -> None:
         "--peel-max-planes",
         "--nms-xy",
         "--nms-xy-split",
+        "--union-strategy",
+        "--max-planes",
     ):
         assert flag in help_text
+    assert "a_priority" in help_text
+    assert "default: 16" in help_text
+
+
+def _a_plane(center_xy, *, zncc=0.40, d=-8.0, source="heading_distance", split=False):
+    x, y = center_xy
+    return {
+        "n": np.array([1.0, 0.0, 0.0]),
+        "d": float(d),
+        "center": np.array([float(x), float(y), 4.0]),
+        "width_m": 8.0,
+        "height_m": 8.0,
+        "zncc": float(zncc),
+        "source": source,
+        "split_parent": bool(split),
+    }
+
+
+def test_a_priority_keeps_a_drops_overlapping_ma() -> None:
+    """Many A + overlapping MA → A kept, overlapping MA dropped, far MA added."""
+    a_planes = [
+        _a_plane((8.0, 0.0), zncc=0.40),
+        _a_plane((8.0, 20.0), zncc=0.42),
+        _a_plane((8.0, 40.0), zncc=0.41),
+        _a_plane((8.0, 60.0), zncc=0.39),
+        _a_plane((8.0, 80.0), zncc=0.38),
+    ]
+    overlapping_ma = [
+        _plane((8.0, 1.0), zncc=0.55),  # 1 m from first A — dup
+        _plane((8.0, 21.0), zncc=0.52),  # 1 m from second A — dup
+    ]
+    far_ma = [_plane((8.0, 200.0), zncc=0.45)]
+    accepted = a_planes + overlapping_ma + far_ma
+    tel: dict = {}
+    kept = union_keep_planes(
+        accepted, strategy="a_priority", max_keep=16, telemetry=tel
+    )
+    sources = [str(p.get("source")) for p in kept]
+    assert sources.count("heading_distance") == 5
+    assert sources.count("ma_segment") == 1
+    assert tel["strategy"] == "a_priority"
+    assert tel["a_pre_nms"] == 5
+    assert tel["a_kept"] == 5
+    assert tel["ma_pre_nms"] == 3
+    assert tel["ma_added"] == 1
+    assert tel["union_kept"] == 6
+    assert tel["pre_nms"] == 8
+    # Surviving MA is the far one, not a same-wall overlap
+    ma = [p for p in kept if p["source"] == "ma_segment"]
+    assert float(ma[0]["center"][1]) == pytest.approx(200.0)
+
+
+def test_union_strategy_nms_regression() -> None:
+    """``nms`` still ZNCC-sorts: higher-ZNCC MA on the same wall evicts A."""
+    accepted = [
+        _a_plane((8.0, 0.0), zncc=0.40),
+        _plane((8.0, 1.0), zncc=0.55),  # overlapping, better ZNCC
+        _a_plane((8.0, 20.0), zncc=0.42),
+        _plane((8.0, 40.0), zncc=0.45),  # far MA
+    ]
+    tel: dict = {}
+    kept = union_keep_planes(accepted, strategy="nms", max_keep=16, telemetry=tel)
+    sources = {str(p.get("source")) for p in kept}
+    assert "ma_segment" in sources
+    # A at y=0 is a dup of MA at y=1 under ZNCC-first NMS
+    a_ys = [float(p["center"][1]) for p in kept if p["source"] == "heading_distance"]
+    ma_ys = [float(p["center"][1]) for p in kept if p["source"] == "ma_segment"]
+    assert 0.0 not in a_ys
+    assert 1.0 in ma_ys
+    assert tel["strategy"] == "nms"
+    assert tel["a_pre_nms"] == 2
+    assert tel["ma_pre_nms"] == 2
+    # Contrast: a_priority keeps both A and drops overlapping MA
+    tel_a: dict = {}
+    kept_a = union_keep_planes(
+        accepted, strategy="a_priority", max_keep=16, telemetry=tel_a
+    )
+    a_ys_p = [float(p["center"][1]) for p in kept_a if p["source"] == "heading_distance"]
+    ma_ys_p = [float(p["center"][1]) for p in kept_a if p["source"] == "ma_segment"]
+    assert sorted(a_ys_p) == pytest.approx([0.0, 20.0])
+    assert 1.0 not in ma_ys_p
+    assert 40.0 in ma_ys_p
+    assert tel_a["a_kept"] == 2
+    assert tel_a["ma_added"] == 1
+
+
+def test_a_priority_max_keep_16_allows_over_12() -> None:
+    """Hybrid keep cap 16 can retain more than 12 well-separated A planes."""
+    accepted = [
+        _a_plane((8.0, float(i * 20)), zncc=0.40 + i * 0.001)
+        for i in range(14)
+    ]
+    tel: dict = {}
+    kept = union_keep_planes(
+        accepted, strategy="a_priority", max_keep=16, telemetry=tel
+    )
+    assert len(kept) == 14
+    assert len(kept) > 12
+    assert tel["a_kept"] == 14
+    assert tel["union_kept"] == 14
+    capped = union_keep_planes(accepted, strategy="a_priority", max_keep=12)
+    assert len(capped) == 12
+
+
+def test_extract_facades_forwards_union_strategy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(3)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        pth = tmp_path / f"us{i}.jpg"
+        cv2.imwrite(str(pth), img)
+        frames.append(
+            {
+                "path": str(pth),
+                "e": 0.0,
+                "n": float(i),
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"us{i}",
+            }
+        )
+
+    seen: dict = {}
+
+    def _fake_planes(ply_path, cam_c, **kwargs):  # noqa: ANN001
+        return (
+            [
+                {
+                    "n": np.array([1.0, 0.0, 0.0]),
+                    "d": -5.0,
+                    "center": np.array([5.0, 0.0, 3.0]),
+                    "width_m": 8.0,
+                    "height_m": 6.0,
+                    "source": "ma_segment",
+                }
+            ],
+            {"z": 0.0},
+            10,
+        )
+
+    def _fake_score(hyps, frames, **kwargs):  # noqa: ANN001
+        seen["score_kwargs"] = dict(kwargs)
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -5.0,
+                "center": np.array([5.0, 0.0, 3.0]),
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "zncc": 0.5,
+                "ok": True,
+                "source": "heading_distance",
+                "count": 100,
+            }
+        ]
+
+    monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
+    monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
+    monkeypatch.setattr(pp, "hypothesize_vertical_planes", lambda *a, **k: [])
+
+    extract_facades(
+        ply,
+        tmp_path / "facades.obj",
+        frames=frames,
+        n_planes=16,
+        zncc_accept=0.35,
+        planarize=True,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=True,
+        union_strategy="nms",
+    )
+    assert seen["score_kwargs"]["union_strategy"] == "nms"
+    assert seen["score_kwargs"]["max_keep"] == 16

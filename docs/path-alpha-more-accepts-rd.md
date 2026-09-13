@@ -74,7 +74,7 @@ Also log (add if missing): pre-NMS accept count, split window count, per-hyp bes
 | `min_inliers` | 400 | peel | `--min-inliers` (PR-2) |
 | `residual_stop` | 1500 | peel | `--residual-stop` (PR-2) |
 | `vertical_dot_max` | 0.15 | peel | `--vertical-dot` (PR-2) |
-| `max_planes` | 24 (peel) / 12 keep | peel / score | `--peel-max-planes` / `--max-planes` (PR-2) |
+| `max_planes` | 24 (peel) / **16** keep | peel / score | `--peel-max-planes` / `--max-planes` (PR-3 keep default 16) |
 | NMS XY | 6 m / **4 m** split siblings | score | `--nms-xy` / `--nms-xy-split` (PR-2) |
 | `aabb_percentile` | 5–95 | `inliers_to_quad` | no |
 | `max_width/height` | 25 / 15 | quad | no |
@@ -298,6 +298,28 @@ ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35
   --voxel 0.06 --plane-dist 0.06 --min-inliers 300 --residual-stop 1000 --peel-max-planes 32
 ```
 
+
+### PR-3 ★ — A-priority union (ship after #22)
+
+**PC A2:** `pre_nms=15 → kept=5` mean 0.410; ma_kept=3 **a_kept=2**. Hybrid NMS evicts A; historic A was **7** planes. Product still 7/5/0.42. Peel knobs exhausted.
+
+**In**
+- `union_keep_planes` + `--union-strategy {nms,a_priority}` default **`a_priority`** for Path α hybrid.
+- Keep all A accepts first (mild intra-A NMS); add MA only if non-dup vs kept A (no 4 m split exception vs A).
+- Hybrid `--max-planes` / `max_keep` default **16**.
+- Telemetry: `a_pre_nms`, `a_kept`, `ma_pre_nms`, `ma_added`, `union_kept`, `strategy=`.
+- Tests: A kept + overlapping MA dropped + far MA added; `nms` regression; max_keep 16 >12.
+
+**Out**
+- No peel knobs. No `zncc_accept` / quality-keep change. No OSM/BAG. `detect_planar_patches` parked.
+
+**PC recipe after merge:**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --union-strategy a_priority --max-planes 16
+```
+(A2 peel knobs optional.)
+
 ---
 
 ## 7) Acceptance tests
@@ -351,7 +373,7 @@ Open3D scrape notes (DBSCAN on inliers, `detect_planar_patches` min_plane_edge 8
 
 ## 10) Pointer
 
-Compare-and-pathforward **§12** (workspace): Path α more accepts / hybrid after PR #20.
+Compare-and-pathforward **§15** (workspace): Path α A-priority union after PR #22.
 
 *End. Chief: MessageSubagent into PR-1 (splits + hybrid + union promote).*
 

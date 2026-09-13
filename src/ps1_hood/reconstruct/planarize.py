@@ -53,6 +53,10 @@ DEFAULT_MAX_HEADING_SEEDS = 24
 # façade windows on the same wall can both keep (PR-2 / R&D §3).
 DEFAULT_NMS_XY_M = 6.0
 DEFAULT_NMS_XY_SPLIT_M = 4.0
+# Hybrid keep cap (Path α). Peel budget remains DEFAULT_MAX_PLANES=24.
+DEFAULT_MAX_KEEP = 16
+UNION_STRATEGIES = ("nms", "a_priority")
+DEFAULT_UNION_STRATEGY = "a_priority"
 
 try:
     import open3d as o3d
@@ -608,16 +612,62 @@ def planes_from_mapanything_ply(
 
 
 
+def is_a_source(src: str | None) -> bool:
+    """Milestone A family: heading×distance / manhattan / sparse / photo_*."""
+    s = (src or "").lower()
+    return s in {"heading_distance", "manhattan", "sparse"} or s.startswith("photo_")
+
+
+def is_ma_source(src: str | None) -> bool:
+    """MapAnything family: ma_segment / mapanything / split MA peels."""
+    s = (src or "ma_segment").lower()
+    if is_a_source(s):
+        return False
+    return (
+        s.startswith("ma_")
+        or s.startswith("mapanything")
+        or s in {"ma_segment", "mapanything_planarize", "mapanything"}
+    )
+
+
+def plane_family(src: str | None) -> str:
+    """``a`` or ``ma`` (unknown sources cannot evict A)."""
+    return "a" if is_a_source(src) else "ma"
+
+
+def _is_plane_dup(
+    pl: dict[str, Any],
+    k: dict[str, Any],
+    *,
+    nms_xy_m: float,
+    nms_xy_split_m: float,
+    n_dot_min: float = 0.85,
+    d_tol_m: float = 2.5,
+    use_split_xy: bool = True,
+) -> bool:
+    """Same n-family + Δd + XY test used by hybrid NMS."""
+    n = pl["n"]
+    d = pl["d"]
+    if abs(float(n @ k["n"])) < n_dot_min:
+        return False
+    if not (abs(float(d - k["d"])) < d_tol_m or abs(float(d + k["d"])) < d_tol_m):
+        return False
+    xy_thresh = float(nms_xy_m)
+    if use_split_xy and (bool(pl.get("split_parent")) or bool(k.get("split_parent"))):
+        xy_thresh = float(nms_xy_split_m)
+    return float(np.linalg.norm(pl["center"][:2] - k["center"][:2])) < xy_thresh
+
+
 def nms_keep_planes(
     accepted: list[dict[str, Any]],
     *,
-    max_keep: int = 16,
+    max_keep: int = DEFAULT_MAX_KEEP,
     nms_xy_m: float = DEFAULT_NMS_XY_M,
     nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
     n_dot_min: float = 0.85,
     d_tol_m: float = 2.5,
 ) -> list[dict[str, Any]]:
-    """NMS on ZNCC-sorted accepts.
+    """NMS on ZNCC-sorted accepts (``union_strategy=nms``).
 
     When either hyp has ``split_parent``, use ``nms_xy_split_m`` (default 4 m)
     instead of ``nms_xy_m`` (default 6 m) so denser split windows on the same
@@ -625,26 +675,128 @@ def nms_keep_planes(
     """
     kept: list[dict[str, Any]] = []
     for pl in accepted:
-        n = pl["n"]
-        d = pl["d"]
-        dup = False
-        pl_split = bool(pl.get("split_parent"))
-        for k in kept:
-            if abs(float(n @ k["n"])) < n_dot_min:
-                continue
-            if abs(float(d - k["d"])) < d_tol_m or abs(float(d + k["d"])) < d_tol_m:
-                xy_thresh = (
-                    float(nms_xy_split_m)
-                    if (pl_split or bool(k.get("split_parent")))
-                    else float(nms_xy_m)
-                )
-                if float(np.linalg.norm(pl["center"][:2] - k["center"][:2])) < xy_thresh:
-                    dup = True
-                    break
+        dup = any(
+            _is_plane_dup(
+                pl,
+                k,
+                nms_xy_m=nms_xy_m,
+                nms_xy_split_m=nms_xy_split_m,
+                n_dot_min=n_dot_min,
+                d_tol_m=d_tol_m,
+                use_split_xy=True,
+            )
+            for k in kept
+        )
         if not dup:
             kept.append(pl)
         if len(kept) >= max_keep:
             break
+    return kept
+
+
+def union_keep_planes(
+    accepted: list[dict[str, Any]],
+    *,
+    strategy: str = DEFAULT_UNION_STRATEGY,
+    max_keep: int = DEFAULT_MAX_KEEP,
+    nms_xy_m: float = DEFAULT_NMS_XY_M,
+    nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
+    n_dot_min: float = 0.85,
+    d_tol_m: float = 2.5,
+    telemetry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Union accepted planes after ZNCC.
+
+    ``nms``: today's single ZNCC-sorted NMS (A/B compare).
+
+    ``a_priority`` (Path α hybrid default): keep A-family first (mild NMS
+    within A — same n·n / Δd / XY as historic Milestone A), then add
+    MA-family only if **not** a duplicate of a kept A. MA-vs-A uses the
+    general ``nms_xy_m`` radius (never the 4 m split-sibling exception) so
+    a slightly better MA on the same wall cannot evict A. MA-vs-MA still
+    uses sibling NMS.
+    """
+    strat = (strategy or DEFAULT_UNION_STRATEGY).lower().strip()
+    if strat not in UNION_STRATEGIES:
+        raise ValueError(
+            f"unknown union strategy {strategy!r} (expected {UNION_STRATEGIES})"
+        )
+
+    a_acc = [p for p in accepted if plane_family(p.get("source")) == "a"]
+    ma_acc = [p for p in accepted if plane_family(p.get("source")) != "a"]
+    a_pre_nms = len(a_acc)
+    ma_pre_nms = len(ma_acc)
+    pre_nms = len(accepted)
+
+    nms_kw = dict(
+        max_keep=max_keep,
+        nms_xy_m=float(nms_xy_m),
+        nms_xy_split_m=float(nms_xy_split_m),
+        n_dot_min=n_dot_min,
+        d_tol_m=d_tol_m,
+    )
+
+    if strat == "nms":
+        ranked = sorted(accepted, key=lambda p: -float(p.get("zncc") or 0.0))
+        kept = nms_keep_planes(ranked, **nms_kw)
+        a_kept = sum(1 for p in kept if plane_family(p.get("source")) == "a")
+        ma_added = len(kept) - a_kept
+    else:
+        a_ranked = sorted(a_acc, key=lambda p: -float(p.get("zncc") or 0.0))
+        a_kept_list = nms_keep_planes(a_ranked, **nms_kw)
+        remaining = max(0, int(max_keep) - len(a_kept_list))
+        ma_ranked = sorted(ma_acc, key=lambda p: -float(p.get("zncc") or 0.0))
+        ma_added_list: list[dict[str, Any]] = []
+        for pl in ma_ranked:
+            if remaining <= 0:
+                break
+            # Stricter than sibling NMS: no 4 m split exception vs kept A.
+            if any(
+                _is_plane_dup(
+                    pl,
+                    k,
+                    nms_xy_m=float(nms_xy_m),
+                    nms_xy_split_m=float(nms_xy_split_m),
+                    n_dot_min=n_dot_min,
+                    d_tol_m=d_tol_m,
+                    use_split_xy=False,
+                )
+                for k in a_kept_list
+            ):
+                continue
+            if any(
+                _is_plane_dup(
+                    pl,
+                    k,
+                    nms_xy_m=float(nms_xy_m),
+                    nms_xy_split_m=float(nms_xy_split_m),
+                    n_dot_min=n_dot_min,
+                    d_tol_m=d_tol_m,
+                    use_split_xy=True,
+                )
+                for k in ma_added_list
+            ):
+                continue
+            ma_added_list.append(pl)
+            remaining -= 1
+        kept = a_kept_list + ma_added_list
+        kept.sort(key=lambda p: -float(p.get("zncc") or 0.0))
+        a_kept = len(a_kept_list)
+        ma_added = len(ma_added_list)
+
+    if telemetry is not None:
+        telemetry.clear()
+        telemetry.update(
+            {
+                "strategy": strat,
+                "a_pre_nms": a_pre_nms,
+                "a_kept": a_kept,
+                "ma_pre_nms": ma_pre_nms,
+                "ma_added": ma_added,
+                "pre_nms": pre_nms,
+                "union_kept": len(kept),
+            }
+        )
     return kept
 
 
@@ -653,7 +805,7 @@ def score_planar_hyps(
     frames: list[dict[str, Any]],
     *,
     zncc_accept: float = DEFAULT_ZNCC_ACCEPT_MA,
-    max_keep: int = 16,
+    max_keep: int = DEFAULT_MAX_KEEP,
     patch: int = 64,
     refine: bool = True,
     refine_deltas_m: tuple[float, ...] = DEFAULT_REFINE_DELTAS_M,
@@ -668,6 +820,7 @@ def score_planar_hyps(
     split_overlap_m: float = DEFAULT_SPLIT_OVERLAP_M,
     nms_xy_m: float = DEFAULT_NMS_XY_M,
     nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
+    union_strategy: str = DEFAULT_UNION_STRATEGY,
 ) -> list[dict[str, Any]]:
     """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
 
@@ -684,7 +837,9 @@ def score_planar_hyps(
     3. Re-picks views per candidate (esp. after normal flip).
     4. Flips ``n`` toward the nearest cam before scoring so the ref sees the front.
     5. Optional ``seed_hyps`` (Milestone A heading×distance) scored in the same
-       pass + NMS → union(A, MA) promote (PR-1 hybrid).
+       pass. Union default ``a_priority``: keep A accepts first, then add
+       non-duplicate MA (PR-3). ``union_strategy=nms`` is the old ZNCC-sorted
+       NMS for A/B compare. Quality-keep / zncc_accept unchanged.
     """
     from ps1_hood.reconstruct import photo_planes as pp
     from ps1_hood.reconstruct.photo_planes import load_view
@@ -880,26 +1035,23 @@ def score_planar_hyps(
             accepted.append(best_local)
 
     accepted.sort(key=lambda p: -float(p.get("zncc") or 0.0))
-    kept = nms_keep_planes(
+    union_tel: dict[str, Any] = {}
+    kept = union_keep_planes(
         accepted,
+        strategy=union_strategy,
         max_keep=max_keep,
         nms_xy_m=float(nms_xy_m),
         nms_xy_split_m=float(nms_xy_split_m),
+        telemetry=union_tel,
     )
 
-    def _is_ma_source(src: str | None) -> bool:
-        s = (src or "ma_segment").lower()
-        return s.startswith("ma_") or s in {"ma_segment", "mapanything_planarize"}
-
-    def _is_a_source(src: str | None) -> bool:
-        s = (src or "").lower()
-        return s in {"heading_distance", "manhattan", "sparse"} or s.startswith(
-            "photo_"
-        )
-
-    n_pre_nms = len(accepted)
-    ma_kept = sum(1 for p in kept if _is_ma_source(p.get("source")))
-    a_kept = sum(1 for p in kept if _is_a_source(p.get("source")))
+    n_pre_nms = int(union_tel.get("pre_nms") or len(accepted))
+    ma_kept = int(union_tel.get("ma_added") or 0)
+    a_kept = int(union_tel.get("a_kept") or 0)
+    a_pre_nms = int(union_tel.get("a_pre_nms") or 0)
+    ma_pre_nms = int(union_tel.get("ma_pre_nms") or 0)
+    union_kept = int(union_tel.get("union_kept") or len(kept))
+    strat = str(union_tel.get("strategy") or union_strategy)
 
     if not kept:
         sentinel = n_scored == 0 or n_finite == 0
@@ -908,7 +1060,9 @@ def score_planar_hyps(
             "planarize: FAIL-LOUD — 0 / %s hyps passed ZNCC≥%.2f "
             "(best rejected≈%.3f %s; scored=%s finite=%s; "
             "skips tilt=%s xy40=%s depth=%s soft_depth=%s views=%s load=%s; "
-            "windows=%s; pre_nms=%s; ma=%s a=%s). Not inventing RANSAC/OSM walls.",
+            "windows=%s; pre_nms=%s; strategy=%s a_pre_nms=%s a_kept=%s "
+            "ma_pre_nms=%s ma_added=%s union_kept=%s; ma_hyps=%s a_hyps=%s). "
+            "Not inventing RANSAC/OSM walls.",
             len(all_hyps),
             zncc_accept,
             best_reject,
@@ -923,6 +1077,12 @@ def score_planar_hyps(
             skip["load"],
             len(score_hyps),
             n_pre_nms,
+            strat,
+            a_pre_nms,
+            a_kept,
+            ma_pre_nms,
+            ma_kept,
+            union_kept,
             len(ma_hyps),
             len(extra),
         )
@@ -932,7 +1092,8 @@ def score_planar_hyps(
             log.warning("planarize: mean ZNCC of kept=%.3f < 0.42 (soft warn)", mean_z)
         log.info(
             "planarize: kept %s / %s hyps (ZNCC≥%.2f, mean=%.3f, scored=%s, "
-            "windows=%s, pre_nms=%s→kept=%s, ma_kept=%s a_kept=%s, "
+            "windows=%s, pre_nms=%s→kept=%s, strategy=%s, "
+            "a_pre_nms=%s a_kept=%s, ma_pre_nms=%s ma_added=%s, union_kept=%s, "
             "nms_xy=%.1f split_xy=%.1f)",
             len(kept),
             len(all_hyps),
@@ -942,8 +1103,12 @@ def score_planar_hyps(
             len(score_hyps),
             n_pre_nms,
             len(kept),
-            ma_kept,
+            strat,
+            a_pre_nms,
             a_kept,
+            ma_pre_nms,
+            ma_kept,
+            union_kept,
             float(nms_xy_m),
             float(nms_xy_split_m),
         )
