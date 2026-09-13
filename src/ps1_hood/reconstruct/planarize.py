@@ -30,6 +30,13 @@ DEFAULT_VERTICAL_DOT = 0.15
 DEFAULT_GROUND_DOT = 0.85
 DEFAULT_ZNCC_ACCEPT_MA = 0.40
 PLANARIZE_AUTO_MIN_POINTS = 50_000
+DEFAULT_AABB_PERCENTILE = (5.0, 95.0)
+DEFAULT_MAX_WIDTH_M = 25.0
+DEFAULT_MAX_HEIGHT_M = 15.0
+DEFAULT_MIN_HEIGHT_M = 2.5
+DEFAULT_MIN_CAM_DEPTH_M = 4.0
+DEFAULT_MAX_CAM_DEPTH_M = 25.0
+DEFAULT_REFINE_DELTAS_M = (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0)
 
 try:
     import open3d as o3d
@@ -102,9 +109,17 @@ def inliers_to_quad(
     *,
     ground_z: float | None = None,
     min_width: float = 1.5,
-    min_height: float = 1.5,
+    min_height: float = DEFAULT_MIN_HEIGHT_M,
+    aabb_percentile: tuple[float, float] = DEFAULT_AABB_PERCENTILE,
+    max_width: float = DEFAULT_MAX_WIDTH_M,
+    max_height: float = DEFAULT_MAX_HEIGHT_M,
 ) -> dict[str, Any] | None:
-    """Inlier pts → rectangular façade corners BL,BR,TR,TL in ENU."""
+    """Inlier pts → rectangular façade corners BL,BR,TR,TL in ENU.
+
+    Uses percentile AABB (default 5–95) to reject outlier inliers on street-slab
+    peels, then clamps extent so scoring is not dominated by multi-building
+    slabs (see path-alpha-zncc-fail-rd).
+    """
     n = np.asarray(n, dtype=np.float64)
     pts = np.asarray(pts, dtype=np.float64)
     if len(pts) < 20:
@@ -123,10 +138,18 @@ def inliers_to_quad(
 
     s = (pts - c) @ right
     t = (pts - c) @ up_t
-    s0, s1 = float(s.min()), float(s.max())
-    t0, t1 = float(t.min()), float(t.max())
+    lo, hi = float(aabb_percentile[0]), float(aabb_percentile[1])
+    s0, s1 = (float(x) for x in np.percentile(s, [lo, hi]))
+    t0, t1 = (float(x) for x in np.percentile(t, [lo, hi]))
     if ground_z is not None:
         t0 = max(t0, float(ground_z) - float(c @ up_t) - 0.2)
+    # Clamp huge street-slab peels about AABB center
+    mid_s = 0.5 * (s0 + s1)
+    mid_t = 0.5 * (t0 + t1)
+    half_w = min(0.5 * (s1 - s0), 0.5 * max_width)
+    half_h = min(0.5 * (t1 - t0), 0.5 * max_height)
+    s0, s1 = mid_s - half_w, mid_s + half_w
+    t0, t1 = mid_t - half_h, mid_t + half_h
     width_m = s1 - s0
     height_m = t1 - t0
     if width_m < min_width or height_m < min_height or width_m * height_m < 4.0:
@@ -434,8 +457,16 @@ def score_planar_hyps(
     zncc_accept: float = DEFAULT_ZNCC_ACCEPT_MA,
     max_keep: int = 16,
     patch: int = 64,
+    refine: bool = True,
+    refine_deltas_m: tuple[float, ...] = DEFAULT_REFINE_DELTAS_M,
+    min_cam_depth_m: float = DEFAULT_MIN_CAM_DEPTH_M,
+    max_cam_depth_m: float = DEFAULT_MAX_CAM_DEPTH_M,
 ) -> list[dict[str, Any]]:
-    """ZNCC-gate MA segment hyps via Milestone A scoring."""
+    """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
+
+    Path α previously scored each hyp once; Milestone A searches deltas along
+    ``n`` before accept. Missing refine left plane depth ~0.5–2 m off → ZNCC≈0.
+    """
     from ps1_hood.reconstruct.photo_planes import (
         load_view,
         score_vertical_plane,
@@ -450,7 +481,6 @@ def score_planar_hyps(
         )
         return []
 
-    # Reuse picker from photo_planes
     from ps1_hood.reconstruct import photo_planes as pp
 
     view_cache: dict[int, Any] = {}
@@ -460,24 +490,28 @@ def score_planar_hyps(
             view_cache[i] = load_view(frames[i], i)
         return view_cache[i]
 
+    cams = np.array(
+        [[float(f["e"]), float(f["n"]), float(f["u"])] for f in frames],
+        dtype=np.float64,
+    )
+
     accepted: list[dict[str, Any]] = []
     best_reject = -1.0
     n_scored = 0
 
     for hyp in hyps:
-        n = hyp["n"]
+        n = np.asarray(hyp["n"], dtype=np.float64)
         d = float(hyp["d"])
-        center = hyp["center"]
-        # Reject floaters / tilted leftovers
+        center = np.asarray(hyp["center"], dtype=np.float64)
         if abs(float(n @ UP)) > 0.20:
             continue
-        if frames:
-            cams = np.array(
-                [[float(f["e"]), float(f["n"]), float(f["u"])] for f in frames],
-                dtype=np.float64,
-            )
-            if float(np.linalg.norm(cams[:, :2] - center[:2], axis=1).min()) > 40.0:
-                continue
+        if float(np.linalg.norm(cams[:, :2] - center[:2], axis=1).min()) > 40.0:
+            continue
+        # Plane depth to nearest camera (signed abs) — drop curb ghosts / far slabs
+        depths = np.abs(cams @ n + d)
+        nearest_depth = float(depths.min())
+        if nearest_depth < min_cam_depth_m or nearest_depth > max_cam_depth_m:
+            continue
 
         idxs = pp._pick_scoring_views(frames, n, center, max_views=4, min_frontal=0.25)
         if len(idxs) < 2:
@@ -493,35 +527,57 @@ def score_planar_hyps(
 
         w = min(float(hyp["width_m"]), 12.0)
         h = min(float(hyp["height_m"]), 12.0)
-        result = score_vertical_plane(
-            views,
-            n,
-            d,
-            center,
-            width_m=w,
-            height_m=h,
-            patch=patch if max(w, h) <= 12.0 else 96,
-            zncc_accept=zncc_accept,
-        )
-        n_scored += 1
-        z = result.get("zncc")
-        if isinstance(z, float) and not math.isnan(z):
-            best_reject = max(best_reject, z)
-        if not result.get("ok"):
-            continue
-        accepted.append(
-            {
-                **hyp,
-                **result,
-                "n": n,
-                "d": d,
-                "center": center,
-                "width_m": float(hyp["width_m"]),
-                "height_m": float(hyp["height_m"]),
-                "source": hyp.get("source") or "ma_segment",
-                "view_indices": idxs[: len(views)],
-            }
-        )
+        patch_i = patch if max(w, h) <= 12.0 else 96
+
+        candidates: list[tuple[np.ndarray, float, np.ndarray]] = [(n, d, center)]
+        if refine:
+            for delta in refine_deltas_m:
+                c2 = center + n * float(delta)
+                d2 = float(-n @ c2)
+                candidates.append((n, d2, c2))
+            # Also try opposite facing (same plane) — H is algebraically invariant
+            # under (n,d)→(-n,-d), but view picker / refine side can differ.
+            candidates.append((-n, -d, center))
+            for delta in refine_deltas_m:
+                c2 = center + (-n) * float(delta)
+                d2 = float(-(-n) @ c2)
+                candidates.append((-n, d2, c2))
+
+        best_local: dict[str, Any] | None = None
+        best_delta = 0.0
+        for n_c, d_c, c_c in candidates:
+            result = score_vertical_plane(
+                views,
+                n_c,
+                d_c,
+                c_c,
+                width_m=w,
+                height_m=h,
+                patch=patch_i,
+                zncc_accept=zncc_accept,
+            )
+            n_scored += 1
+            z = result.get("zncc")
+            if isinstance(z, float) and not math.isnan(z):
+                best_reject = max(best_reject, z)
+            if not result.get("ok"):
+                continue
+            if best_local is None or float(result["zncc"]) > float(best_local["zncc"]):
+                best_delta = float(n_c @ (c_c - center))
+                best_local = {
+                    **hyp,
+                    **result,
+                    "n": n_c,
+                    "d": d_c,
+                    "center": c_c,
+                    "width_m": float(hyp["width_m"]),
+                    "height_m": float(hyp["height_m"]),
+                    "source": hyp.get("source") or "ma_segment",
+                    "view_indices": idxs[: len(views)],
+                    "refine_delta_m": best_delta,
+                }
+        if best_local is not None:
+            accepted.append(best_local)
 
     accepted.sort(key=lambda p: -float(p.get("zncc") or 0.0))
     kept: list[dict[str, Any]] = []

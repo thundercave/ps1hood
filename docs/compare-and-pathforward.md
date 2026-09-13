@@ -176,3 +176,18 @@ Studio-compare MapAnything
 | Wire | Extend `photo_planes.py` + `facades.py` — MA PLY → Open3D vertical `segment_plane` → existing ZNCC/ortho bake. No OSM/BAG. No Poisson hero. |
 
 First PR: smoke-block planarize only (no Instant Meshes / organic remesh). See recipe §8 acceptance tests.
+
+---
+
+## 10) Path α FAIL (2026-09-13) — ZNCC 0/23 on MA ENU → fix PR
+
+**PR #15** planarize+ZNCC on MA ENU product: **23 vertical hyps, 0 passed ZNCC≥0.40** (best rejected ≈ **−0.077** = uncorrelated patches). Empty `planes.json`; `facades.obj` wiped to ~253 B — **lost prior 7 flow ZNCC~0.42 planes**.
+
+**Top causes (code):** (1) `score_planar_hyps` scored MA hyps once — **no ±n depth refine** that Milestone A uses; (2) RANSAC largest-vertical + **min/max AABB** → street-slab peels; (3) `extract_facades` **always overwrote** OBJ/textures/planes.json on 0 accepts; (4) no same-run Milestone A fallback.
+
+**Fix (this PR):** depth refine + opposite-n candidates in `score_planar_hyps`; percentile AABB + max extent + cam-depth gate; `--keep-previous-on-fail` (default) → `*.failed` diagnostics without clobber; auto `photo_consistency_fallback` when Path α keeps 0; CLI exits non-zero on 0 planes.
+
+**R&D pack:** `docs/path-alpha-zncc-fail-rd.md` (also `/workspace/path-alpha-zncc-fail-rd.md`).
+
+**Do not** treat this as MA ENU gate regression — cloud still product; planarize scoring/peel/write path was the bug.
+
