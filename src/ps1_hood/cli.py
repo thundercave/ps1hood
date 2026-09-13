@@ -669,6 +669,19 @@ def export_mapanything_bundle_cmd(
     show_default=True,
     help="Hybrid union: keep A first then non-dup MA (a_priority), or ZNCC-sorted NMS (nms)",
 )
+@click.option(
+    "--ps1-rectify/--no-ps1-rectify",
+    default=True,
+    show_default=True,
+    help="Manhattan-rectify accepted façade quads (PS1) before warp/write",
+)
+@click.option(
+    "--ps1-tex-size",
+    default=128,
+    show_default=True,
+    type=int,
+    help="Nearest resize short side (128² or 128×256) + RGB555; 0 disables",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -694,6 +707,8 @@ def facades_cmd(
     nms_xy_m: float,
     nms_xy_split_m: float,
     union_strategy: str,
+    ps1_rectify: bool,
+    ps1_tex_size: int,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -788,6 +803,8 @@ def facades_cmd(
             a_ply_path=a_ply,
             a_source=a_source,
             control_out=control_out,
+            ps1_rectify=ps1_rectify,
+            ps1_tex_size=(None if int(ps1_tex_size) <= 0 else int(ps1_tex_size)),
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
@@ -831,6 +848,47 @@ def facades_cmd(
     # Product intact on quality-keep; only fail-hard when nothing usable remains
     if n_planes_out <= 0 and not preserved:
         raise SystemExit(1)
+
+
+@main.command("ps1-facades")
+@click.argument("name")
+@click.option(
+    "--ps1-tex-size",
+    default=128,
+    show_default=True,
+    type=int,
+    help="Nearest resize short side (128² or 128×256) + RGB555",
+)
+@click.option(
+    "--no-backup",
+    is_flag=True,
+    default=False,
+    help="Do not write facades.obj.bak before rewriting quads",
+)
+def ps1_facades_cmd(name: str, ps1_tex_size: int, no_backup: bool) -> None:
+    """Post-process existing product: Manhattan rectify + PS1 textures (no re-extract).
+
+    Rectifies planes.json (or parses facades.obj), nearest-resizes façade JPGs,
+    RGB555-quantizes, rewrites facades.obj quads. Quality-keep is not re-run.
+    """
+    from ps1_hood.reconstruct.ps1_facades import postprocess_run
+
+    project = open_project(name)
+    try:
+        meta = postprocess_run(
+            project.recon_dir,
+            tex_size=int(ps1_tex_size),
+            backup_obj=not no_backup,
+        )
+    except Exception as exc:
+        click.echo(f"ps1-facades failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(
+        f"ps1-facades ok  planes={meta.get('planes')}  "
+        f"textures={meta.get('textures_rewritten')}  "
+        f"tex_size={meta.get('ps1_tex_size')}  "
+        f"obj={meta.get('obj')}  planes_json={meta.get('planes_json')}"
+    )
 
 
 @main.command("studio")

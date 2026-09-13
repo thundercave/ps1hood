@@ -214,7 +214,14 @@
       for (const mat of Object.values(materials.materials)) {
         if (!mat) continue;
         mat.side = THREE.DoubleSide;
-        if (mat.map) mat.map.colorSpace = THREE.SRGBColorSpace;
+        if (mat.map) {
+          mat.map.colorSpace = THREE.SRGBColorSpace;
+          // PS1 look: blocky façade texels (no bilinear smear)
+          mat.map.magFilter = THREE.NearestFilter;
+          mat.map.minFilter = THREE.NearestFilter;
+          mat.map.generateMipmaps = false;
+          mat.map.needsUpdate = true;
+        }
       }
       const objLoader = new OBJLoader();
       objLoader.setMaterials(materials);
@@ -227,7 +234,13 @@
             const mats = Array.isArray(child.material) ? child.material : [child.material];
             for (const m of mats) {
               m.side = THREE.DoubleSide;
-              if (m.map) m.map.colorSpace = THREE.SRGBColorSpace;
+              if (m.map) {
+                m.map.colorSpace = THREE.SRGBColorSpace;
+                m.map.magFilter = THREE.NearestFilter;
+                m.map.minFilter = THREE.NearestFilter;
+                m.map.generateMipmaps = false;
+                m.map.needsUpdate = true;
+              }
             }
           }
         }
