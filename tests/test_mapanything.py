@@ -170,25 +170,122 @@ def test_which_mapanything_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ma.which_mapanything() is None
 
 
+def test_cam_points_to_enu_matches_cam2world() -> None:
+    """WORLD = R @ X_cam + C with camera_rotation_cv columns as R_c2w."""
+    frame = {"e": 10.0, "n": -2.0, "u": 1.7, "heading": 90.0, "pitch": 0.0}
+    T = ma.cam2world_from_frame(frame)
+    R, C = T[:3, :3], T[:3, 3]
+    # Point 5 m along camera forward (+Z_cam) should land near C + 5*forward.
+    X_cam = np.array([[0.0, 0.0, 5.0]])
+    Pw = ma.cam_points_to_enu(X_cam, R, C)
+    forward = R[:, 2]
+    expected = C + 5.0 * forward
+    assert np.allclose(Pw[0], expected, atol=1e-6)
+    # Right (+X_cam) → ENU eastish for heading=90 (looking east).
+    X_right = np.array([[2.0, 0.0, 0.0]])
+    Pr = ma.cam_points_to_enu(X_right, R, C)
+    assert np.allclose(Pr[0], C + 2.0 * R[:, 0], atol=1e-6)
+
+
+def test_cam2world_is_not_world2cam() -> None:
+    """Translation must be camera centre C, not OpenCV t=-Rcw@C."""
+    frame = {"e": 3.0, "n": 4.0, "u": 1.5, "heading": 45.0, "pitch": -5.0}
+    T = ma.cam2world_from_frame(frame)
+    R = T[:3, :3]
+    C = T[:3, 3]
+    assert np.allclose(C, [3.0, 4.0, 1.5])
+    Rcw = R.T
+    t_w2c = -Rcw @ C
+    assert not np.allclose(C, t_w2c), "cam2world translation must not equal w2c t"
+    # Round-trip: world point = C maps to camera origin.
+    X_cam0 = Rcw @ (C - C)
+    assert np.allclose(X_cam0, 0.0)
+
+
+def test_fuse_predictions_uses_locked_poses_not_predicted(tmp_path: Path) -> None:
+    """Product PLY from pts3d_cam + our R,C — predicted pose only logged."""
+    # Camera at ENU origin, identity R (heading such that R≈I is awkward;
+    # use explicit locked T = eye → C=0, R=I so ENU == cam for this unit test).
+    locked = [np.eye(4, dtype=np.float64)]
+    locked[0][:3, 3] = [0.0, 0.0, 1.7]
+
+    pts_cam = np.zeros((2, 2, 3), dtype=np.float64)
+    pts_cam[0, 0] = [1.0, 0.0, 4.0]   # street-ish depth
+    pts_cam[0, 1] = [0.0, 0.0, 5.0]
+    pts_cam[1, 0] = [-1.0, 0.5, 3.5]
+    pts_cam[1, 1] = [0.5, -0.2, 6.0]
+    mask = np.array([[True, False], [True, True]], dtype=bool)
+    pred_pose = np.eye(4)
+    pred_pose[:3, 3] = [100.0, 0.0, 50.0]  # bogus predicted C (Studio ~50m float)
+
+    meta = ma.fuse_predictions_to_ply(
+        [{"pts3d_cam": pts_cam, "mask": mask, "camera_poses": pred_pose}],
+        tmp_path / "out.ply",
+        locked_poses=locked,
+    )
+    assert meta["points"] == 3
+    assert meta["predicted_poses_discarded"] is True
+    assert meta["export_source"] == "pts3d_cam"
+    assert meta["export_frame"] == "ENU"
+    assert meta["predicted_pose_median_delta_m"] == pytest.approx(
+        float(np.linalg.norm(np.array([100.0, 0.0, 50.0]) - np.array([0.0, 0.0, 1.7]))),
+        rel=1e-6,
+    )
+    assert Path(meta["path"]).is_file()
+    # Points must sit near C + X_cam (R=I), not near predicted C.
+    assert meta["enu_check"]["cloud_z_p50"] == pytest.approx(1.7 + 4.0, abs=2.5)
+
+
+def test_fuse_refuses_raw_pts3d_as_enu(tmp_path: Path) -> None:
+    """Dumping model-world pts3d without pts3d_cam must fail loud."""
+    locked = [np.eye(4)]
+    pts = np.ones((2, 2, 3), dtype=np.float64) * 50.0
+    with pytest.raises(RuntimeError, match="pts3d_cam"):
+        ma.fuse_predictions_to_ply(
+            [{"pts3d": pts, "mask": np.ones((2, 2), dtype=bool)}],
+            tmp_path / "bad.ply",
+            locked_poses=locked,
+        )
+
+
+def test_assert_cloud_near_cameras_catches_float_sheet() -> None:
+    """Studio symptom: z p50~60 vs cameras ~3 → fail loud."""
+    cams = np.array([[-20.0, 5.0, 3.4], [-15.0, 5.0, 3.5], [-10.0, 4.0, 3.3]])
+    # Floating sheet like the broken MA export.
+    bad = np.random.default_rng(0).normal(loc=(20.5, -0.5, 60.0), scale=2.0, size=(1000, 3))
+    with pytest.raises(RuntimeError, match="ENU frame check failed"):
+        ma.assert_cloud_near_cameras(bad, cams)
+
+    # Street-level cloud near cameras should pass.
+    good = np.random.default_rng(1).normal(loc=(-15.0, 5.0, 4.0), scale=3.0, size=(1000, 3))
+    stats = ma.assert_cloud_near_cameras(good, cams)
+    assert stats["centroid_delta_m"] < 25.0
+    assert stats["z_p50_delta_m"] < 15.0
+
+
 def test_fuse_predictions_discards_poses(tmp_path: Path) -> None:
-    pts = np.zeros((2, 2, 3), dtype=np.float64)
-    pts[0, 0] = [1, 2, 3]
-    pts[0, 1] = [4, 5, 6]
-    pts[1, 0] = [7, 8, 9]
-    pts[1, 1] = [10, 11, 12]
-    mask = np.array([[[[True], [False]], [[True], [True]]]], dtype=bool)
+    """Back-compat name: predicted poses logged, locked ENU used for fuse."""
+    pts_cam = np.zeros((2, 2, 3), dtype=np.float64)
+    pts_cam[0, 0] = [1, 0, 3]
+    pts_cam[0, 1] = [4, 0, 5]
+    pts_cam[1, 0] = [0, 0, 4]
+    pts_cam[1, 1] = [1, 0, 6]
+    mask = np.array([[True, False], [True, True]], dtype=bool)
     pred_pose = np.eye(4)
     pred_pose[:3, 3] = [100, 0, 0]
     locked = [np.eye(4)]
+    locked[0][:3, 3] = [0.0, 0.0, 1.7]
     meta = ma.fuse_predictions_to_ply(
-        [{"pts3d": pts, "mask": mask[0], "camera_poses": pred_pose}],
+        [{"pts3d_cam": pts_cam, "mask": mask, "camera_poses": pred_pose}],
         tmp_path / "out.ply",
         locked_poses=locked,
     )
     assert meta["points"] == 3
     assert meta["predicted_poses_discarded"] is True
     assert Path(meta["path"]).is_file()
-    assert meta["predicted_pose_median_delta_m"] == pytest.approx(100.0)
+    assert meta["predicted_pose_median_delta_m"] == pytest.approx(
+        float(np.linalg.norm([100.0, 0.0, -1.7])), rel=1e-5
+    )
 
 
 def test_cli_export_mapanything_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
