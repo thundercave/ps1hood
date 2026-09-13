@@ -468,6 +468,18 @@ def export_mapanything_bundle_cmd(
 @click.option("--voxel", "voxel_m", default=0.08, show_default=True, type=float)
 @click.option("--plane-dist", "plane_dist_m", default=0.08, show_default=True, type=float)
 @click.option("--max-planes", default=12, show_default=True, type=int)
+@click.option(
+    "--keep-previous-on-fail/--no-keep-previous-on-fail",
+    default=True,
+    show_default=True,
+    help="On 0 accepts, preserve non-empty facades.obj/mtl/textures/planes.json; write *.failed",
+)
+@click.option(
+    "--fallback-heading/--no-fallback-heading",
+    default=True,
+    show_default=True,
+    help="If Path α ZNCC keeps 0, retry Milestone A heading×distance on the same run",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -476,6 +488,8 @@ def facades_cmd(
     voxel_m: float,
     plane_dist_m: float,
     max_planes: int,
+    keep_previous_on_fail: bool,
+    fallback_heading: bool,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -528,6 +542,8 @@ def facades_cmd(
             planarize=planarize,
             voxel_m=voxel_m,
             plane_dist_m=plane_dist_m,
+            keep_previous_on_fail=keep_previous_on_fail,
+            fallback_heading=fallback_heading,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
@@ -547,11 +563,16 @@ def facades_cmd(
         payload["facades"] = meta
         scene_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    n_planes_out = int(meta.get("planes") or 0)
+    preserved = bool(meta.get("preserved_previous"))
+    status = "ok" if n_planes_out > 0 else ("preserved" if preserved else "FAIL")
     click.echo(
-        f"facades ok  planes={meta.get('planes')}  textured={meta.get('textured')}  "
+        f"facades {status}  planes={n_planes_out}  textured={meta.get('textured')}  "
         f"source={meta.get('source')}  mean_zncc={meta.get('mean_zncc')}  "
-        f"ply={ply}"
+        f"preserved_previous={preserved}  ply={ply}"
     )
+    if n_planes_out <= 0:
+        raise SystemExit(1)
 
 
 @main.command("studio")

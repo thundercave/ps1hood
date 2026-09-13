@@ -215,6 +215,14 @@ Reuse / tighten existing `_pick_scoring_views` in `photo_planes.py`:
 
 Flip `n` toward camera before scoring (A already does).
 
+**Post-FAIL (2026-09-13) — required in `score_planar_hyps`:** port Milestone A
+±n depth refine (`delta ∈ {±0.5,±1,±2}` m) for `ma_segment` hyps; percentile
+AABB (5–95) + max extent clamp; cam–plane depth gate 4–25 m; on 0 accepts
+auto-fallback to heading×distance and **never clobber** non-empty product
+(`keep_previous_on_fail`, diagnostics → `*.failed`). See
+`docs/path-alpha-zncc-fail-rd.md`.
+
+
 **Integration shape:**
 
 ```python

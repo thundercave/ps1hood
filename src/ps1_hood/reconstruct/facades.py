@@ -315,6 +315,33 @@ def _fit_ground_z(xyz: np.ndarray) -> float:
     return best_z
 
 
+
+def _facade_product_looks_nonempty(dest_obj: Path) -> bool:
+    """True if existing façades.obj / planes.json / facade textures look like real product."""
+    dest_obj = Path(dest_obj)
+    if dest_obj.is_file() and dest_obj.stat().st_size > 400:
+        body = dest_obj.read_text(encoding="ascii", errors="ignore")
+        # Prior photo façades have façade materials / multiple usemtl
+        if "usemtl facade_" in body or body.count("usemtl") >= 2:
+            return True
+        if sum(1 for line in body.splitlines() if line.startswith("v ")) >= 12:
+            return True
+    planes_json = dest_obj.parent / "planes.json"
+    if planes_json.is_file() and planes_json.stat().st_size > 80:
+        try:
+            import json
+
+            payload = json.loads(planes_json.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and len(payload.get("planes") or []) > 0:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    tex_dir = dest_obj.parent / "textures"
+    if tex_dir.is_dir() and any(tex_dir.glob("facade_*.jpg")):
+        return True
+    return False
+
+
 def extract_facades(
     ply_path: Path | None,
     dest_obj: Path,
@@ -328,6 +355,8 @@ def extract_facades(
     planarize: bool | None = None,
     voxel_m: float = 0.08,
     plane_dist_m: float = 0.08,
+    keep_previous_on_fail: bool = True,
+    fallback_heading: bool = True,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -335,10 +364,13 @@ def extract_facades(
     seed vertical planes from MapAnything ENU cloud via Open3D/numpy
     ``segment_plane`` peel, then ZNCC-gate + ortho bake (Milestone A).
 
-    Milestone A fallback: heading×distance / sparse hypotheses + ZNCC.
+    If Path α keeps 0 planes and ``fallback_heading``, retry Milestone A
+    heading×distance on the same run (``photo_consistency_fallback``).
 
-    Fail-loud: empty wall list + clear log — never invent flow-RANSAC or
-    OSM/BAG walls as product geometry.
+    Fail-loud: never invent flow-RANSAC or OSM/BAG walls. When accepts==0 and
+    ``keep_previous_on_fail`` (default), do **not** clobber non-empty product
+    ``facades.obj`` / ``.mtl`` / ``textures/facade_*.jpg`` / ``planes.json`` —
+    write diagnostics to ``*.failed`` instead.
     """
     import logging
 
@@ -356,6 +388,7 @@ def extract_facades(
 
     log = logging.getLogger(__name__)
     frames = list(frames or [])
+    dest_obj = Path(dest_obj)
 
     xyz_raw = np.zeros((0, 3), dtype=np.float64)
     if ply_path is not None and Path(ply_path).is_file():
@@ -372,6 +405,7 @@ def extract_facades(
 
     residual_pts = 0
     source_tag = "photo_consistency"
+    path_alpha_attempted = False
 
     if len(xyz_raw) >= 20:
         xyz = _voxel_downsample_xyz(xyz_raw, 0.20 if not use_planarize else voxel_m)
@@ -383,6 +417,7 @@ def extract_facades(
             ground_z = float(np.median([float(f.get("u") or 0.0) for f in frames])) - 2.5
 
     if use_planarize and ply_path is not None and Path(ply_path).is_file() and len(xyz_raw) >= 100:
+        path_alpha_attempted = True
         cam_c = (
             np.mean(
                 [[float(f["e"]), float(f["n"]), float(f["u"])] for f in frames],
@@ -415,6 +450,20 @@ def extract_facades(
             len(accepted),
             len(xyz_raw),
         )
+        if not accepted and fallback_heading:
+            log.warning(
+                "facades Path α: 0 ZNCC accepts — falling back to Milestone A "
+                "heading×distance (same run; no OSM/BAG invent)"
+            )
+            accepted = search_photo_consistent_planes(
+                frames,
+                xyz if len(xyz) >= 30 else None,
+                zncc_accept=min(float(zncc_accept), 0.35),
+                ground_z=ground_z,
+                max_keep=n_planes,
+            )
+            if accepted:
+                source_tag = "photo_consistency_fallback"
     else:
         if planarize is True and len(xyz_raw) < 100:
             log.warning(
@@ -436,11 +485,8 @@ def extract_facades(
 
     dest_obj.parent.mkdir(parents=True, exist_ok=True)
     tex_dir = dest_obj.parent / "textures"
-    if tex_dir.is_dir():
-        for old_tex in tex_dir.glob("*.jpg"):
-            old_tex.unlink(missing_ok=True)
-    tex_dir.mkdir(parents=True, exist_ok=True)
-    materials: list[dict[str, Any]] = []
+    mtl_path = dest_obj.with_suffix(".mtl")
+    planes_json = dest_obj.parent / "planes.json"
 
     # Ground extents from photo cloud or camera AABB
     if len(xyz) >= 4:
@@ -450,7 +496,6 @@ def extract_facades(
             [[float(f["e"]), float(f["n"]), float(f.get("u") or ground_z)] for f in frames],
             dtype=np.float64,
         )
-        # Pad so ground quad is not degenerate
         pad = 15.0
         extent_xyz = np.vstack(
             [
@@ -464,6 +509,67 @@ def extract_facades(
             [[-10, -10, ground_z], [10, 10, ground_z]], dtype=np.float64
         )
 
+    # --- FAIL-LOUD preserve: do not wipe prior product ---
+    if not planes and keep_previous_on_fail and _facade_product_looks_nonempty(dest_obj):
+        failed_obj = dest_obj.with_name(dest_obj.stem + ".failed.obj")
+        failed_mtl = dest_obj.with_name(dest_obj.stem + ".failed.mtl")
+        failed_json = dest_obj.parent / "planes.failed.json"
+        ground_only = [
+            {
+                "name": "ground",
+                "map": None,
+                "kd": (0.35, 0.38, 0.32),
+            }
+        ]
+        _write_mtl(failed_mtl, ground_only)
+        _write_obj(failed_obj, [], extent_xyz, ground_only, failed_mtl.name)
+        write_planes_json(
+            failed_json,
+            planes=[],
+            ground_z=ground_z,
+            residual_points=residual_pts,
+            source=f"{source_tag}_failed",
+            textured_maps=[],
+        )
+        log.error(
+            "facades: 0 photo-consistent walls (ZNCC≥%.2f, source=%s) — "
+            "kept previous %s / textures / planes.json; diagnostics → %s / %s. "
+            "Not inventing RANSAC/OSM blocks.",
+            zncc_accept,
+            source_tag,
+            dest_obj.name,
+            failed_obj.name,
+            failed_json.name,
+        )
+        return {
+            "path": str(dest_obj),
+            "mtl": str(mtl_path),
+            "planes_json": str(planes_json),
+            "planes": 0,
+            "textured": 0,
+            "ground_textured": bool((tex_dir / "ground.jpg").is_file()),
+            "source": source_tag,
+            "planarize": bool(path_alpha_attempted and source_tag == "mapanything_planarize"),
+            "zncc_accept": float(zncc_accept),
+            "ground_z": ground_z,
+            "points_used": int(len(xyz_raw) if len(xyz_raw) else len(xyz)),
+            "points_voxel": int(len(xyz)),
+            "residual_points": int(residual_pts),
+            "mean_zncc": None,
+            "path_alpha": source_tag == "mapanything_planarize",
+            "preserved_previous": True,
+            "ok": False,
+            "failed_obj": str(failed_obj),
+            "failed_planes_json": str(failed_json),
+        }
+
+    # Success (or explicit wipe-on-fail): replace product artifacts
+    tex_dir.mkdir(parents=True, exist_ok=True)
+    if tex_dir.is_dir():
+        for old_tex in tex_dir.glob("facade_*.jpg"):
+            old_tex.unlink(missing_ok=True)
+
+    materials: list[dict[str, Any]] = []
     ground_tex = tex_dir / "ground.jpg"
     has_ground_tex = _ground_satellite_texture(
         extent_xyz, ground_tex, satellite, local_frame
@@ -505,11 +611,9 @@ def extract_facades(
             source_tag,
         )
 
-    mtl_path = dest_obj.with_suffix(".mtl")
     _write_mtl(mtl_path, materials)
     _write_obj(dest_obj, planes, extent_xyz, materials, mtl_path.name)
 
-    # Enrich plane dicts with width/height for planes.json
     for i, pl in enumerate(planes):
         if accepted and i < len(accepted):
             pl["width_m"] = float(accepted[i].get("width_m") or 0.0)
@@ -520,7 +624,6 @@ def extract_facades(
                 pl["n"] = np.array([pl["nx"], pl["ny"], 0.0], dtype=np.float64)
 
     tex_maps = [m.get("map") for m in materials[1:]]
-    planes_json = dest_obj.parent / "planes.json"
     write_planes_json(
         planes_json,
         planes=planes,
@@ -543,7 +646,9 @@ def extract_facades(
         "textured": textured,
         "ground_textured": has_ground_tex,
         "source": source_tag,
-        "planarize": bool(use_planarize and source_tag == "mapanything_planarize"),
+        "planarize": bool(
+            path_alpha_attempted and source_tag == "mapanything_planarize"
+        ),
         "zncc_accept": float(zncc_accept),
         "ground_z": ground_z,
         "points_used": int(len(xyz_raw) if len(xyz_raw) else len(xyz)),
@@ -551,6 +656,8 @@ def extract_facades(
         "residual_points": int(residual_pts),
         "mean_zncc": mean_zncc,
         "path_alpha": source_tag == "mapanything_planarize",
+        "preserved_previous": False,
+        "ok": len(planes) > 0,
     }
 
 

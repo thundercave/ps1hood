@@ -147,11 +147,11 @@ def test_resolve_dense_ply_mapanything(tmp_path: Path) -> None:
 
 
 def test_extract_facades_planarize_branch_writes_planes_json(tmp_path: Path) -> None:
-    """Dense synthetic PLY + planarize=True → source mapanything_planarize or empty ZNCC."""
+    """Dense synthetic PLY + planarize=True; wipe-on-fail still writes empty product."""
     xyz = _synthetic_street_cloud(n_wall=500, n_ground=300)
     ply = tmp_path / "cloud.ply"
     _write_xyz_ply(ply, xyz)
-    # Uncorrelated images → ZNCC fail-loud, but planes.json still written
+    # Uncorrelated images → ZNCC fail-loud
     frames = []
     rng = np.random.default_rng(4)
     for i in range(2):
@@ -180,9 +180,12 @@ def test_extract_facades_planarize_branch_writes_planes_json(tmp_path: Path) -> 
         planarize=True,
         voxel_m=0.15,
         plane_dist_m=0.10,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
     )
     assert meta["source"] == "mapanything_planarize"
     assert meta["path_alpha"] is True
+    assert meta.get("ok") is False
     assert (tmp_path / "planes.json").is_file()
     assert dest.is_file()
 
@@ -243,3 +246,109 @@ def test_write_planes_json(tmp_path: Path) -> None:
 def test_open3d_flag_documented() -> None:
     # Soft: just ensure constant exists; Open3D optional
     assert isinstance(HAS_OPEN3D, bool)
+
+def test_fail_loud_preserves_prior_facade_artifacts(tmp_path: Path) -> None:
+    """0 accepts + keep_previous: do not clobber non-empty product; write *.failed."""
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+
+    dest = tmp_path / "facades.obj"
+    mtl = tmp_path / "facades.mtl"
+    planes_json = tmp_path / "planes.json"
+    tex_dir = tmp_path / "textures"
+    tex_dir.mkdir()
+    prior_obj = "\n".join(
+        [
+            "# prior good photo facades",
+            "mtllib facades.mtl",
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 1 1 0",
+            "v 0 1 0",
+            "v 0 0 1",
+            "v 1 0 1",
+            "v 1 1 1",
+            "v 0 1 1",
+            "v 2 0 0",
+            "v 3 0 0",
+            "v 3 1 0",
+            "v 2 1 0",
+            "usemtl ground",
+            "f 1 2 3 4",
+            "usemtl facade_00",
+            "f 5 6 7 8",
+            "usemtl facade_01",
+            "f 9 10 11 12",
+        ]
+        + ["# pad"] * 40
+    ) + "\n"
+    dest.write_text(prior_obj, encoding="ascii")
+    mtl.write_text("newmtl facade_00\nKd 0.5 0.5 0.5\n", encoding="ascii")
+    planes_json.write_text(
+        '{"frame":"ENU","source":"photo_consistency","planes":[{"id":"facade_00"}],'
+        '"ground_z":0,"residual_points":0,"gates":{"plane_count":1}}',
+        encoding="utf-8",
+    )
+    tex = tex_dir / "facade_00.jpg"
+    cv2.imwrite(str(tex), np.zeros((32, 32, 3), dtype=np.uint8))
+    prior_obj_bytes = dest.read_bytes()
+    prior_tex_bytes = tex.read_bytes()
+    prior_json = planes_json.read_text(encoding="utf-8")
+
+    frames = []
+    rng = np.random.default_rng(7)
+    for i in range(2):
+        img = rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)
+        p = tmp_path / f"g{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": float(i * 4),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"g{i}",
+            }
+        )
+
+    meta = extract_facades(
+        ply,
+        dest,
+        frames=frames,
+        n_planes=6,
+        zncc_accept=0.95,
+        planarize=True,
+        voxel_m=0.15,
+        plane_dist_m=0.10,
+        keep_previous_on_fail=True,
+        fallback_heading=False,
+    )
+    assert meta["planes"] == 0
+    assert meta.get("preserved_previous") is True
+    assert meta.get("ok") is False
+    assert dest.read_bytes() == prior_obj_bytes
+    assert tex.read_bytes() == prior_tex_bytes
+    assert planes_json.read_text(encoding="utf-8") == prior_json
+    assert (tmp_path / "planes.failed.json").is_file()
+    assert (tmp_path / "facades.failed.obj").is_file()
+
+
+def test_inliers_to_quad_percentile_clamps_wide_slab() -> None:
+    """Street-slab inliers → width clamped to DEFAULT_MAX_WIDTH_M."""
+    from ps1_hood.reconstruct.planarize import DEFAULT_MAX_WIDTH_M
+
+    rng = np.random.default_rng(9)
+    ys = rng.uniform(-40, 40, 800)
+    zs = rng.uniform(0.5, 8.0, 800)
+    pts = np.stack([np.full(800, 5.0), ys, zs], axis=1)
+    n = np.array([1.0, 0.0, 0.0])
+    d = -5.0
+    q = inliers_to_quad(pts, n, d, ground_z=0.0)
+    assert q is not None
+    assert q["width_m"] <= DEFAULT_MAX_WIDTH_M + 1e-6
+    assert q["height_m"] >= 2.0
+
