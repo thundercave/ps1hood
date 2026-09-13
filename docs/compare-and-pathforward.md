@@ -204,7 +204,7 @@ First PR: smoke-block planarize only (no Instant Meshes / organic remesh). See r
 | Product | `keep_previous_on_fail` only when `not planes` → fallback with ≥1 plane always overwrote. |
 
 **This PR (preserve-quality + score telemetry):**
-1. **Promote only if strictly better** (more textured, else more planes, else higher mean_zncc+eps); else write `facades.candidate.*` / `planes.candidate.json` and **keep product**. 2-plane fallback cannot clobber 7-plane.
+1. **Promote only if strictly better** (see §16: textured↑ only with planes≥ and mean within −0.02; else same textured with more planes / mean +0.02); else write `facades.candidate.*` / `planes.candidate.json` and **keep product**. 2-plane fallback cannot clobber 7-plane.
 2. Depth gate → **center→cam Euclidean** (defaults 2–35 m); FAIL-LOUD prints `SENTINEL` when `scored=0` or no finite z, plus skip counts (`tilt/xy40/depth/views/load`).
 
 **R&D:** `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` (also fold into `docs/path-alpha-zncc-fail-rd.md`).
@@ -286,3 +286,18 @@ ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35
 ```
 
 **R&D:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md) §6 PR-3.
+
+---
+
+## 16) Path α after PR #23 (2026-09-13) — quality-keep no mean/plane regress
+
+**PC hole after #23 A-priority union:** hybrid candidate **6 planes / 6 textured / mean_zncc=0.377** (a_kept=4, ma_added=2) beat live **7 / 5 / 0.42** because `_is_strictly_better` treated **textured↑ alone** as enough. Product demoted; PC restored 7/5/0.42; hybrid left as `planes.hybrid.json`.
+
+**Fix:** tighten promote predicate — never textured↑ when planes↓ or mean regresses by >0.02. Promote only if:
+1. textured↑ **and** planes≥ **and** mean ≥ prior−0.02, or
+2. same textured **and** planes↑ **and** mean ≥ prior−0.02, or
+3. same textured+planes **and** mean ≥ prior+0.02.
+
+Keep soft floors (min textured 3 / mean 0.35). Do **not** lower `zncc_accept`. Log which clause fired.
+
+**R&D:** [`docs/path-alpha-zncc-neg1-and-quality-keep.md`](path-alpha-zncc-neg1-and-quality-keep.md) (promote rule).

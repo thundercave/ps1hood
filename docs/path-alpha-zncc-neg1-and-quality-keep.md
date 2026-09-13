@@ -23,7 +23,7 @@
 | Product bug? | **Confirmed:** `keep_previous_on_fail` only when `not planes`. Fallback with 2 planes **bypasses** guard → clobbers 7-plane product. |
 | First PR? | **Quality-aware promote / keep-previous** (product safety). Then α score using `scored=` branch. |
 
-**One-liner quality-keep:** *Promote new façades only if strictly better than existing product (more textured walls, or same count with higher mean ZNCC above mins); else write `facades.candidate.*` and keep product.*
+**One-liner quality-keep:** *Promote new façades only if strictly better than existing product (more textured **with** planes≥ and mean within −0.02 of prior; or same textured with more planes / mean +0.02); never textured↑ alone when planes↓ or mean regresses >0.02; else write `facades.candidate.*` and keep product.*
 
 ---
 
@@ -242,18 +242,22 @@ existing = read_product_metrics(dest_obj.parent)
 
 candidate = { n_planes, mean_zncc, textured, source }
 
-BETTER iff:
-  (textured > existing.textured)
-  OR (textured == existing.textured AND n_planes > existing.n_planes)
-  OR (textured == existing.textured AND n_planes == existing.n_planes
-      AND mean_zncc is not None AND existing.mean_zncc is not None
-      AND mean_zncc > existing.mean_zncc + 0.02)   # epsilon
+BETTER iff (Scrapy / post–PR #23 hole fix — never textured↑ alone):
+  1. textured > existing.textured AND n_planes ≥ existing.n_planes
+     AND mean_zncc ≥ existing.mean_zncc − 0.02
+  2. OR textured == existing.textured AND n_planes > existing.n_planes
+     AND mean_zncc ≥ existing.mean_zncc − 0.02
+  3. OR textured == existing.textured AND n_planes == existing.n_planes
+     AND mean_zncc ≥ existing.mean_zncc + 0.02
 
-HARD FLOORS (optional): refuse promote if textured < 3 or mean_zncc < 0.35
-  when existing already meets floors — never demote a good block.
+HARD FLOORS (kept): refuse demotion when existing already meets textured≥3 or
+  mean_zncc≥0.35 — never demote a good block. Do not lower zncc_accept.
+
+Hole (PC after PR #23): hybrid 6 planes / 6 textured / mean 0.377 was promoted
+  over live 7/5/0.42 because textured 6>5 alone passed the old rule.
 
 Else: write facades.candidate.obj / .mtl / planes.candidate.json / textures_candidate/
-      keep product; log reason.
+      keep product; log which clause fired (or reject reason).
 ```
 
 When Path α fails and fallback runs: **same** promote check vs existing (and vs bak if `planes.json` already wiped — prefer bak metrics).
@@ -288,41 +292,11 @@ def _read_product_metrics(recon_dir: Path) -> dict:
     return metrics
 
 
-def _is_strictly_better(new: dict, old: dict, *, min_textured: int = 3,
-                        min_mean_zncc: float = 0.35) -> tuple[bool, str]:
-    if old["n_planes"] <= 0 and old["textured"] <= 0:
-        return True, "no existing product"
-    # refuse demotion below floors when old is already good
-    old_good = old["textured"] >= min_textured or (
-        old["mean_zncc"] is not None and old["mean_zncc"] >= min_mean_zncc
-    )
-    if old_good:
-        if new["textured"] < old["textured"]:
-            return False, f"fewer textured ({new['textured']}<{old['textured']})"
-        if new["textured"] == old["textured"] and new["n_planes"] < old["n_planes"]:
-            return False, f"fewer planes ({new['n_planes']}<{old['n_planes']})"
-        if (
-            new["textured"] == old["textured"]
-            and new["n_planes"] == old["n_planes"]
-            and old["mean_zncc"] is not None
-            and (new["mean_zncc"] is None or new["mean_zncc"] <= old["mean_zncc"] + 0.02)
-        ):
-            return False, (
-                f"not higher mean_zncc ({new['mean_zncc']} vs {old['mean_zncc']})"
-            )
-    if new["textured"] > old["textured"]:
-        return True, "more textured walls"
-    if new["n_planes"] > old["n_planes"]:
-        return True, "more planes"
-    if (
-        new["mean_zncc"] is not None
-        and old["mean_zncc"] is not None
-        and new["mean_zncc"] > old["mean_zncc"] + 0.02
-    ):
-        return True, "higher mean_zncc"
-    if not old_good and (new["n_planes"] > 0 or new["textured"] > 0):
-        return True, "replace empty/weak product"
-    return False, "candidate not strictly better"
+# Implemented in facades._is_strictly_better (post–PR #23 hole fix).
+# See "Promote rule" above — clause1/2/3; never textured↑ alone when
+# planes↓ or mean regresses >0.02. Soft floors min_textured=3 / min_mean=0.35 kept.
+def _is_strictly_better(new, old, *, min_textured=3, min_mean_zncc=0.35, zncc_eps=0.02):
+    ...  # src/ps1_hood/reconstruct/facades.py
 
 
 # --- inside extract_facades, AFTER planes list built, BEFORE unlink/write: ---

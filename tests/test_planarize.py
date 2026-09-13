@@ -380,13 +380,56 @@ def test_is_strictly_better_textured_then_zncc() -> None:
         {"textured": 5, "plane_count": 7, "mean_zncc": 0.50}, prev
     )
     assert ok3 is True
-    assert "mean_zncc" in why3
+    assert "clause3" in why3 and "mean_zncc" in why3
 
+    # textured↑ alone with planes↓ / mean regress must NOT promote
     ok4, why4 = _is_strictly_better(
         {"textured": 6, "plane_count": 6, "mean_zncc": 0.30}, prev
     )
-    assert ok4 is True
-    assert "textured" in why4
+    assert ok4 is False
+    assert "fewer planes" in why4 or "mean_zncc" in why4
+
+
+def test_is_strictly_better_quality_keep_no_mean_regress() -> None:
+    """PC hole after PR #23: 6/6/0.377 must not beat live 7/5/0.42."""
+    from ps1_hood.reconstruct.facades import _is_strictly_better
+
+    prev = {"textured": 5, "plane_count": 7, "mean_zncc": 0.42}
+
+    # Incident: more textured but fewer planes + mean regress → False
+    ok_hole, why_hole = _is_strictly_better(
+        {"textured": 6, "plane_count": 6, "mean_zncc": 0.377}, prev
+    )
+    assert ok_hole is False
+    assert "fewer planes" in why_hole
+
+    # more textured, ≥planes, mean within 0.02 → True (clause1)
+    ok1, why1 = _is_strictly_better(
+        {"textured": 6, "plane_count": 8, "mean_zncc": 0.41}, prev
+    )
+    assert ok1 is True
+    assert "clause1" in why1
+
+    # same textured, mean +0.03 → True (clause3)
+    ok3, why3 = _is_strictly_better(
+        {"textured": 5, "plane_count": 7, "mean_zncc": 0.45}, prev
+    )
+    assert ok3 is True
+    assert "clause3" in why3
+
+    # same textured, more planes, mean flat → True (clause2)
+    ok2, why2 = _is_strictly_better(
+        {"textured": 5, "plane_count": 8, "mean_zncc": 0.42}, prev
+    )
+    assert ok2 is True
+    assert "clause2" in why2
+
+    # textured↑ but planes↓ (even with great mean) → False
+    ok_down, why_down = _is_strictly_better(
+        {"textured": 6, "plane_count": 5, "mean_zncc": 0.50}, prev
+    )
+    assert ok_down is False
+    assert "fewer planes" in why_down
 
 
 def test_weaker_fallback_does_not_clobber_better_product(
@@ -924,7 +967,7 @@ def test_union_promote_beats_product() -> None:
         {"textured": 6, "plane_count": 8, "mean_zncc": 0.41}, prev
     )
     assert ok is True
-    assert "textured" in why
+    assert "clause1" in why and "textured" in why
 
 
 def test_union_no_promote_weaker() -> None:
