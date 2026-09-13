@@ -1080,7 +1080,7 @@ def test_hybrid_seeds_scored(
 def test_extract_facades_hybrid_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Path α with hybrid_heading=True calls hypothesize even when MA would keep ≥1."""
+    """Path α hybrid default: dual-arm full A search + MA peels (no A seed inject)."""
     import ps1_hood.reconstruct.photo_planes as pp
     import ps1_hood.reconstruct.planarize as pl
 
@@ -1106,16 +1106,25 @@ def test_extract_facades_hybrid_default(
             }
         )
 
-    called = {"hypothesize": 0, "seed_hyps": None}
-    real_hyp = pp.hypothesize_vertical_planes
+    called = {"search": 0, "seed_hyps": None}
 
-    def _spy_hyp(*args, **kwargs):  # noqa: ANN001
-        called["hypothesize"] += 1
-        return real_hyp(*args, **kwargs)
+    def _search(*args, **kwargs):  # noqa: ANN001
+        called["search"] += 1
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -8.0,
+                "center": np.array([8.0, 20.0, 4.0]),
+                "width_m": 8.0,
+                "height_m": 9.0,
+                "zncc": 0.42,
+                "ok": True,
+                "source": "heading_distance",
+            }
+        ]
 
     def _score(hyps, frames, **kwargs):  # noqa: ANN001
         called["seed_hyps"] = kwargs.get("seed_hyps")
-        # MA keeps 1 — old path would skip A; hybrid must still have seeded.
         return [
             {
                 "n": np.array([1.0, 0.0, 0.0]),
@@ -1130,7 +1139,7 @@ def test_extract_facades_hybrid_default(
             }
         ]
 
-    monkeypatch.setattr(pp, "hypothesize_vertical_planes", _spy_hyp)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _search)
     monkeypatch.setattr(pl, "score_planar_hyps", _score)
 
     dest = tmp_path / "facades.obj"
@@ -1147,10 +1156,10 @@ def test_extract_facades_hybrid_default(
         fallback_heading=False,
         hybrid_heading=True,
     )
-    assert called["hypothesize"] >= 1
-    assert called["seed_hyps"] is not None
-    assert len(called["seed_hyps"]) >= 1
-    assert meta.get("path_alpha") is True
+    assert called["search"] >= 1
+    assert called["seed_hyps"] is None  # dual-arm: no A inject into MA scorer
+    assert meta.get("source") == "mapanything_hybrid"
+    assert int(meta.get("planes") or 0) >= 2
 
 
 def _plane(center_xy, *, zncc=0.5, split=False, d=-8.0):
@@ -1317,6 +1326,8 @@ def test_facades_cli_exposes_peel_knobs() -> None:
         "--nms-xy-split",
         "--union-strategy",
         "--max-planes",
+        "--hybrid-a-full-search",
+        "--no-hybrid-a-full-search",
     ):
         assert flag in help_text
     assert "a_priority" in help_text
@@ -1480,14 +1491,34 @@ def test_extract_facades_forwards_union_strategy(
                 "height_m": 6.0,
                 "zncc": 0.5,
                 "ok": True,
-                "source": "heading_distance",
+                "source": "ma_segment",
                 "count": 100,
             }
         ]
 
+    def _fake_search(*a, **k):  # noqa: ANN001
+        seen["search_called"] = True
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -8.0,
+                "center": np.array([8.0, 40.0, 4.0]),
+                "width_m": 8.0,
+                "height_m": 9.0,
+                "zncc": 0.41,
+                "ok": True,
+                "source": "heading_distance",
+            }
+        ]
+
+    def _fake_union(accepted, **kwargs):  # noqa: ANN001
+        seen["union_kwargs"] = dict(kwargs)
+        return list(accepted)
+
     monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
     monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
-    monkeypatch.setattr(pp, "hypothesize_vertical_planes", lambda *a, **k: [])
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _fake_search)
+    monkeypatch.setattr(pl, "union_keep_planes", _fake_union)
 
     extract_facades(
         ply,
@@ -1501,5 +1532,286 @@ def test_extract_facades_forwards_union_strategy(
         hybrid_heading=True,
         union_strategy="nms",
     )
+    assert seen.get("search_called") is True
+    # MA arm uses internal nms; final union gets the CLI strategy
     assert seen["score_kwargs"]["union_strategy"] == "nms"
+    assert seen["score_kwargs"]["seed_hyps"] is None
     assert seen["score_kwargs"]["max_keep"] == 16
+    assert seen["union_kwargs"]["strategy"] == "nms"
+    assert seen["union_kwargs"]["max_keep"] == 16
+
+
+def test_hybrid_a_arm_calls_full_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dual arm calls search_photo_consistent_planes when hybrid is on."""
+    import logging
+
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(11)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        p = tmp_path / f"da{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": 0.0,
+                "n": float(i),
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"da{i}",
+            }
+        )
+
+    called = {"search": 0, "score_seed": "unset"}
+
+    def _fake_planes(ply_path, cam_c, **kwargs):  # noqa: ANN001
+        return (
+            [
+                {
+                    "n": np.array([1.0, 0.0, 0.0]),
+                    "d": -5.0,
+                    "center": np.array([5.0, 0.0, 3.0]),
+                    "width_m": 8.0,
+                    "height_m": 6.0,
+                    "source": "ma_segment",
+                }
+            ],
+            {"z": 0.0},
+            10,
+        )
+
+    def _fake_search(*a, **k):  # noqa: ANN001
+        called["search"] += 1
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -8.0,
+                "center": np.array([8.0, 20.0, 4.0]),
+                "width_m": 8.0,
+                "height_m": 9.0,
+                "zncc": 0.42,
+                "ok": True,
+                "source": "heading_distance",
+            }
+        ]
+
+    def _fake_score(hyps, frames, **kwargs):  # noqa: ANN001
+        called["score_seed"] = kwargs.get("seed_hyps")
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -5.0,
+                "center": np.array([5.0, 0.0, 3.0]),
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "zncc": 0.50,
+                "ok": True,
+                "source": "ma_segment",
+                "count": 100,
+            }
+        ]
+
+    monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _fake_search)
+    monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
+
+    with caplog.at_level(logging.INFO, logger="ps1_hood.reconstruct.facades"):
+        extract_facades(
+            ply,
+            tmp_path / "facades.obj",
+            frames=frames,
+            n_planes=16,
+            zncc_accept=0.35,
+            planarize=True,
+            keep_previous_on_fail=False,
+            fallback_heading=False,
+            hybrid_heading=True,
+            hybrid_a_full_search=True,
+        )
+    assert called["search"] == 1
+    assert called["score_seed"] is None
+    joined = " ".join(r.message for r in caplog.records)
+    assert "dual_arm" in joined
+    assert "search_photo_consistent_planes" in joined
+
+
+def test_union_a_priority_after_dual_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A accepts from full search survive a_priority when MA overlaps."""
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(13)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        p = tmp_path / f"ua{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": 0.0,
+                "n": float(i),
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"ua{i}",
+            }
+        )
+
+    def _fake_planes(ply_path, cam_c, **kwargs):  # noqa: ANN001
+        return ([], {"z": 0.0}, 0)
+
+    def _fake_search(*a, **k):  # noqa: ANN001
+        # Four well-separated A planes from full search
+        return [
+            _a_plane((8.0, float(i * 20)), zncc=0.40 + i * 0.01)
+            for i in range(4)
+        ]
+
+    def _fake_score(hyps, frames, **kwargs):  # noqa: ANN001
+        assert kwargs.get("seed_hyps") is None
+        # Overlapping MA (higher ZNCC) + one far MA
+        return [
+            _plane((8.0, 1.0), zncc=0.55),  # overlaps A at y=0
+            _plane((8.0, 200.0), zncc=0.45),
+        ]
+
+    monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _fake_search)
+    monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
+
+    # Spy real union to assert telemetry (extract imports from planarize each call)
+    tel_out: dict = {}
+    real_union = pl.union_keep_planes
+
+    def _spy_union(accepted, **kwargs):  # noqa: ANN001
+        result = real_union(accepted, **kwargs)
+        if kwargs.get("telemetry") is not None:
+            tel_out.update(kwargs["telemetry"])
+        return result
+
+    monkeypatch.setattr(pl, "union_keep_planes", _spy_union)
+
+    meta = extract_facades(
+        ply,
+        tmp_path / "facades.obj",
+        frames=frames,
+        n_planes=16,
+        zncc_accept=0.35,
+        planarize=True,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=True,
+        hybrid_a_full_search=True,
+        union_strategy="a_priority",
+    )
+    assert tel_out.get("a_kept") == 4
+    assert tel_out.get("ma_added") == 1
+    assert tel_out.get("union_kept") == 5
+    assert tel_out.get("a_pre_nms") == 4
+    assert meta.get("source") == "mapanything_hybrid"
+    assert int(meta.get("planes") or 0) == 5
+
+
+def test_hybrid_legacy_seeds_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-hybrid-a-full-search restores seed inject into score_planar_hyps."""
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(17)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        p = tmp_path / f"lg{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": float(i * 5),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"lg{i}",
+            }
+        )
+
+    called = {"search": 0, "seed_hyps": None, "hypothesize": 0}
+
+    def _spy_hyp(*a, **k):  # noqa: ANN001
+        called["hypothesize"] += 1
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -8.0,
+                "center": np.array([8.0, 10.0, 4.0]),
+                "width_m": 8.0,
+                "height_m": 9.0,
+                "source": "heading_distance",
+            }
+        ]
+
+    def _fake_search(*a, **k):  # noqa: ANN001
+        called["search"] += 1
+        return []
+
+    def _score(hyps, frames, **kwargs):  # noqa: ANN001
+        called["seed_hyps"] = kwargs.get("seed_hyps")
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -5.0,
+                "center": np.array([5.0, 0.0, 3.0]),
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "zncc": 0.439,
+                "ok": True,
+                "source": "ma_segment",
+                "count": 100,
+            }
+        ]
+
+    monkeypatch.setattr(pp, "hypothesize_vertical_planes", _spy_hyp)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _fake_search)
+    monkeypatch.setattr(pl, "score_planar_hyps", _score)
+
+    extract_facades(
+        ply,
+        tmp_path / "facades.obj",
+        frames=frames,
+        n_planes=8,
+        zncc_accept=0.35,
+        planarize=True,
+        voxel_m=0.15,
+        plane_dist_m=0.10,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=True,
+        hybrid_a_full_search=False,
+    )
+    assert called["search"] == 0  # no dual-arm A search
+    assert called["hypothesize"] >= 1
+    assert called["seed_hyps"] is not None
+    assert len(called["seed_hyps"]) >= 1

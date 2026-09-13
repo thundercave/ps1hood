@@ -570,6 +570,7 @@ def extract_facades(
     nms_xy_m: float | None = None,
     nms_xy_split_m: float | None = None,
     union_strategy: str | None = None,
+    hybrid_a_full_search: bool = True,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -577,10 +578,13 @@ def extract_facades(
     seed vertical planes from MapAnything ENU cloud via Open3D/numpy
     ``segment_plane`` peel, then ZNCC-gate + ortho bake (Milestone A).
 
-    With ``hybrid_heading`` (default on for Path α), Milestone A
-    heading×distance seeds are injected into the same ``score_planar_hyps``
-    pass. Default ``union_strategy='a_priority'`` keeps A accepts first,
-    then adds non-duplicate MA (``nms`` is the old ZNCC-sorted NMS).
+    With ``hybrid_heading`` (default on for Path α) and
+    ``hybrid_a_full_search`` (default on): **dual arm** — A arm runs full
+    Milestone A ``search_photo_consistent_planes`` (ungated historic path);
+    MA arm peels through ``score_planar_hyps`` only (no A seed inject);
+    then ``union_keep_planes`` with default ``a_priority`` keeps A first and
+    adds non-dup MA. Opt out with ``hybrid_a_full_search=False`` to restore
+    the older hypothesize→``score_planar_hyps`` seed-inject path.
     Promote still uses ``_is_strictly_better`` on the union bake metrics.
 
     If hybrid/Path α keeps 0 planes and ``fallback_heading``, retry full
@@ -621,6 +625,7 @@ def extract_facades(
         PLANARIZE_AUTO_MIN_POINTS,
         planes_from_mapanything_ply,
         score_planar_hyps,
+        union_keep_planes,
         write_planes_json,
     )
 
@@ -711,19 +716,6 @@ def extract_facades(
             else float(split_overlap_m)
         )
 
-        seed_hyps: list[dict] = []
-        if hybrid_heading and frames:
-            seed_hyps = hypothesize_vertical_planes(
-                frames,
-                xyz if len(xyz) >= 30 else None,
-                ground_z=ground_z,
-                max_heading_seeds=int(max_heading_seeds),
-            )
-            log.info(
-                "facades Path α hybrid: injecting %s A heading seeds into scorer",
-                len(seed_hyps),
-            )
-
         nms_xy = float(DEFAULT_NMS_XY_M if nms_xy_m is None else nms_xy_m)
         nms_xy_split = float(
             DEFAULT_NMS_XY_SPLIT_M if nms_xy_split_m is None else nms_xy_split_m
@@ -733,19 +725,9 @@ def extract_facades(
             if union_strategy is None
             else str(union_strategy)
         )
-        accepted = score_planar_hyps(
-            hyps,
-            frames,
-            zncc_accept=float(zncc_accept),
-            max_keep=n_planes,
-            seed_hyps=seed_hyps or None,
-            split_trigger_width_m=split_trigger,
-            split_window_m=split_window,
-            split_overlap_m=split_overlap,
-            nms_xy_m=nms_xy,
-            nms_xy_split_m=nms_xy_split,
-            union_strategy=strategy,
-        )
+        dual_arm = bool(hybrid_heading and hybrid_a_full_search and frames)
+        seed_hyps: list[dict] = []
+        union_tel: dict[str, Any] = {}
 
         def _is_ma(src: str | None) -> bool:
             s = (src or "ma_segment").lower()
@@ -757,30 +739,119 @@ def extract_facades(
                 "photo_"
             )
 
-        ma_n = sum(1 for p in accepted if _is_ma(p.get("source")))
-        a_n = sum(1 for p in accepted if _is_a(p.get("source")))
-        if ma_n and a_n:
-            source_tag = "mapanything_hybrid"
-        elif ma_n:
-            source_tag = "mapanything_planarize"
-        elif a_n:
-            source_tag = "mapanything_hybrid" if seed_hyps else "photo_consistency"
+        if dual_arm:
+            # ★ Fix A — Dual arm: full Milestone A search + MA peels only,
+            # then a_priority (or CLI union_strategy) union. Do NOT inject A
+            # seeds into gated score_planar_hyps.
+            accepted_a = search_photo_consistent_planes(
+                frames,
+                xyz if len(xyz) >= 30 else None,
+                zncc_accept=min(float(zncc_accept), 0.35),
+                ground_z=ground_z,
+                max_keep=n_planes,
+            )
+            accepted_ma = score_planar_hyps(
+                hyps,
+                frames,
+                zncc_accept=float(zncc_accept),
+                max_keep=n_planes,
+                seed_hyps=None,
+                split_trigger_width_m=split_trigger,
+                split_window_m=split_window,
+                split_overlap_m=split_overlap,
+                nms_xy_m=nms_xy,
+                nms_xy_split_m=nms_xy_split,
+                union_strategy="nms",  # MA-only NMS; final union below
+            )
+            accepted = union_keep_planes(
+                list(accepted_a) + list(accepted_ma),
+                strategy=strategy,
+                max_keep=n_planes,
+                nms_xy_m=nms_xy,
+                nms_xy_split_m=nms_xy_split,
+                telemetry=union_tel,
+            )
+            a_pre = int(union_tel.get("a_pre_nms") or len(accepted_a))
+            a_n = int(union_tel.get("a_kept") or sum(1 for p in accepted if _is_a(p.get("source"))))
+            ma_added = int(
+                union_tel.get("ma_added")
+                or sum(1 for p in accepted if _is_ma(p.get("source")))
+            )
+            ma_n = ma_added
+            if a_n and ma_n:
+                source_tag = "mapanything_hybrid"
+            elif a_n:
+                source_tag = "mapanything_hybrid"
+            elif ma_n:
+                source_tag = "mapanything_planarize"
+            else:
+                source_tag = "mapanything_planarize"
+            log.info(
+                "facades Path α dual_arm: a_arm=search_photo_consistent_planes "
+                "kept=%s; ma_arm=%s; strategy=%s a_pre_nms=%s a_kept=%s "
+                "ma_added=%s union_kept=%s; ply=%s pts; source=%s; "
+                "promote vs product 7/5/0.42",
+                len(accepted_a),
+                len(accepted_ma),
+                strategy,
+                a_pre,
+                a_n,
+                ma_added,
+                len(accepted),
+                len(xyz_raw),
+                source_tag,
+            )
         else:
-            source_tag = "mapanything_planarize"
+            if hybrid_heading and frames:
+                # Legacy opt-out: inject A seeds into gated score_planar_hyps
+                seed_hyps = hypothesize_vertical_planes(
+                    frames,
+                    xyz if len(xyz) >= 30 else None,
+                    ground_z=ground_z,
+                    max_heading_seeds=int(max_heading_seeds),
+                )
+                log.info(
+                    "facades Path α hybrid (seeds): injecting %s A heading "
+                    "seeds into scorer (--no-hybrid-a-full-search)",
+                    len(seed_hyps),
+                )
+            accepted = score_planar_hyps(
+                hyps,
+                frames,
+                zncc_accept=float(zncc_accept),
+                max_keep=n_planes,
+                seed_hyps=seed_hyps or None,
+                split_trigger_width_m=split_trigger,
+                split_window_m=split_window,
+                split_overlap_m=split_overlap,
+                nms_xy_m=nms_xy,
+                nms_xy_split_m=nms_xy_split,
+                union_strategy=strategy,
+            )
+            ma_n = sum(1 for p in accepted if _is_ma(p.get("source")))
+            a_n = sum(1 for p in accepted if _is_a(p.get("source")))
+            if ma_n and a_n:
+                source_tag = "mapanything_hybrid"
+            elif ma_n:
+                source_tag = "mapanything_planarize"
+            elif a_n:
+                source_tag = "mapanything_hybrid" if seed_hyps else "photo_consistency"
+            else:
+                source_tag = "mapanything_planarize"
+            log.info(
+                "facades Path α: %s segmented + %s A seeds → %s ZNCC-kept "
+                "(ma_kept=%s a_kept=%s; strategy=%s; ply=%s pts; source=%s; "
+                "promote vs product 7/5/0.42)",
+                len(hyps),
+                len(seed_hyps),
+                len(accepted),
+                ma_n,
+                a_n,
+                strategy,
+                len(xyz_raw),
+                source_tag,
+            )
 
-        log.info(
-            "facades Path α: %s segmented + %s A seeds → %s ZNCC-kept "
-            "(ma_kept=%s a_kept=%s; strategy=%s; ply=%s pts; source=%s; "
-            "promote vs product 7/5/0.42)",
-            len(hyps),
-            len(seed_hyps),
-            len(accepted),
-            ma_n,
-            a_n,
-            strategy,
-            len(xyz_raw),
-            source_tag,
-        )
         if not accepted and fallback_heading:
             log.warning(
                 "facades Path α: 0 ZNCC accepts after hybrid — falling back to "

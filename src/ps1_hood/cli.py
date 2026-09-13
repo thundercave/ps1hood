@@ -484,7 +484,13 @@ def export_mapanything_bundle_cmd(
     "--hybrid-heading/--no-hybrid-heading",
     default=True,
     show_default=True,
-    help="Inject Milestone A heading×distance seeds into Path α score_planar_hyps (union promote)",
+    help="Enable Path α hybrid A+MA (default dual-arm full A search + MA peels)",
+)
+@click.option(
+    "--hybrid-a-full-search/--no-hybrid-a-full-search",
+    default=True,
+    show_default=True,
+    help="Hybrid A arm = full search_photo_consistent_planes (on); off = inject seeds into score_planar_hyps",
 )
 @click.option(
     "--split-trigger",
@@ -572,6 +578,7 @@ def facades_cmd(
     keep_previous_on_fail: bool,
     fallback_heading: bool,
     hybrid_heading: bool,
+    hybrid_a_full_search: bool,
     split_trigger_width_m: float,
     split_window_m: float,
     split_overlap_m: float,
@@ -637,6 +644,7 @@ def facades_cmd(
             keep_previous_on_fail=keep_previous_on_fail,
             fallback_heading=fallback_heading,
             hybrid_heading=hybrid_heading,
+            hybrid_a_full_search=hybrid_a_full_search,
             split_trigger_width_m=split_trigger_width_m,
             split_window_m=split_window_m,
             split_overlap_m=split_overlap_m,
