@@ -218,9 +218,11 @@ Flip `n` toward camera before scoring (A already does).
 **Post-FAIL (2026-09-13) — required in `score_planar_hyps`:** port Milestone A
 ±n depth refine (`delta ∈ {±0.5,±1,±2}` m) for `ma_segment` hyps; percentile
 AABB (5–95) + max extent clamp; cam–plane depth gate 4–25 m; on 0 accepts
-auto-fallback to heading×distance and **never clobber** non-empty product
-(`keep_previous_on_fail`, diagnostics → `*.failed`). See
-`docs/path-alpha-zncc-fail-rd.md`.
+auto-fallback to heading×distance and **never clobber** a better product
+(`keep_previous_on_fail`: promote only if strictly better textured/planes/mean_zncc;
+else `*.candidate` + keep product; 0 accepts → `*.failed`). Depth gate uses
+center→cam Euclidean; FAIL-LOUD labels `SENTINEL` when `scored=0`. See
+`docs/path-alpha-zncc-fail-rd.md` and compare §11.
 
 
 **Integration shape:**

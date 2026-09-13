@@ -472,7 +472,7 @@ def export_mapanything_bundle_cmd(
     "--keep-previous-on-fail/--no-keep-previous-on-fail",
     default=True,
     show_default=True,
-    help="On 0 accepts, preserve non-empty facades.obj/mtl/textures/planes.json; write *.failed",
+    help="Preserve product on 0 accepts (*.failed) or when new result is not strictly better (*.candidate)",
 )
 @click.option(
     "--fallback-heading/--no-fallback-heading",
@@ -565,13 +565,24 @@ def facades_cmd(
 
     n_planes_out = int(meta.get("planes") or 0)
     preserved = bool(meta.get("preserved_previous"))
-    status = "ok" if n_planes_out > 0 else ("preserved" if preserved else "FAIL")
+    rejected_weaker = bool(meta.get("rejected_weaker"))
+    if rejected_weaker and preserved:
+        status = "preserved_better"
+    elif n_planes_out > 0:
+        status = "ok"
+    elif preserved:
+        status = "preserved"
+    else:
+        status = "FAIL"
     click.echo(
         f"facades {status}  planes={n_planes_out}  textured={meta.get('textured')}  "
         f"source={meta.get('source')}  mean_zncc={meta.get('mean_zncc')}  "
-        f"preserved_previous={preserved}  ply={ply}"
+        f"preserved_previous={preserved}  "
+        f"candidate_planes={meta.get('candidate_planes')}  "
+        f"reason={meta.get('candidate_reason')}  ply={ply}"
     )
-    if n_planes_out <= 0:
+    # Product intact on quality-keep; only fail-hard when nothing usable remains
+    if n_planes_out <= 0 and not preserved:
         raise SystemExit(1)
 
 
