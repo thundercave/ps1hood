@@ -34,8 +34,10 @@ DEFAULT_AABB_PERCENTILE = (5.0, 95.0)
 DEFAULT_MAX_WIDTH_M = 25.0
 DEFAULT_MAX_HEIGHT_M = 15.0
 DEFAULT_MIN_HEIGHT_M = 2.5
-DEFAULT_MIN_CAM_DEPTH_M = 4.0
-DEFAULT_MAX_CAM_DEPTH_M = 25.0
+DEFAULT_MIN_CAM_DEPTH_M = 2.0
+DEFAULT_MAX_CAM_DEPTH_M = 35.0
+# Hard reject only outside this; signed |n·C+d| alone used to zero scored=0
+# on street-parallel peels (PR#16 4–25). Gate uses center→cam Euclidean.
 DEFAULT_REFINE_DELTAS_M = (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0)
 
 try:
@@ -496,25 +498,33 @@ def score_planar_hyps(
     )
 
     accepted: list[dict[str, Any]] = []
-    best_reject = -1.0
+    best_reject = -1.0  # SENTINEL — not a measured ZNCC until a finite score lands
     n_scored = 0
+    n_finite = 0
+    skip = {"tilt": 0, "xy40": 0, "depth": 0, "views": 0, "load": 0}
 
     for hyp in hyps:
         n = np.asarray(hyp["n"], dtype=np.float64)
         d = float(hyp["d"])
         center = np.asarray(hyp["center"], dtype=np.float64)
         if abs(float(n @ UP)) > 0.20:
+            skip["tilt"] += 1
             continue
         if float(np.linalg.norm(cams[:, :2] - center[:2], axis=1).min()) > 40.0:
+            skip["xy40"] += 1
             continue
-        # Plane depth to nearest camera (signed abs) — drop curb ghosts / far slabs
-        depths = np.abs(cams @ n + d)
-        nearest_depth = float(depths.min())
-        if nearest_depth < min_cam_depth_m or nearest_depth > max_cam_depth_m:
+        # Center→nearest-cam Euclidean (façade-like). Signed |n·C+d| alone can be
+        # tiny for cams beside a long street-parallel peel and zeroed all scores
+        # under the old 4–25 m min-over-cams gate (sentinel best≈-1, scored=0).
+        nearest_eucl = float(np.linalg.norm(cams - center, axis=1).min())
+        nearest_signed = float(np.abs(cams @ n + d).min())
+        if nearest_eucl < min_cam_depth_m or nearest_eucl > max_cam_depth_m:
+            skip["depth"] += 1
             continue
 
         idxs = pp._pick_scoring_views(frames, n, center, max_views=4, min_frontal=0.25)
         if len(idxs) < 2:
+            skip["views"] += 1
             continue
         views = []
         for i in idxs:
@@ -523,6 +533,7 @@ def score_planar_hyps(
                 break
             views.append(v)
         if len(views) < 2:
+            skip["load"] += 1
             continue
 
         w = min(float(hyp["width_m"]), 12.0)
@@ -559,6 +570,7 @@ def score_planar_hyps(
             n_scored += 1
             z = result.get("zncc")
             if isinstance(z, float) and not math.isnan(z):
+                n_finite += 1
                 best_reject = max(best_reject, z)
             if not result.get("ok"):
                 continue
@@ -598,13 +610,24 @@ def score_planar_hyps(
             break
 
     if not kept:
+        sentinel = n_scored == 0 or n_finite == 0
+        tag = "SENTINEL" if sentinel else "measured"
         log.error(
             "planarize: FAIL-LOUD — 0 / %s MA hyps passed ZNCC≥%.2f "
-            "(best rejected≈%.3f; scored=%s). Not inventing RANSAC/OSM walls.",
+            "(best rejected≈%.3f %s; scored=%s finite=%s; "
+            "skips tilt=%s xy40=%s depth=%s views=%s load=%s). "
+            "Not inventing RANSAC/OSM walls.",
             len(hyps),
             zncc_accept,
             best_reject,
+            tag,
             n_scored,
+            n_finite,
+            skip["tilt"],
+            skip["xy40"],
+            skip["depth"],
+            skip["views"],
+            skip["load"],
         )
     else:
         mean_z = float(np.mean([float(p["zncc"]) for p in kept]))

@@ -191,3 +191,21 @@ First PR: smoke-block planarize only (no Instant Meshes / organic remesh). See r
 
 **Do not** treat this as MA ENU gate regression — cloud still product; planarize scoring/peel/write path was the bug.
 
+
+---
+
+## 11) Path α post–PR #16 (2026-09-13) — sentinel −1 + quality-aware keep
+
+**PC retry after PR #16:** still **0 ZNCC accepts**, best≈**−1**; Milestone A fallback wrote **2** planes @ **0.377** and **clobbered** better **7**-plane / 5-textured / ZNCC **0.42** product (only in `.bak`).
+
+| Issue | Call |
+|-------|------|
+| best≈−1 | Usually **SENTINEL** (`best_reject` init), not anti-corr — confirm with `scored=N` / `finite=` / skip histogram. PR #16 signed-depth gate 4–25 m could skip all hyps pre-score (`scored=0`). |
+| Product | `keep_previous_on_fail` only when `not planes` → fallback with ≥1 plane always overwrote. |
+
+**This PR (preserve-quality + score telemetry):**
+1. **Promote only if strictly better** (more textured, else more planes, else higher mean_zncc+eps); else write `facades.candidate.*` / `planes.candidate.json` and **keep product**. 2-plane fallback cannot clobber 7-plane.
+2. Depth gate → **center→cam Euclidean** (defaults 2–35 m); FAIL-LOUD prints `SENTINEL` when `scored=0` or no finite z, plus skip counts (`tilt/xy40/depth/views/load`).
+
+**R&D:** `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` (also fold into `docs/path-alpha-zncc-fail-rd.md`). Path α real ZNCC / warp sign remains follow-up if greps show finite anti-corr.
+

@@ -332,3 +332,20 @@ Can squash 2–4 if small; **guard must land first** before more PC planarize ru
 ---
 
 *End of pack. Pointer from path-forward §10.*
+
+---
+
+## Post–PR #16 addendum — sentinel −1 + quality-aware promote
+
+See `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` and **compare-and-pathforward §11**.
+
+**Product rule:** promote new façades **only if strictly better** than existing
+(textured count → plane count → mean_zncc + 0.02). Else write
+`facades.candidate.*` / `planes.candidate.json` and keep live product.
+Fallback with 2 planes @ 0.377 must **not** overwrite 7-plane / ZNCC 0.42.
+
+**Score telemetry:** `best_reject = -1.0` is a **SENTINEL** until a finite ZNCC
+is recorded. FAIL-LOUD must include `scored=` / `finite=` / skip histogram and
+label `SENTINEL` when no finite score. Cam-depth gate uses **center→nearest-cam
+Euclidean** (not min `|n·C+d|` alone), defaults 2–35 m.
+

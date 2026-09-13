@@ -342,6 +342,183 @@ def _facade_product_looks_nonempty(dest_obj: Path) -> bool:
     return False
 
 
+def _read_facade_quality(dest_obj: Path) -> dict[str, Any] | None:
+    """Quality tuple from existing product: textured count, mean_zncc, plane_count."""
+    import json
+
+    dest_obj = Path(dest_obj)
+    planes_json = dest_obj.parent / "planes.json"
+    tex_dir = dest_obj.parent / "textures"
+    file_tex = (
+        len(list(tex_dir.glob("facade_*.jpg")))
+        if tex_dir.is_dir()
+        else 0
+    )
+    if not planes_json.is_file():
+        if file_tex <= 0 and not _facade_product_looks_nonempty(dest_obj):
+            return None
+        return {
+            "textured": int(file_tex),
+            "mean_zncc": None,
+            "plane_count": int(file_tex),
+        }
+    try:
+        payload = json.loads(planes_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        if file_tex <= 0:
+            return None
+        return {
+            "textured": int(file_tex),
+            "mean_zncc": None,
+            "plane_count": int(file_tex),
+        }
+    if not isinstance(payload, dict):
+        return None
+    planes = payload.get("planes") or []
+    if not isinstance(planes, list):
+        planes = []
+    textured = sum(1 for p in planes if isinstance(p, dict) and p.get("texture"))
+    if textured <= 0:
+        textured = int(file_tex)
+    gates = payload.get("gates") if isinstance(payload.get("gates"), dict) else {}
+    mean_zncc = gates.get("mean_zncc")
+    if mean_zncc is None:
+        znccs = [
+            float(p["zncc"])
+            for p in planes
+            if isinstance(p, dict) and p.get("zncc") is not None
+        ]
+        mean_zncc = float(np.mean(znccs)) if znccs else None
+    else:
+        mean_zncc = float(mean_zncc)
+    if len(planes) <= 0 and textured <= 0 and not _facade_product_looks_nonempty(dest_obj):
+        return None
+    return {
+        "textured": int(textured),
+        "mean_zncc": mean_zncc,
+        "plane_count": int(len(planes)),
+    }
+
+
+def _is_strictly_better(
+    new_q: dict[str, Any],
+    prev_q: dict[str, Any],
+    *,
+    min_textured: int = 3,
+    min_mean_zncc: float = 0.35,
+    zncc_eps: float = 0.02,
+) -> tuple[bool, str]:
+    """Promote only if new is strictly better than existing product.
+
+    Order: more textured → more planes (same textured) → higher mean_zncc
+    (same textured+planes, by > eps). Never demote a product that already
+    meets soft floors (textured≥min or mean_zncc≥min).
+    """
+    nt = int(new_q.get("textured") or 0)
+    pt = int(prev_q.get("textured") or 0)
+    np_ = int(new_q.get("plane_count") or new_q.get("n_planes") or 0)
+    pp_ = int(prev_q.get("plane_count") or prev_q.get("n_planes") or 0)
+    nm = new_q.get("mean_zncc")
+    pm = prev_q.get("mean_zncc")
+
+    if pp_ <= 0 and pt <= 0:
+        return True, "no existing product"
+
+    old_good = pt >= min_textured or (
+        pm is not None and float(pm) >= float(min_mean_zncc)
+    )
+    if old_good:
+        if nt < pt:
+            return False, f"fewer textured ({nt}<{pt})"
+        if nt == pt and np_ < pp_:
+            return False, f"fewer planes ({np_}<{pp_})"
+        if (
+            nt == pt
+            and np_ == pp_
+            and pm is not None
+            and (nm is None or float(nm) <= float(pm) + float(zncc_eps))
+        ):
+            return False, (
+                f"not higher mean_zncc ({nm} vs {pm})"
+            )
+
+    if nt > pt:
+        return True, "more textured walls"
+    if nt == pt and np_ > pp_:
+        return True, "more planes"
+    if (
+        nt == pt
+        and np_ == pp_
+        and nm is not None
+        and pm is not None
+        and float(nm) > float(pm) + float(zncc_eps)
+    ):
+        return True, "higher mean_zncc"
+    if not old_good and (np_ > 0 or nt > 0):
+        return True, "replace empty/weak product"
+    return False, "candidate not strictly better"
+
+
+def _rewrite_texture_prefix(text: str, old: str, new: str) -> str:
+    return text.replace(old, new)
+
+
+def _promote_candidate_facades(
+    dest_obj: Path,
+    *,
+    cand_obj: Path,
+    cand_mtl: Path,
+    cand_json: Path,
+    cand_tex_dir: Path,
+) -> None:
+    """Move candidate product into primary façades.obj / planes.json / textures/."""
+    import json
+    import shutil
+
+    dest_obj = Path(dest_obj)
+    parent = dest_obj.parent
+    tex_dir = parent / "textures"
+    mtl_path = dest_obj.with_suffix(".mtl")
+    planes_json = parent / "planes.json"
+    tex_dir.mkdir(parents=True, exist_ok=True)
+
+    for old_tex in tex_dir.glob("facade_*.jpg"):
+        old_tex.unlink(missing_ok=True)
+
+    if cand_tex_dir.is_dir():
+        for src in sorted(cand_tex_dir.glob("facade_*.jpg")):
+            shutil.copy2(src, tex_dir / src.name)
+        shutil.rmtree(cand_tex_dir, ignore_errors=True)
+
+    old_prefix = "textures/candidate/"
+    new_prefix = "textures/"
+    if cand_mtl.is_file():
+        mtl_path.write_text(
+            _rewrite_texture_prefix(
+                cand_mtl.read_text(encoding="ascii", errors="ignore"),
+                old_prefix,
+                new_prefix,
+            ),
+            encoding="ascii",
+        )
+        cand_mtl.unlink(missing_ok=True)
+    if cand_obj.is_file():
+        body = cand_obj.read_text(encoding="ascii", errors="ignore")
+        body = _rewrite_texture_prefix(body, old_prefix, new_prefix)
+        # mtllib may point at candidate mtl name
+        body = body.replace(cand_mtl.name, mtl_path.name)
+        body = body.replace(dest_obj.stem + ".candidate.mtl", mtl_path.name)
+        dest_obj.write_text(body, encoding="ascii")
+        cand_obj.unlink(missing_ok=True)
+    if cand_json.is_file():
+        payload = json.loads(cand_json.read_text(encoding="utf-8"))
+        for pl in payload.get("planes") or []:
+            if isinstance(pl, dict) and isinstance(pl.get("texture"), str):
+                pl["texture"] = pl["texture"].replace(old_prefix, new_prefix)
+        planes_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        cand_json.unlink(missing_ok=True)
+
+
 def extract_facades(
     ply_path: Path | None,
     dest_obj: Path,
@@ -371,6 +548,12 @@ def extract_facades(
     ``keep_previous_on_fail`` (default), do **not** clobber non-empty product
     ``facades.obj`` / ``.mtl`` / ``textures/facade_*.jpg`` / ``planes.json`` —
     write diagnostics to ``*.failed`` instead.
+
+    Quality gate: with ``keep_previous_on_fail``, **promote only if strictly
+    better** than the existing product (more textured walls, or same textured
+    with more planes / higher ``mean_zncc``). Weaker or equal results —
+    including Milestone A fallback after Path α 0 accepts — go to
+    ``*.candidate`` and the live product is kept.
     """
     import logging
 
@@ -563,13 +746,40 @@ def extract_facades(
             "failed_planes_json": str(failed_json),
         }
 
-    # Success (or explicit wipe-on-fail): replace product artifacts
-    tex_dir.mkdir(parents=True, exist_ok=True)
-    if tex_dir.is_dir():
-        for old_tex in tex_dir.glob("facade_*.jpg"):
+    # Success path — optionally stage to *.candidate when a better product exists
+    prev_q = (
+        _read_facade_quality(dest_obj)
+        if keep_previous_on_fail and _facade_product_looks_nonempty(dest_obj)
+        else None
+    )
+    stage_candidate = bool(prev_q is not None and planes)
+
+    if stage_candidate:
+        out_obj = dest_obj.with_name(dest_obj.stem + ".candidate.obj")
+        out_mtl = dest_obj.with_name(dest_obj.stem + ".candidate.mtl")
+        out_json = dest_obj.parent / "planes.candidate.json"
+        bake_tex_dir = tex_dir / "candidate"
+        tex_map_prefix = "textures/candidate"
+    else:
+        out_obj = dest_obj
+        out_mtl = mtl_path
+        out_json = planes_json
+        bake_tex_dir = tex_dir
+        tex_map_prefix = "textures"
+        # Wipe-on-write only when replacing the live product
+        tex_dir.mkdir(parents=True, exist_ok=True)
+        if tex_dir.is_dir():
+            for old_tex in tex_dir.glob("facade_*.jpg"):
+                old_tex.unlink(missing_ok=True)
+
+    bake_tex_dir.mkdir(parents=True, exist_ok=True)
+    if stage_candidate:
+        for old_tex in bake_tex_dir.glob("facade_*.jpg"):
             old_tex.unlink(missing_ok=True)
 
     materials: list[dict[str, Any]] = []
+    # Ground sat texture always lives at textures/ground.jpg (shared)
+    tex_dir.mkdir(parents=True, exist_ok=True)
     ground_tex = tex_dir / "ground.jpg"
     has_ground_tex = _ground_satellite_texture(
         extent_xyz, ground_tex, satellite, local_frame
@@ -590,9 +800,9 @@ def extract_facades(
         if frames:
             cam = _pick_frontal_camera(pl, quad, frames)
             if cam is not None:
-                tex_path = tex_dir / f"facade_{i:02d}.jpg"
+                tex_path = bake_tex_dir / f"facade_{i:02d}.jpg"
                 if _warp_facade_texture(quad, cam, tex_path):
-                    map_rel = f"textures/facade_{i:02d}.jpg"
+                    map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
                     textured += 1
         materials.append(
             {
@@ -611,9 +821,6 @@ def extract_facades(
             source_tag,
         )
 
-    _write_mtl(mtl_path, materials)
-    _write_obj(dest_obj, planes, extent_xyz, materials, mtl_path.name)
-
     for i, pl in enumerate(planes):
         if accepted and i < len(accepted):
             pl["width_m"] = float(accepted[i].get("width_m") or 0.0)
@@ -623,9 +830,12 @@ def extract_facades(
             if "n" not in pl and "nx" in pl:
                 pl["n"] = np.array([pl["nx"], pl["ny"], 0.0], dtype=np.float64)
 
+    _write_mtl(out_mtl, materials)
+    _write_obj(out_obj, planes, extent_xyz, materials, out_mtl.name)
+
     tex_maps = [m.get("map") for m in materials[1:]]
     write_planes_json(
-        planes_json,
+        out_json,
         planes=planes,
         ground_z=ground_z,
         residual_points=residual_pts,
@@ -638,6 +848,85 @@ def extract_facades(
         if any(p.get("zncc") is not None for p in planes)
         else None
     )
+    new_q = {
+        "textured": int(textured),
+        "mean_zncc": mean_zncc,
+        "plane_count": int(len(planes)),
+    }
+
+    if stage_candidate and prev_q is not None:
+        ok_promote, why = _is_strictly_better(new_q, prev_q)
+        if not ok_promote:
+            log.error(
+                "facades: candidate NOT promoted — %s "
+                "(new textured=%s planes=%s mean_zncc=%s source=%s vs "
+                "prev textured=%s planes=%s mean_zncc=%s) — "
+                "kept previous %s / textures / planes.json; candidate → %s / %s. "
+                "Not inventing RANSAC/OSM blocks.",
+                why,
+                new_q["textured"],
+                new_q["plane_count"],
+                new_q["mean_zncc"],
+                source_tag,
+                prev_q.get("textured"),
+                prev_q.get("plane_count"),
+                prev_q.get("mean_zncc"),
+                dest_obj.name,
+                out_obj.name,
+                out_json.name,
+            )
+            return {
+                "path": str(dest_obj),
+                "mtl": str(mtl_path),
+                "planes_json": str(planes_json),
+                # Report *product* plane count so CLI/Studio see the kept result
+                "planes": int(prev_q.get("plane_count") or 0),
+                "textured": int(prev_q.get("textured") or 0),
+                "ground_textured": has_ground_tex
+                or bool((tex_dir / "ground.jpg").is_file()),
+                "source": source_tag,
+                "planarize": bool(
+                    path_alpha_attempted and source_tag == "mapanything_planarize"
+                ),
+                "zncc_accept": float(zncc_accept),
+                "ground_z": ground_z,
+                "points_used": int(len(xyz_raw) if len(xyz_raw) else len(xyz)),
+                "points_voxel": int(len(xyz)),
+                "residual_points": int(residual_pts),
+                "mean_zncc": prev_q.get("mean_zncc"),
+                "path_alpha": source_tag == "mapanything_planarize",
+                "preserved_previous": True,
+                "rejected_weaker": True,
+                "candidate_reason": why,
+                "candidate_planes": int(len(planes)),
+                "candidate_textured": int(textured),
+                "candidate_mean_zncc": mean_zncc,
+                "ok": False,
+                "candidate_obj": str(out_obj),
+                "candidate_planes_json": str(out_json),
+                "previous_textured": int(prev_q.get("textured") or 0),
+                "previous_mean_zncc": prev_q.get("mean_zncc"),
+            }
+
+    if stage_candidate:
+        _promote_candidate_facades(
+            dest_obj,
+            cand_obj=out_obj,
+            cand_mtl=out_mtl,
+            cand_json=out_json,
+            cand_tex_dir=bake_tex_dir,
+        )
+        # Product maps are now under textures/facade_*.jpg
+        mean_zncc = (
+            float(
+                np.mean(
+                    [p.get("zncc", 0.0) for p in planes if p.get("zncc") is not None]
+                )
+            )
+            if any(p.get("zncc") is not None for p in planes)
+            else None
+        )
+
     return {
         "path": str(dest_obj),
         "mtl": str(mtl_path),
@@ -657,6 +946,7 @@ def extract_facades(
         "mean_zncc": mean_zncc,
         "path_alpha": source_tag == "mapanything_planarize",
         "preserved_previous": False,
+        "rejected_weaker": False,
         "ok": len(planes) > 0,
     }
 

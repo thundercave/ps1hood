@@ -352,3 +352,219 @@ def test_inliers_to_quad_percentile_clamps_wide_slab() -> None:
     assert q["width_m"] <= DEFAULT_MAX_WIDTH_M + 1e-6
     assert q["height_m"] >= 2.0
 
+
+
+def test_is_strictly_better_textured_then_zncc() -> None:
+    from ps1_hood.reconstruct.facades import _is_strictly_better
+
+    prev = {"textured": 5, "plane_count": 7, "mean_zncc": 0.42}
+    # 2-plane fallback must not beat 7-plane / 5-textured product
+    ok, why = _is_strictly_better(
+        {"textured": 2, "plane_count": 2, "mean_zncc": 0.377}, prev
+    )
+    assert ok is False
+    assert "textured" in why
+
+    # equal textured+planes needs higher mean_zncc
+    ok2, _ = _is_strictly_better(
+        {"textured": 5, "plane_count": 7, "mean_zncc": 0.42}, prev
+    )
+    assert ok2 is False
+
+    ok3, why3 = _is_strictly_better(
+        {"textured": 5, "plane_count": 7, "mean_zncc": 0.50}, prev
+    )
+    assert ok3 is True
+    assert "mean_zncc" in why3
+
+    ok4, why4 = _is_strictly_better(
+        {"textured": 6, "plane_count": 6, "mean_zncc": 0.30}, prev
+    )
+    assert ok4 is True
+    assert "textured" in why4
+
+
+def test_weaker_fallback_does_not_clobber_better_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2-plane fallback @ low ZNCC must keep 7-plane product; write *.candidate."""
+    import json
+
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    dest = tmp_path / "facades.obj"
+    mtl = tmp_path / "facades.mtl"
+    planes_json = tmp_path / "planes.json"
+    tex_dir = tmp_path / "textures"
+    tex_dir.mkdir()
+
+    prior_planes = []
+    for i in range(7):
+        prior_planes.append(
+            {
+                "id": f"facade_{i:02d}",
+                "n": [1.0, 0.0, 0.0],
+                "d": -5.0,
+                "zncc": 0.42,
+                "texture": f"textures/facade_{i:02d}.jpg" if i < 5 else None,
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "inliers": 100,
+                "source": "photo_consistency",
+            }
+        )
+    planes_json.write_text(
+        json.dumps(
+            {
+                "frame": "ENU",
+                "source": "photo_consistency",
+                "ground_z": 0.0,
+                "planes": prior_planes,
+                "residual_points": 0,
+                "gates": {"mean_zncc": 0.42, "plane_count": 7},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    for i in range(5):
+        cv2.imwrite(
+            str(tex_dir / f"facade_{i:02d}.jpg"),
+            np.full((32, 32, 3), 40 + i, dtype=np.uint8),
+        )
+    dest.write_text(
+        "\n".join(
+            ["# prior good", "mtllib facades.mtl"]
+            + [f"v {i} 0 0" for i in range(16)]
+            + ["usemtl ground", "f 1 2 3 4"]
+            + [
+                f"usemtl facade_{i:02d}\nf {i * 4 + 1} {i * 4 + 2} {i * 4 + 3} {i * 4 + 4}"
+                for i in range(3)
+            ]
+            + ["# pad"] * 40
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    mtl.write_text("newmtl facade_00\nKd 0.5 0.5 0.5\n", encoding="ascii")
+    prior_obj = dest.read_bytes()
+    prior_json = planes_json.read_text(encoding="utf-8")
+    prior_tex = (tex_dir / "facade_00.jpg").read_bytes()
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+
+    frames = []
+    rng = np.random.default_rng(11)
+    for i in range(2):
+        img = rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)
+        p = tmp_path / f"w{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": float(i * 4),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"w{i}",
+            }
+        )
+
+    def _zero_alpha(hyps, frames, **kwargs):  # noqa: ANN001
+        return []
+
+    def _weak_fallback(frames, xyz=None, **kwargs):  # noqa: ANN001
+        out = []
+        for dxy in (5.0, 8.0):
+            out.append(
+                {
+                    "n": np.array([1.0, 0.0, 0.0]),
+                    "d": -dxy,
+                    "center": np.array([dxy, 0.0, 3.0]),
+                    "width_m": 6.0,
+                    "height_m": 5.0,
+                    "zncc": 0.377,
+                    "ok": True,
+                    "source": "heading_distance",
+                    "count": 50,
+                }
+            )
+        return out
+
+    monkeypatch.setattr(pl, "score_planar_hyps", _zero_alpha)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _weak_fallback)
+
+    meta = extract_facades(
+        ply,
+        dest,
+        frames=frames,
+        n_planes=8,
+        zncc_accept=0.40,
+        planarize=True,
+        voxel_m=0.15,
+        plane_dist_m=0.10,
+        keep_previous_on_fail=True,
+        fallback_heading=True,
+    )
+
+    assert meta.get("preserved_previous") is True
+    assert meta.get("rejected_weaker") is True
+    assert meta.get("candidate_planes") == 2
+    assert dest.read_bytes() == prior_obj
+    assert planes_json.read_text(encoding="utf-8") == prior_json
+    assert (tex_dir / "facade_00.jpg").read_bytes() == prior_tex
+    assert (tmp_path / "planes.candidate.json").is_file()
+    assert (tmp_path / "facades.candidate.obj").is_file()
+    assert len(list(tex_dir.glob("facade_*.jpg"))) == 5
+
+
+def test_score_planar_hyps_fail_loud_marks_sentinel(caplog: pytest.LogCaptureFixture) -> None:
+    """When every hyp is skipped pre-score, FAIL-LOUD must say SENTINEL + scored=0."""
+    import logging
+
+    from ps1_hood.reconstruct.planarize import score_planar_hyps
+
+    # Hyp far away → xy40 or depth skip; no frames that can score
+    hyps = [
+        {
+            "n": np.array([1.0, 0.0, 0.0]),
+            "d": -200.0,
+            "center": np.array([200.0, 0.0, 3.0]),
+            "width_m": 8.0,
+            "height_m": 6.0,
+            "source": "ma_segment",
+        }
+    ]
+    frames = [
+        {
+            "path": "/nonexistent.jpg",
+            "e": 0.0,
+            "n": 0.0,
+            "u": 2.0,
+            "heading": 0.0,
+            "pitch": 0.0,
+            "fov": 90.0,
+            "pano_id": "a",
+        },
+        {
+            "path": "/nonexistent2.jpg",
+            "e": 5.0,
+            "n": 0.0,
+            "u": 2.0,
+            "heading": 0.0,
+            "pitch": 0.0,
+            "fov": 90.0,
+            "pano_id": "b",
+        },
+    ]
+    with caplog.at_level(logging.ERROR, logger="ps1_hood.reconstruct.planarize"):
+        kept = score_planar_hyps(hyps, frames, zncc_accept=0.40)
+    assert kept == []
+    joined = " ".join(r.message for r in caplog.records)
+    assert "SENTINEL" in joined
+    assert "scored=0" in joined
