@@ -4,9 +4,9 @@
 PC recipe after sat align (no densify re-run):
 
   uv run ps1hood align smoke-dense --align-prior sat
-  # stage_align already seats + clips when prior poses exist; or:
+  # stage_align seats (cloud clip is opt-in: --cloud-clip-sat); or:
   uv run python scripts/apply_georef.py smoke-dense --clip-sat-bbox
-  # Studio hard-reload; BAG off; cams+façades on sat streets; MA inside Ortho
+  # Studio hard-reload; BAG off; cams+façades on sat streets; prefer unclipped MA
 """
 
 from __future__ import annotations

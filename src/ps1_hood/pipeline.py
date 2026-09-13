@@ -273,7 +273,8 @@ def stage_align(
 
     Default ``align_prior=sat``: Ortho edge+NCC fuse + feature SE(2) bundle;
     **never** ``snap_camera_to_bag``; skip footprint push that fights sat.
-    After seat, optionally clip MA cloud to Ortho ENU ± margin.
+    Cloud clip is **opt-in** (``cloud_clip_sat=False`` by default): prefer the
+    unclipped product cloud; use ``--cloud-clip-sat`` only as a floater tool.
     Writes ``align/georef.json`` and seats existing recon artefacts with one SE(2).
     ``align_prior=bag`` keeps legacy BAG-first behaviour for debug.
     """
@@ -288,7 +289,7 @@ def stage_align(
     w_edge = float(0.65 if sat_edge_weight is None else sat_edge_weight)
     w_edge = min(1.0, max(0.0, w_edge))
     w_ncc = 1.0 - w_edge
-    do_clip = True if cloud_clip_sat is None else bool(cloud_clip_sat)
+    do_clip = False if cloud_clip_sat is None else bool(cloud_clip_sat)
     clip_margin = float(2.0 if sat_cloud_margin_m is None else sat_cloud_margin_m)
 
     shots = project.read_json(project.cropped_dir / "shots.json")
@@ -450,7 +451,7 @@ def stage_align(
         if stats:
             log.info("applied T_sat to recon artefacts (no prior poses): %s", stats)
 
-    # Floater gate: drop MA pts outside Ortho ENU ± margin (façades untouched)
+    # Opt-in floater gate: drop MA pts outside Ortho ENU ± margin (façades untouched)
     if prior == "sat" and do_clip and (project.recon_dir / "cloud.ply").is_file():
         clip_stats = clip_recon_clouds_to_ortho(
             project.recon_dir,
