@@ -83,6 +83,7 @@ class ProjectSpec:
     recon_backend: str = "flow"
     recon_matcher: str = "sift"
     max_panos: int | None = None
+    align_prior: str = "sat"  # sat = Ortho absolute XY (default); bag = legacy BAG snap
 
     def to_dict(self) -> dict:
         out = {
@@ -99,6 +100,7 @@ class ProjectSpec:
             "interp_backend": self.interp_backend,
             "recon_backend": self.recon_backend,
             "recon_matcher": self.recon_matcher,
+            "align_prior": self.align_prior,
         }
         if self.max_panos is not None:
             out["max_panos"] = int(self.max_panos)
@@ -123,4 +125,5 @@ class ProjectSpec:
             recon_backend=str(data.get("recon_backend", "flow")),
             recon_matcher=str(data.get("recon_matcher", "sift")),
             max_panos=int(max_raw) if max_raw is not None else None,
+            align_prior=str(data.get("align_prior", "sat")),
         )

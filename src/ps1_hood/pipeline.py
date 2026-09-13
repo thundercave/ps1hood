@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from ps1_hood.align.bag_edges import snap_camera_to_bag
+from ps1_hood.align.georef import (
+    ALIGN_PRIORS,
+    fit_se2,
+    georef_payload,
+    refresh_scene_cameras,
+    seat_recon_artefacts,
+    summarize_se2,
+)
 from ps1_hood.align.pose_graph import (
     explode_orbit_cameras,
     initial_poses,
@@ -251,8 +259,27 @@ def stage_bag(project: Project, progress: Progress | None = None) -> list:
     return buildings
 
 
-def stage_align(project: Project, progress: Progress | None = None) -> list:
+def stage_align(
+    project: Project,
+    progress: Progress | None = None,
+    *,
+    align_prior: str | None = None,
+) -> list:
+    """GPS/OSM prior → sat or BAG absolute seat.
+
+    Default ``align_prior=sat``: Ortho NCC + feature SE(2) bundle; **never**
+    ``snap_camera_to_bag``; skip footprint push that fights sat. Writes
+    ``align/georef.json`` and seats existing recon artefacts with one SE(2).
+    ``align_prior=bag`` keeps legacy BAG-first behaviour for debug.
+    """
     spec = project.load_spec()
+    prior = (align_prior or getattr(spec, "align_prior", None) or "sat").strip().lower()
+    if prior not in ALIGN_PRIORS:
+        raise ValueError(f"align_prior must be one of {ALIGN_PRIORS}, got {prior!r}")
+    if align_prior is not None and getattr(spec, "align_prior", None) != prior:
+        spec.align_prior = prior
+        project.save_spec(spec)
+
     shots = project.read_json(project.cropped_dir / "shots.json")
     shots, dropped = _shots_in_bbox(shots, spec.bbox)
     if dropped:
@@ -262,24 +289,48 @@ def stage_align(project: Project, progress: Progress | None = None) -> list:
     sat = project.read_json(project.satellite_dir / "ortho.json")
     frame = LocalFrame.from_bbox(spec.bbox)
     ortho = Ortho.load(sat, frame)
-    buildings = project.read_json(project.bag_dir / "buildings.json") if (project.bag_dir / "buildings.json").is_file() else []
+    buildings = (
+        project.read_json(project.bag_dir / "buildings.json")
+        if (project.bag_dir / "buildings.json").is_file()
+        else []
+    )
     footprints = building_footprints(buildings) if buildings else []
     shots_by: dict[str, list[dict[str, Any]]] = {}
     for shot in shots:
         shots_by.setdefault(shot["pano_id"], []).append(shot)
-    _emit(progress, "align", "GPS prior, street constraint, then 3DBAG façade snap")
+
+    old_poses = None
+    poses_path = project.align_dir / "poses.json"
+    if poses_path.is_file():
+        try:
+            old_poses = project.read_json(poses_path)
+        except Exception:  # noqa: BLE001
+            old_poses = None
+
+    if prior == "sat":
+        _emit(progress, "align", "sat prior: Ortho NCC + feature SE(2); BAG snap off")
+        use_satellite = True
+        use_features = True
+    else:
+        _emit(progress, "align", "bag prior: GPS/OSM then 3DBAG façade snap (debug)")
+        use_satellite = not buildings
+        use_features = not bool(buildings)
+
     poses = initial_poses(shots, spec, frame, osm)
+    poses_before = [dict(p) for p in poses]
     poses = refine_poses(
         poses,
         spec,
         frame,
         ortho,
-        use_satellite=not buildings,
-        # similar street photos match each other and collapse XY
-        use_features=not bool(buildings),
+        use_satellite=use_satellite,
+        use_features=use_features,
     )
-    for pose in poses:
-        pose["e"], pose["n"] = push_out_of_footprints(pose["e"], pose["n"], footprints)
+
+    if prior == "bag":
+        for pose in poses:
+            pose["e"], pose["n"] = push_out_of_footprints(pose["e"], pose["n"], footprints)
+
     for i, pose in enumerate(poses):
         photo = None
         look_h, _wall_d = look_at_nearest_wall(pose["e"], pose["n"], footprints)
@@ -293,7 +344,8 @@ def stage_align(project: Project, progress: Progress | None = None) -> list:
             photo = cv2.imread(photo_path, cv2.IMREAD_COLOR)
         except Exception:
             photo = None
-        if photo is not None and buildings:
+        # BAG snap only under bag prior (sacred: sat ortho = absolute XY)
+        if prior == "bag" and photo is not None and buildings:
             hit = snap_camera_to_bag(
                 photo,
                 buildings,
@@ -322,36 +374,75 @@ def stage_align(project: Project, progress: Progress | None = None) -> list:
         _emit(
             progress,
             "align",
-            f"snap {i + 1}/{len(poses)}  residual={pose.get('residual_m')} m",
+            f"{'snap' if prior == 'bag' else 'seat'} {i + 1}/{len(poses)}  residual={pose.get('residual_m')} m",
             aligned=i + 1,
             queued=len(poses),
         )
         _write_live(project, frame, buildings, live_cams)
+
     n_spread = uncollapse_along_gps(poses)
     if n_spread:
         log.info("restored GPS spacing for %s collapsed pano pairs", n_spread)
         _emit(progress, "align", f"spread {n_spread} stacked panos back along the street")
     for pose in poses:
-        pose["e"], pose["n"] = push_out_of_footprints(pose["e"], pose["n"], footprints)
+        if prior == "bag":
+            pose["e"], pose["n"] = push_out_of_footprints(pose["e"], pose["n"], footprints)
         lat, lon, _ = frame.to_geodetic(pose["e"], pose["n"], 0.0)
         pose["lat"] = lat
         pose["lon"] = lon
 
+    T_sat = summarize_se2(poses_before, poses)
+    scores = [float(p["sat_score"]) for p in poses if p.get("sat_score") is not None]
+    sat_mean = sum(scores) / len(scores) if scores else None
+    snapped_n = sum(1 for p in poses if p.get("bag_snapped"))
+    georef = georef_payload(
+        prior=prior,
+        T_sat=T_sat,
+        sat_score_mean=sat_mean,
+        bag_snapped=snapped_n,
+        n_poses=len(poses),
+    )
+
+    # Seat existing product artefacts with one SE(2) (old poses → new) so Studio
+    # agrees without a full densify re-run.
+    if prior == "sat" and old_poses and len(old_poses) == len(poses):
+        T_applied = fit_se2(old_poses, poses)
+        stats = seat_recon_artefacts(project.recon_dir, T_applied)
+        georef["T_applied"] = {
+            "tx_m": T_applied["tx_m"],
+            "ty_m": T_applied["ty_m"],
+            "yaw_deg": T_applied["yaw_deg"],
+            "s": T_applied.get("s", 1.0),
+            "pivot_e": T_applied.get("pivot_e"),
+            "pivot_n": T_applied.get("pivot_n"),
+        }
+        georef["artefacts_seated"] = stats
+        if stats:
+            log.info("applied product SE(2) to recon artefacts: %s", stats)
+            _emit(progress, "align", f"seated recon artefacts with T_applied {stats}")
+    elif prior == "sat" and (project.recon_dir / "cloud.ply").is_file():
+        # No prior poses.json — apply this-run T_sat (init→sat) as best effort.
+        stats = seat_recon_artefacts(project.recon_dir, T_sat)
+        georef["artefacts_seated"] = stats
+        if stats:
+            log.info("applied T_sat to recon artefacts (no prior poses): %s", stats)
+
     cameras = explode_orbit_cameras(poses, shots)
     project.write_json(project.align_dir / "poses.json", poses)
     project.write_json(project.align_dir / "cameras.json", cameras)
+    project.write_json(project.align_dir / "georef.json", georef)
     write_debug_overlay(poses, ortho, project.align_dir / "overlay.jpg")
+    refresh_scene_cameras(project.recon_dir / "scene.json", poses, georef)
     live_cams = []
     for pose in poses:
         live_cams.extend(horizon_cardinals(pose, shots_by.get(pose["pano_id"]) or []))
     _write_live(project, frame, buildings, live_cams)
-    if poses and buildings:
+    if poses and buildings and prior == "bag":
         ce = sum(p["e"] for p in poses) / len(poses)
         cn = sum(p["n"] for p in poses) / len(poses)
         be = sum(0.5 * (b["bbox"][0] + b["bbox"][3]) for b in buildings) / len(buildings)
         bn = sum(0.5 * (b["bbox"][1] + b["bbox"][4]) for b in buildings) / len(buildings)
         offset = ((ce - be) ** 2 + (cn - bn) ** 2) ** 0.5
-        snapped_n = sum(1 for p in poses if p.get("bag_snapped"))
         log.info(
             "camera vs 3DBAG centroid %.1f m  (%s/%s panos edge-snapped)",
             offset,
@@ -363,8 +454,22 @@ def stage_align(project: Project, progress: Progress | None = None) -> list:
             "align",
             f"SV vs 3DBAG {offset:.1f} m apart, {snapped_n}/{len(poses)} snapped",
         )
-    _emit(progress, "align", f"refined {len(poses)} panos / {len(cameras)} views", aligned=len(poses))
+    if prior == "sat":
+        log.info(
+            "sat georef T_sat tx=%.2f ty=%.2f yaw=%.2f°  sat_score_mean=%s",
+            T_sat["tx_m"],
+            T_sat["ty_m"],
+            T_sat["yaw_deg"],
+            f"{sat_mean:.3f}" if sat_mean is not None else "n/a",
+        )
+    _emit(
+        progress,
+        "align",
+        f"refined {len(poses)} panos / {len(cameras)} views (prior={prior})",
+        aligned=len(poses),
+    )
     return poses
+
 
 
 def stage_interpolate(project: Project, progress: Progress | None = None) -> list:
@@ -566,6 +671,13 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
     buildings = []
     if (project.bag_dir / "buildings.json").is_file():
         buildings = project.read_json(project.bag_dir / "buildings.json")
+    georef = None
+    georef_path = project.align_dir / "georef.json"
+    if georef_path.is_file():
+        try:
+            georef = project.read_json(georef_path)
+        except Exception:  # noqa: BLE001
+            georef = None
     scene = scene_payload(
         spec_name=spec.name,
         bbox=spec.bbox,
@@ -575,6 +687,7 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
         satellite=sat,
         cloud=cloud,
         buildings=live_buildings(buildings) if buildings else [],
+        georef=georef,
     )
     _write_live(project, frame, buildings, poses)
     write_scene(project.recon_dir / "scene.json", scene)
@@ -599,6 +712,7 @@ def run_all(
     *,
     from_stage: str = "discover",
     progress: Progress | None = None,
+    align_prior: str | None = None,
 ) -> None:
     if from_stage not in STAGES:
         raise ValueError(f"unknown stage {from_stage}")
@@ -609,7 +723,7 @@ def run_all(
         "crop": lambda: stage_crop(project, settings, progress),
         "satellite": lambda: stage_satellite(project, progress),
         "bag": lambda: stage_bag(project, progress),
-        "align": lambda: stage_align(project, progress),
+        "align": lambda: stage_align(project, progress, align_prior=align_prior),
         "interpolate": lambda: stage_interpolate(project, progress),
         "reconstruct": lambda: stage_reconstruct(project, progress),
     }
