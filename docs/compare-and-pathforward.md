@@ -269,3 +269,20 @@ ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35
 Do **not** lower `zncc_accept` below 0.35 for product runs.
 
 **R&D:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md) §2 grids A/B, §6 PR-2.
+
+
+---
+
+## 15) Path α after PR #22 (2026-09-13) — A-priority union (PR-3)
+
+**PC after #22 peel knobs:** A1 `pre_nms=10 → kept=5` mean 0.406. A2 `pre_nms=**15** → kept=**5** mean 0.410; ma_kept=3 **a_kept=2**; nms_xy=4 split=3.5. Product still **7/5/0.42**. Hybrid NMS is starving A (historic pure Milestone A kept **7** planes) and collapsing ~half of pre_nms. Peel densify is exhausted — no more peel knobs.
+
+**PR-3 (this):** union strategy **`a_priority`** (new hybrid default): after ZNCC≥0.35, keep A-family accepts first (mild intra-A NMS), then add MA only if **not** a duplicate of kept A (stricter than sibling 4 m — uses general 6 m XY, A wins ties). `--union-strategy nms` keeps today's ZNCC-sorted NMS for A/B. Hybrid `--max-planes` default **16**. Telemetry: `a_pre_nms`, `a_kept`, `ma_pre_nms`, `ma_added`, `union_kept`, `strategy=`. `zncc_accept` / `_is_strictly_better` unchanged. `detect_planar_patches` stays parked.
+
+**Recommended PC after merge (default peel params; A2 knobs optional):**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --union-strategy a_priority --max-planes 16
+```
+
+**R&D:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md) §6 PR-3.

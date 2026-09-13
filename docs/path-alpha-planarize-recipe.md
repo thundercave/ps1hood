@@ -555,6 +555,10 @@ ps1hood planarize <name> \
 # or extend densify / reconstruct:
 ps1hood densify <name> --backend mapanything
 ps1hood facades <name> --planarize --zncc-accept 0.35
+
+# After PR-3 (A-priority union, default keep 16):
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --union-strategy a_priority --max-planes 16
 ```
 
 Minimal: **no new command required** — gate inside `_facade_pass` when MA product PLY detected (`meta["backend"]=="mapanything"` or point count). Explicit `ps1hood facades --planarize` is clearer for Chief smoke.

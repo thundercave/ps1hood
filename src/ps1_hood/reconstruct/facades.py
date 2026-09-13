@@ -522,7 +522,7 @@ def _promote_candidate_facades(
 def extract_facades(
     ply_path: Path | None,
     dest_obj: Path,
-    n_planes: int = 12,
+    n_planes: int = 16,
     *,
     frames: list[dict[str, Any]] | None = None,
     satellite: dict[str, Any] | None = None,
@@ -545,6 +545,7 @@ def extract_facades(
     peel_max_planes: int | None = None,
     nms_xy_m: float | None = None,
     nms_xy_split_m: float | None = None,
+    union_strategy: str | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -554,8 +555,9 @@ def extract_facades(
 
     With ``hybrid_heading`` (default on for Path α), Milestone A
     heading×distance seeds are injected into the same ``score_planar_hyps``
-    pass so NMS keeps a union(A, MA). Promote still uses
-    ``_is_strictly_better`` on the union bake metrics.
+    pass. Default ``union_strategy='a_priority'`` keeps A accepts first,
+    then adds non-duplicate MA (``nms`` is the old ZNCC-sorted NMS).
+    Promote still uses ``_is_strictly_better`` on the union bake metrics.
 
     If hybrid/Path α keeps 0 planes and ``fallback_heading``, retry full
     Milestone A search on the same run (``photo_consistency_fallback``).
@@ -588,6 +590,7 @@ def extract_facades(
         DEFAULT_SPLIT_TRIGGER_WIDTH_M,
         DEFAULT_SPLIT_WINDOW_M,
         DEFAULT_VERTICAL_DOT,
+        DEFAULT_UNION_STRATEGY,
         DEFAULT_ZNCC_ACCEPT_MA,
         PLANARIZE_AUTO_MIN_POINTS,
         planes_from_mapanything_ply,
@@ -699,6 +702,11 @@ def extract_facades(
         nms_xy_split = float(
             DEFAULT_NMS_XY_SPLIT_M if nms_xy_split_m is None else nms_xy_split_m
         )
+        strategy = (
+            DEFAULT_UNION_STRATEGY
+            if union_strategy is None
+            else str(union_strategy)
+        )
         accepted = score_planar_hyps(
             hyps,
             frames,
@@ -710,6 +718,7 @@ def extract_facades(
             split_overlap_m=split_overlap,
             nms_xy_m=nms_xy,
             nms_xy_split_m=nms_xy_split,
+            union_strategy=strategy,
         )
 
         def _is_ma(src: str | None) -> bool:
@@ -735,12 +744,14 @@ def extract_facades(
 
         log.info(
             "facades Path α: %s segmented + %s A seeds → %s ZNCC-kept "
-            "(ma_kept=%s a_kept=%s; ply=%s pts; source=%s)",
+            "(ma_kept=%s a_kept=%s; strategy=%s; ply=%s pts; source=%s; "
+            "promote vs product 7/5/0.42)",
             len(hyps),
             len(seed_hyps),
             len(accepted),
             ma_n,
             a_n,
+            strategy,
             len(xyz_raw),
             source_tag,
         )

@@ -467,7 +467,7 @@ def export_mapanything_bundle_cmd(
 @click.option("--zncc-accept", default=0.35, show_default=True, type=float)
 @click.option("--voxel", "voxel_m", default=0.08, show_default=True, type=float)
 @click.option("--plane-dist", "plane_dist_m", default=0.08, show_default=True, type=float)
-@click.option("--max-planes", default=12, show_default=True, type=int)
+@click.option("--max-planes", default=16, show_default=True, type=int)
 @click.option(
     "--keep-previous-on-fail/--no-keep-previous-on-fail",
     default=True,
@@ -554,6 +554,13 @@ def export_mapanything_bundle_cmd(
     type=float,
     help="NMS XY radius (m) when either hyp has split_parent",
 )
+@click.option(
+    "--union-strategy",
+    type=click.Choice(["nms", "a_priority"]),
+    default="a_priority",
+    show_default=True,
+    help="Hybrid union: keep A first then non-dup MA (a_priority), or ZNCC-sorted NMS (nms)",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -574,6 +581,7 @@ def facades_cmd(
     peel_max_planes: int,
     nms_xy_m: float,
     nms_xy_split_m: float,
+    union_strategy: str,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -638,6 +646,7 @@ def facades_cmd(
             peel_max_planes=peel_max_planes,
             nms_xy_m=nms_xy_m,
             nms_xy_split_m=nms_xy_split_m,
+            union_strategy=union_strategy,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
