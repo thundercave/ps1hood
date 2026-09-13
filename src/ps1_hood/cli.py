@@ -456,7 +456,26 @@ def export_mapanything_bundle_cmd(
     type=click.Choice(["mapanything", "recon", "auto"]),
     default="mapanything",
     show_default=True,
-    help="dense ENU PLY: mapanything/cloud.ply (or cloud_mapanything) / recon/cloud.ply / auto",
+    help="compat: MA peel PLY only (sets --ma-source). Does not set A's xyz.",
+)
+@click.option(
+    "--a-source",
+    type=click.Choice(["flow", "product", "mapanything", "recon"]),
+    default="flow",
+    show_default=True,
+    help="A-arm xyz/seeds: recon/cloud_flow.ply|cloud.ply, product planes.json, or MA (debug)",
+)
+@click.option(
+    "--ma-source",
+    type=click.Choice(["mapanything", "recon", "auto"]),
+    default=None,
+    help="MA peel PLY (default: --source / mapanything). Independent of --a-source.",
+)
+@click.option(
+    "--control-out",
+    is_flag=True,
+    default=False,
+    help="Write facades.control.* / planes.control.json; never clobber *.candidate or product",
 )
 @click.option(
     "--planarize/--no-planarize",
@@ -570,6 +589,9 @@ def export_mapanything_bundle_cmd(
 def facades_cmd(
     name: str,
     source: str,
+    a_source: str,
+    ma_source: str | None,
+    control_out: bool,
     planarize: bool,
     zncc_accept: float,
     voxel_m: float,
@@ -598,15 +620,40 @@ def facades_cmd(
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
     from ps1_hood.reconstruct.keyframes import load_keyframes
-    from ps1_hood.reconstruct.planarize import resolve_dense_ply
+    from ps1_hood.reconstruct.planarize import resolve_a_ply, resolve_ma_ply
 
     project = open_project(name)
 
+    ma_src = ma_source or source
+    ctx = click.get_current_context(silent=True)
+    source_explicit = False
+    if ctx is not None:
+        src_info = ctx.get_parameter_source("source")
+        source_explicit = src_info == click.core.ParameterSource.COMMANDLINE
+    if source_explicit and ma_source is None:
+        log.warning(
+            "facades: --source=%s sets MA peel PLY only; A xyz uses --a-source=%s",
+            source,
+            a_source,
+        )
     try:
-        ply = resolve_dense_ply(project.root, source=source)
+        ply = resolve_ma_ply(project.root, ma_src)
     except FileNotFoundError as exc:
-        click.echo(f"facades: {exc}", err=True)
-        raise SystemExit(1) from exc
+        if planarize:
+            click.echo(f"facades: {exc}", err=True)
+            raise SystemExit(1) from exc
+        ply = None
+        log.warning("facades: no MA peel PLY (%s) — A-only / control", exc)
+
+    a_ply = resolve_a_ply(project.root, a_source)
+    if a_source == "product":
+        a_ply = None
+    elif a_ply is None and a_source in {"flow", "recon"}:
+        log.warning(
+            "facades: no flow/recon PLY for --a-source=%s — A will fall back "
+            "(product lock if planes.json, else MA ply)",
+            a_source,
+        )
 
     frames = load_keyframes(project)
     for fr in frames:
@@ -655,6 +702,9 @@ def facades_cmd(
             nms_xy_m=nms_xy_m,
             nms_xy_split_m=nms_xy_split_m,
             union_strategy=union_strategy,
+            a_ply_path=a_ply,
+            a_source=a_source,
+            control_out=control_out,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
@@ -690,7 +740,10 @@ def facades_cmd(
         f"source={meta.get('source')}  mean_zncc={meta.get('mean_zncc')}  "
         f"preserved_previous={preserved}  "
         f"candidate_planes={meta.get('candidate_planes')}  "
-        f"reason={meta.get('candidate_reason')}  ply={ply}"
+        f"reason={meta.get('candidate_reason')}  "
+        f"a_ply={meta.get('a_ply') or a_ply}  ma_ply={meta.get('ma_ply') or ply}  "
+        f"a_kept={meta.get('a_kept')}  ma_added={meta.get('ma_added')}  "
+        f"output_kind={meta.get('output_kind')}"
     )
     # Product intact on quality-keep; only fail-hard when nothing usable remains
     if n_planes_out <= 0 and not preserved:

@@ -105,6 +105,52 @@ def resolve_dense_ply(project_root: Path, source: str = "mapanything") -> Path:
     raise ValueError(f"unknown façade source {source!r} (mapanything|recon|auto)")
 
 
+A_SOURCES = ("flow", "recon", "product", "mapanything")
+MA_SOURCES = ("mapanything", "recon", "auto")
+
+
+def resolve_a_ply(project_root: Path, a_source: str = "flow") -> Path | None:
+    """Locate A's support PLY (flow/recon). ``product`` has no PLY (planes.json).
+
+    ``flow`` / ``recon``: ``recon/cloud_flow.ply`` if present, else ``recon/cloud.ply``.
+    Also accepts those names directly under ``project_root`` (recon dir or tests).
+    ``mapanything``: escape hatch — same candidates as ``resolve_dense_ply``.
+    ``product``: return None (caller loads ``recon/planes.json``).
+    """
+    root = Path(project_root)
+    src = (a_source or "flow").lower().strip()
+    if src == "product":
+        return None
+    if src in {"flow", "recon"}:
+        candidates = [
+            root / "recon" / "cloud_flow.ply",
+            root / "recon" / "cloud.ply",
+            root / "cloud_flow.ply",
+            root / "cloud.ply",
+        ]
+        for pth in candidates:
+            if pth.is_file():
+                return pth
+        return None
+    if src == "mapanything":
+        try:
+            return resolve_dense_ply(root, "mapanything")
+        except FileNotFoundError:
+            return None
+    raise ValueError(f"unknown A source {a_source!r} (flow|recon|product|mapanything)")
+
+
+def resolve_ma_ply(project_root: Path, ma_source: str = "mapanything") -> Path:
+    """Locate MA peel PLY. Default MapAnything ENU product cloud.
+
+    Does **not** resolve A's flow cloud. ``--source`` maps here only.
+    """
+    src = (ma_source or "mapanything").lower().strip()
+    if src not in {"mapanything", "recon", "auto"}:
+        raise ValueError(f"unknown MA source {ma_source!r} (mapanything|recon|auto)")
+    return resolve_dense_ply(project_root, src)
+
+
 def _unit_plane(model: np.ndarray) -> tuple[np.ndarray, float]:
     """Open3D [a,b,c,d] → unit n, d with n·X + d = 0."""
     m = np.asarray(model, dtype=np.float64).reshape(4)
@@ -613,9 +659,13 @@ def planes_from_mapanything_ply(
 
 
 def is_a_source(src: str | None) -> bool:
-    """Milestone A family: heading×distance / manhattan / sparse / photo_*."""
+    """Milestone A family: heading×distance / manhattan / sparse / photo_* / product lock."""
     s = (src or "").lower()
-    return s in {"heading_distance", "manhattan", "sparse"} or s.startswith("photo_")
+    return (
+        s in {"heading_distance", "manhattan", "sparse", "product_lock"}
+        or s.startswith("photo_")
+        or s.startswith("product")
+    )
 
 
 def is_ma_source(src: str | None) -> bool:
@@ -1168,3 +1218,73 @@ def write_planes_json(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def planes_from_product_json(path: Path) -> list[dict[str, Any]]:
+    """Load live product ``planes.json`` as already-accepted A-family planes.
+
+    Used by ``--a-source product`` (and flow-thin fallback). Does **not**
+    auto-promote — quality-keep still gates the union.
+    """
+    import json
+
+    src = Path(path)
+    if not src.is_file():
+        return []
+    try:
+        payload = json.loads(src.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("planes") or []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for pl in raw:
+        if not isinstance(pl, dict):
+            continue
+        n_raw = pl.get("n")
+        if n_raw is None and "nx" in pl:
+            n_raw = [pl.get("nx"), pl.get("ny"), 0.0]
+        if n_raw is None:
+            continue
+        n = np.asarray(n_raw, dtype=np.float64).reshape(-1)
+        if n.size < 2:
+            continue
+        if n.size == 2:
+            n = np.array([float(n[0]), float(n[1]), 0.0], dtype=np.float64)
+        nrm = float(np.linalg.norm(n) + 1e-12)
+        n = n / nrm
+        if "d" in pl and "nx" not in pl:
+            d_plane = float(pl["d"])
+        elif "nx" in pl:
+            d_plane = float(-pl["d"])
+        else:
+            d_plane = float(pl.get("d", 0.0))
+        quad = pl.get("quad") or pl.get("corners")
+        if quad:
+            center = np.mean(np.asarray(quad, dtype=np.float64), axis=0)
+        else:
+            center = (-d_plane) * n
+            if center.size >= 3:
+                pass
+            else:
+                center = np.array([center[0], center[1] if center.size > 1 else 0.0, 4.0])
+        if len(center) < 3:
+            center = np.array([float(center[0]), float(center[1] if len(center) > 1 else 0.0), 4.0])
+        out.append(
+            {
+                "n": n,
+                "d": d_plane,
+                "center": np.asarray(center, dtype=np.float64),
+                "width_m": float(pl.get("width_m") or 8.0),
+                "height_m": float(pl.get("height_m") or 9.0),
+                "zncc": pl.get("zncc"),
+                "ok": True,
+                "source": "product_lock",
+                "quad": quad,
+                "count": int(pl.get("inliers") or pl.get("count") or 0),
+            }
+        )
+    return out

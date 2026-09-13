@@ -543,6 +543,106 @@ def _promote_candidate_facades(
         cand_json.unlink(missing_ok=True)
 
 
+def _ground_z_from_cams(frames: list[dict[str, Any]]) -> float:
+    if not frames:
+        return 0.0
+    return float(np.median([float(f.get("u") or 0.0) for f in frames])) - 2.5
+
+
+def _facade_output_paths(dest_obj: Path, kind: str) -> dict[str, Path | str]:
+    """Product / candidate / control artefact paths. Control never shares candidate."""
+    dest_obj = Path(dest_obj)
+    parent = dest_obj.parent
+    tex_dir = parent / "textures"
+    if kind == "control":
+        return {
+            "obj": dest_obj.with_name(dest_obj.stem + ".control.obj"),
+            "mtl": dest_obj.with_name(dest_obj.stem + ".control.mtl"),
+            "json": parent / "planes.control.json",
+            "bake_tex": tex_dir / "control",
+            "tex_prefix": "textures/control",
+        }
+    if kind == "candidate":
+        return {
+            "obj": dest_obj.with_name(dest_obj.stem + ".candidate.obj"),
+            "mtl": dest_obj.with_name(dest_obj.stem + ".candidate.mtl"),
+            "json": parent / "planes.candidate.json",
+            "bake_tex": tex_dir / "candidate",
+            "tex_prefix": "textures/candidate",
+        }
+    return {
+        "obj": dest_obj,
+        "mtl": dest_obj.with_suffix(".mtl"),
+        "json": parent / "planes.json",
+        "bake_tex": tex_dir,
+        "tex_prefix": "textures",
+    }
+
+
+def _candidate_artifacts_exist(dest_obj: Path) -> bool:
+    dest_obj = Path(dest_obj)
+    return (
+        dest_obj.with_name(dest_obj.stem + ".candidate.obj").is_file()
+        or (dest_obj.parent / "planes.candidate.json").is_file()
+    )
+
+
+def _resolve_output_kind(
+    output_kind: str,
+    *,
+    control_out: bool,
+    use_planarize: bool,
+    prev_product: bool,
+    dest_obj: Path | None = None,
+) -> str:
+    """auto → control for A-only when product/candidate exist (never clobber).
+
+    First-run A (no product, no candidate) still writes live product.
+    Explicit ``control_out`` / ``output_kind=control`` always stages ``*.control``.
+    """
+    kind = (output_kind or "auto").lower().strip()
+    if control_out or kind == "control":
+        return "control"
+    if kind in {"candidate", "product"}:
+        return kind
+    if not use_planarize:
+        has_candidate = bool(dest_obj and _candidate_artifacts_exist(dest_obj))
+        if prev_product or has_candidate:
+            return "control"
+        return "product"
+    if prev_product:
+        return "candidate"
+    return "product"
+
+
+def _resolve_a_support_ply(
+    dest_obj: Path,
+    *,
+    a_ply_path: Path | None,
+    a_source: str,
+    ply_path: Path | None,
+) -> Path | None:
+    """A-arm PLY: explicit path, then flow/recon next to dest, then ply_path fallback."""
+    from ps1_hood.reconstruct.planarize import resolve_a_ply
+
+    src = (a_source or "flow").lower().strip()
+    if src == "product":
+        return None
+    if a_ply_path is not None and Path(a_ply_path).is_file():
+        return Path(a_ply_path)
+    dest_obj = Path(dest_obj)
+    for base in (dest_obj.parent, dest_obj.parent.parent):
+        found = resolve_a_ply(base, src)
+        if found is not None:
+            return found
+    if src == "mapanything" and ply_path is not None and Path(ply_path).is_file():
+        return Path(ply_path)
+    # Single-PLY callers / tests: fall back to the peel cloud so A still runs.
+    if ply_path is not None and Path(ply_path).is_file():
+        return Path(ply_path)
+    return None
+
+
 def extract_facades(
     ply_path: Path | None,
     dest_obj: Path,
@@ -571,12 +671,21 @@ def extract_facades(
     nms_xy_split_m: float | None = None,
     union_strategy: str | None = None,
     hybrid_a_full_search: bool = True,
+    a_ply_path: Path | None = None,
+    a_source: str = "flow",
+    output_kind: str = "auto",
+    control_out: bool = False,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
     Path α (planarize): when ``planarize=True`` or auto (dense PLY ≳50k pts),
     seed vertical planes from MapAnything ENU cloud via Open3D/numpy
     ``segment_plane`` peel, then ZNCC-gate + ortho bake (Milestone A).
+
+    Dual-**source** (PR post-#25): A arm xyz / ``ground_z`` come from
+    ``a_ply_path`` / ``--a-source flow`` (``recon/cloud_flow.ply`` else
+    flow ``recon/cloud.ply``). MA peels stay on ``ply_path``
+    (``--ma-source mapanything``). Do not force both arms onto one MA PLY.
 
     With ``hybrid_heading`` (default on for Path α) and
     ``hybrid_a_full_search`` (default on): **dual arm** — A arm runs full
@@ -586,6 +695,10 @@ def extract_facades(
     adds non-dup MA. Opt out with ``hybrid_a_full_search=False`` to restore
     the older hypothesize→``score_planar_hyps`` seed-inject path.
     Promote still uses ``_is_strictly_better`` on the union bake metrics.
+
+    ``--a-source product`` locks live ``planes.json`` as the A family.
+    A-only / ``--no-planarize`` / ``control_out`` write ``*.control`` and
+    never clobber ``*.candidate`` or live product.
 
     If hybrid/Path α keeps 0 planes and ``fallback_heading``, retry full
     Milestone A search on the same run (``photo_consistency_fallback``).
@@ -623,7 +736,10 @@ def extract_facades(
         DEFAULT_UNION_STRATEGY,
         DEFAULT_ZNCC_ACCEPT_MA,
         PLANARIZE_AUTO_MIN_POINTS,
+        is_a_source,
+        is_ma_source,
         planes_from_mapanything_ply,
+        planes_from_product_json,
         score_planar_hyps,
         union_keep_planes,
         write_planes_json,
@@ -632,16 +748,32 @@ def extract_facades(
     log = logging.getLogger(__name__)
     frames = list(frames or [])
     dest_obj = Path(dest_obj)
+    a_source = (a_source or "flow").lower().strip()
 
-    xyz_raw = np.zeros((0, 3), dtype=np.float64)
+    xyz_ma_raw = np.zeros((0, 3), dtype=np.float64)
     if ply_path is not None and Path(ply_path).is_file():
         try:
-            xyz_raw = _read_ply_xyz(Path(ply_path))
+            xyz_ma_raw = _read_ply_xyz(Path(ply_path))
         except Exception as exc:  # noqa: BLE001
-            log.warning("facades: could not read seed PLY %s (%s)", ply_path, exc)
+            log.warning("facades: could not read MA peel PLY %s (%s)", ply_path, exc)
 
+    ply_a = _resolve_a_support_ply(
+        dest_obj,
+        a_ply_path=a_ply_path,
+        a_source=a_source,
+        ply_path=ply_path,
+    )
+    xyz_a_raw = np.zeros((0, 3), dtype=np.float64)
+    if ply_a is not None and Path(ply_a).is_file():
+        try:
+            xyz_a_raw = _read_ply_xyz(Path(ply_a))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("facades: could not read A support PLY %s (%s)", ply_a, exc)
+
+    # Auto planarize on MA density (or the single seed if no MA).
+    n_auto = len(xyz_ma_raw) if len(xyz_ma_raw) else len(xyz_a_raw)
     use_planarize = planarize if planarize is not None else (
-        len(xyz_raw) >= PLANARIZE_AUTO_MIN_POINTS
+        n_auto >= PLANARIZE_AUTO_MIN_POINTS
     )
     if zncc_accept is None:
         zncc_accept = DEFAULT_ZNCC_ACCEPT_MA if use_planarize else 0.35
@@ -649,17 +781,31 @@ def extract_facades(
     residual_pts = 0
     source_tag = "photo_consistency"
     path_alpha_attempted = False
+    a_kept_n = 0
+    ma_added_n = 0
+    a_ply_str = str(ply_a) if ply_a is not None else ""
+    ma_ply_str = str(ply_path) if ply_path is not None else ""
 
-    if len(xyz_raw) >= 20:
-        xyz = _voxel_downsample_xyz(xyz_raw, 0.20 if not use_planarize else voxel_m)
+    # A voxel = historic 0.20 (not MA 0.08). MA peels use raw + their voxel.
+    if len(xyz_a_raw) >= 20:
+        xyz_a = _voxel_downsample_xyz(xyz_a_raw, 0.20)
+        ground_z_a = _fit_ground_z(xyz_a)
+    else:
+        xyz_a = xyz_a_raw
+        ground_z_a = _ground_z_from_cams(frames) if frames else 0.0
+
+    xyz_raw = xyz_ma_raw if len(xyz_ma_raw) else xyz_a_raw
+    if len(xyz_ma_raw) >= 20:
+        xyz = _voxel_downsample_xyz(xyz_ma_raw, voxel_m if use_planarize else 0.20)
         ground_z = _fit_ground_z(xyz)
+    elif len(xyz_a) >= 20:
+        xyz = xyz_a
+        ground_z = ground_z_a
     else:
         xyz = xyz_raw
-        ground_z = 0.0
-        if frames:
-            ground_z = float(np.median([float(f.get("u") or 0.0) for f in frames])) - 2.5
+        ground_z = ground_z_a if frames else 0.0
 
-    if use_planarize and ply_path is not None and Path(ply_path).is_file() and len(xyz_raw) >= 100:
+    if use_planarize and ply_path is not None and Path(ply_path).is_file() and len(xyz_ma_raw) >= 100:
         path_alpha_attempted = True
         cam_c = (
             np.mean(
@@ -730,26 +876,49 @@ def extract_facades(
         union_tel: dict[str, Any] = {}
 
         def _is_ma(src: str | None) -> bool:
-            s = (src or "ma_segment").lower()
-            return s.startswith("ma_") or s in {"ma_segment", "mapanything_planarize"}
+            return is_ma_source(src)
 
         def _is_a(src: str | None) -> bool:
-            s = (src or "").lower()
-            return s in {"heading_distance", "manhattan", "sparse"} or s.startswith(
-                "photo_"
+            return is_a_source(src)
+
+        def _run_a_arm(*, zncc: float) -> list[dict]:
+            """A arm on flow xyz, or locked product planes.json."""
+            product_json = dest_obj.parent / "planes.json"
+            flow_thin = len(xyz_a) < 30
+            use_lock = a_source == "product" or (
+                a_source in {"flow", "recon"}
+                and flow_thin
+                and product_json.is_file()
+            )
+            if use_lock:
+                locked = planes_from_product_json(product_json)
+                if locked:
+                    log.info(
+                        "facades A arm: product_lock %s planes from %s "
+                        "(a_source=%s flow_pts=%s)",
+                        len(locked),
+                        product_json,
+                        a_source,
+                        len(xyz_a),
+                    )
+                    return locked
+                if a_source == "product":
+                    log.warning(
+                        "facades: --a-source product but no usable planes at %s",
+                        product_json,
+                    )
+                    return []
+            return search_photo_consistent_planes(
+                frames,
+                xyz_a if len(xyz_a) >= 30 else None,
+                zncc_accept=float(zncc),
+                ground_z=ground_z_a,
+                max_keep=n_planes,
             )
 
         if dual_arm:
-            # ★ Fix A — Dual arm: full Milestone A search + MA peels only,
-            # then a_priority (or CLI union_strategy) union. Do NOT inject A
-            # seeds into gated score_planar_hyps.
-            accepted_a = search_photo_consistent_planes(
-                frames,
-                xyz if len(xyz) >= 30 else None,
-                zncc_accept=min(float(zncc_accept), 0.35),
-                ground_z=ground_z,
-                max_keep=n_planes,
-            )
+            # Dual-source dual-arm: A on flow xyz / product lock; MA peels only.
+            accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
             accepted_ma = score_planar_hyps(
                 hyps,
                 frames,
@@ -786,11 +955,13 @@ def extract_facades(
                 source_tag = "mapanything_planarize"
             else:
                 source_tag = "mapanything_planarize"
+            a_kept_n = a_n
+            ma_added_n = ma_added
             log.info(
                 "facades Path α dual_arm: a_arm=search_photo_consistent_planes "
                 "kept=%s; ma_arm=%s; strategy=%s a_pre_nms=%s a_kept=%s "
-                "ma_added=%s union_kept=%s; ply=%s pts; source=%s; "
-                "promote vs product 7/5/0.42",
+                "ma_added=%s union_kept=%s; a_ply=%s ma_ply=%s a_pts=%s "
+                "ma_pts=%s; source=%s; promote vs product 7/5/0.42",
                 len(accepted_a),
                 len(accepted_ma),
                 strategy,
@@ -798,7 +969,10 @@ def extract_facades(
                 a_n,
                 ma_added,
                 len(accepted),
-                len(xyz_raw),
+                a_ply_str,
+                ma_ply_str,
+                len(xyz_a_raw),
+                len(xyz_ma_raw),
                 source_tag,
             )
         else:
@@ -806,8 +980,8 @@ def extract_facades(
                 # Legacy opt-out: inject A seeds into gated score_planar_hyps
                 seed_hyps = hypothesize_vertical_planes(
                     frames,
-                    xyz if len(xyz) >= 30 else None,
-                    ground_z=ground_z,
+                    xyz_a if len(xyz_a) >= 30 else None,
+                    ground_z=ground_z_a,
                     max_heading_seeds=int(max_heading_seeds),
                 )
                 log.info(
@@ -859,27 +1033,63 @@ def extract_facades(
             )
             accepted = search_photo_consistent_planes(
                 frames,
-                xyz if len(xyz) >= 30 else None,
+                xyz_a if len(xyz_a) >= 30 else None,
                 zncc_accept=min(float(zncc_accept), 0.35),
-                ground_z=ground_z,
+                ground_z=ground_z_a,
                 max_keep=n_planes,
             )
             if accepted:
                 source_tag = "photo_consistency_fallback"
+                a_kept_n = len(accepted)
     else:
-        if planarize is True and len(xyz_raw) < 100:
+        if planarize is True and len(xyz_ma_raw) < 100:
             log.warning(
-                "facades: planarize requested but PLY too thin (%s pts) — "
-                "falling back to Milestone A heading×distance",
-                len(xyz_raw),
+                "facades: planarize requested but MA PLY too thin (%s pts) — "
+                "falling back to Milestone A heading×distance on a_ply=%s",
+                len(xyz_ma_raw),
+                a_ply_str or "(none)",
             )
-        accepted = search_photo_consistent_planes(
-            frames,
-            xyz if len(xyz) >= 30 else None,
-            zncc_accept=float(zncc_accept),
-            ground_z=ground_z,
-            max_keep=n_planes,
+        product_json = dest_obj.parent / "planes.json"
+        flow_thin = len(xyz_a) < 30
+        use_lock = a_source == "product" or (
+            a_source in {"flow", "recon"}
+            and flow_thin
+            and product_json.is_file()
         )
+        if use_lock:
+            accepted = planes_from_product_json(product_json)
+            if accepted:
+                source_tag = "product_lock"
+                a_kept_n = len(accepted)
+                log.info(
+                    "facades A-only: product_lock %s planes from %s",
+                    len(accepted),
+                    product_json,
+                )
+            elif a_source == "product":
+                accepted = []
+                log.warning(
+                    "facades: --a-source product but no usable planes at %s",
+                    product_json,
+                )
+            else:
+                accepted = search_photo_consistent_planes(
+                    frames,
+                    xyz_a if len(xyz_a) >= 30 else None,
+                    zncc_accept=float(zncc_accept),
+                    ground_z=ground_z_a,
+                    max_keep=n_planes,
+                )
+                a_kept_n = len(accepted)
+        else:
+            accepted = search_photo_consistent_planes(
+                frames,
+                xyz_a if len(xyz_a) >= 30 else None,
+                zncc_accept=float(zncc_accept),
+                ground_z=ground_z_a,
+                max_keep=n_planes,
+            )
+            a_kept_n = len(accepted)
 
     planes: list[dict] = []
     for pl in accepted:
@@ -890,8 +1100,10 @@ def extract_facades(
     mtl_path = dest_obj.with_suffix(".mtl")
     planes_json = dest_obj.parent / "planes.json"
 
-    # Ground extents from photo cloud or camera AABB
-    if len(xyz) >= 4:
+    # Ground extents from flow/A cloud (historic) or MA / camera AABB
+    if len(xyz_a) >= 4:
+        extent_xyz = xyz_a
+    elif len(xyz) >= 4:
         extent_xyz = xyz
     elif frames:
         pts = np.array(
@@ -911,8 +1123,32 @@ def extract_facades(
             [[-10, -10, ground_z], [10, 10, ground_z]], dtype=np.float64
         )
 
+    prev_product = bool(
+        keep_previous_on_fail and _facade_product_looks_nonempty(dest_obj)
+    )
+    kind = _resolve_output_kind(
+        output_kind,
+        control_out=control_out,
+        use_planarize=use_planarize,
+        prev_product=prev_product,
+        dest_obj=dest_obj,
+    )
+    tel = {
+        "a_ply": a_ply_str,
+        "ma_ply": ma_ply_str,
+        "a_kept": int(a_kept_n),
+        "ma_added": int(ma_added_n),
+        "output_kind": kind,
+    }
+
     # --- FAIL-LOUD preserve: do not wipe prior product ---
-    if not planes and keep_previous_on_fail and _facade_product_looks_nonempty(dest_obj):
+    # Control runs never use *.failed / *.candidate — they write *.control.
+    if (
+        kind != "control"
+        and not planes
+        and keep_previous_on_fail
+        and _facade_product_looks_nonempty(dest_obj)
+    ):
         failed_obj = dest_obj.with_name(dest_obj.stem + ".failed.obj")
         failed_mtl = dest_obj.with_name(dest_obj.stem + ".failed.mtl")
         failed_json = dest_obj.parent / "planes.failed.json"
@@ -963,22 +1199,28 @@ def extract_facades(
             "ok": False,
             "failed_obj": str(failed_obj),
             "failed_planes_json": str(failed_json),
+            **tel,
         }
 
-    # Success path — optionally stage to *.candidate when a better product exists
-    prev_q = (
-        _read_facade_quality(dest_obj)
-        if keep_previous_on_fail and _facade_product_looks_nonempty(dest_obj)
-        else None
-    )
-    stage_candidate = bool(prev_q is not None and planes)
+    # Success path — candidate / product / control staging
+    prev_q = _read_facade_quality(dest_obj) if prev_product else None
+    stage_candidate = bool(kind == "candidate" and prev_q is not None and planes)
+    skip_promote = kind == "control"
 
-    if stage_candidate:
-        out_obj = dest_obj.with_name(dest_obj.stem + ".candidate.obj")
-        out_mtl = dest_obj.with_name(dest_obj.stem + ".candidate.mtl")
-        out_json = dest_obj.parent / "planes.candidate.json"
-        bake_tex_dir = tex_dir / "candidate"
-        tex_map_prefix = "textures/candidate"
+    if kind == "control":
+        paths = _facade_output_paths(dest_obj, "control")
+        out_obj = Path(paths["obj"])
+        out_mtl = Path(paths["mtl"])
+        out_json = Path(paths["json"])
+        bake_tex_dir = Path(paths["bake_tex"])
+        tex_map_prefix = str(paths["tex_prefix"])
+    elif stage_candidate:
+        paths = _facade_output_paths(dest_obj, "candidate")
+        out_obj = Path(paths["obj"])
+        out_mtl = Path(paths["mtl"])
+        out_json = Path(paths["json"])
+        bake_tex_dir = Path(paths["bake_tex"])
+        tex_map_prefix = str(paths["tex_prefix"])
     else:
         out_obj = dest_obj
         out_mtl = mtl_path
@@ -992,7 +1234,7 @@ def extract_facades(
                 old_tex.unlink(missing_ok=True)
 
     bake_tex_dir.mkdir(parents=True, exist_ok=True)
-    if stage_candidate:
+    if kind in {"candidate", "control"}:
         for old_tex in bake_tex_dir.glob("facade_*.jpg"):
             old_tex.unlink(missing_ok=True)
 
@@ -1073,6 +1315,50 @@ def extract_facades(
         "plane_count": int(len(planes)),
     }
 
+    if skip_promote or kind == "control":
+        log.info(
+            "facades: control write %s / %s (planes=%s textured=%s "
+            "a_ply=%s ma_ply=%s a_kept=%s ma_added=%s) — "
+            "did not touch product or candidate",
+            out_obj.name,
+            out_json.name,
+            len(planes),
+            textured,
+            a_ply_str,
+            ma_ply_str,
+            a_kept_n,
+            ma_added_n,
+        )
+        return {
+            "path": str(dest_obj),
+            "mtl": str(mtl_path),
+            "planes_json": str(planes_json),
+            "planes": int(prev_q.get("plane_count") or 0) if prev_q else len(planes),
+            "textured": int(prev_q.get("textured") or 0) if prev_q else textured,
+            "ground_textured": has_ground_tex
+            or bool((tex_dir / "ground.jpg").is_file()),
+            "source": source_tag,
+            "planarize": bool(
+                path_alpha_attempted and source_tag == "mapanything_planarize"
+            ),
+            "zncc_accept": float(zncc_accept),
+            "ground_z": ground_z,
+            "points_used": int(len(xyz_raw) if len(xyz_raw) else len(xyz)),
+            "points_voxel": int(len(xyz)),
+            "residual_points": int(residual_pts),
+            "mean_zncc": prev_q.get("mean_zncc") if prev_q else mean_zncc,
+            "path_alpha": source_tag == "mapanything_planarize",
+            "preserved_previous": bool(prev_q),
+            "rejected_weaker": False,
+            "ok": bool(prev_q) or len(planes) > 0,
+            "control_obj": str(out_obj),
+            "control_planes_json": str(out_json),
+            "control_planes": int(len(planes)),
+            "control_textured": int(textured),
+            "control_mean_zncc": mean_zncc,
+            **tel,
+        }
+
     if stage_candidate and prev_q is not None:
         ok_promote, why = _is_strictly_better(new_q, prev_q)
         if not ok_promote:
@@ -1125,6 +1411,7 @@ def extract_facades(
                 "candidate_planes_json": str(out_json),
                 "previous_textured": int(prev_q.get("textured") or 0),
                 "previous_mean_zncc": prev_q.get("mean_zncc"),
+                **tel,
             }
 
     if stage_candidate:
@@ -1167,6 +1454,7 @@ def extract_facades(
         "preserved_previous": False,
         "rejected_weaker": False,
         "ok": len(planes) > 0,
+        **tel,
     }
 
 

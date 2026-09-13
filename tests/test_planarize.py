@@ -14,9 +14,13 @@ from ps1_hood.reconstruct.planarize import (
     HAS_OPEN3D,
     expand_hyps_for_scoring,
     inliers_to_quad,
+    is_a_source,
     nms_keep_planes,
     planes_from_mapanything_ply,
+    planes_from_product_json,
+    resolve_a_ply,
     resolve_dense_ply,
+    resolve_ma_ply,
     score_planar_hyps,
     segment_vertical_planes_numpy,
     split_long_hyp,
@@ -1328,6 +1332,9 @@ def test_facades_cli_exposes_peel_knobs() -> None:
         "--max-planes",
         "--hybrid-a-full-search",
         "--no-hybrid-a-full-search",
+        "--a-source",
+        "--ma-source",
+        "--control-out",
     ):
         assert flag in help_text
     assert "a_priority" in help_text
@@ -1815,3 +1822,299 @@ def test_hybrid_legacy_seeds_opt_out(
     assert called["hypothesize"] >= 1
     assert called["seed_hyps"] is not None
     assert len(called["seed_hyps"]) >= 1
+
+
+def test_resolve_a_and_ma_ply_are_distinct(tmp_path: Path) -> None:
+    """Dual-source: A prefers cloud_flow.ply; MA prefers mapanything/cloud.ply."""
+    ma_ply = tmp_path / "mapanything" / "cloud.ply"
+    flow_ply = tmp_path / "recon" / "cloud_flow.ply"
+    recon_ply = tmp_path / "recon" / "cloud.ply"
+    _write_xyz_ply(ma_ply, np.zeros((8, 3)))
+    _write_xyz_ply(flow_ply, np.ones((8, 3)))
+    _write_xyz_ply(recon_ply, np.full((8, 3), 2.0))
+    a = resolve_a_ply(tmp_path, "flow")
+    ma = resolve_ma_ply(tmp_path, "mapanything")
+    assert a == flow_ply
+    assert ma == ma_ply
+    assert a != ma
+    assert resolve_a_ply(tmp_path, "product") is None
+
+
+def test_resolve_a_ply_falls_back_to_recon_cloud(tmp_path: Path) -> None:
+    recon_ply = tmp_path / "recon" / "cloud.ply"
+    _write_xyz_ply(recon_ply, np.zeros((4, 3)))
+    assert resolve_a_ply(tmp_path, "flow") == recon_ply
+
+
+def test_dual_source_a_uses_recon_cloud_not_ma(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A search sees flow xyz; MA peel sees mapanything path — not one resolve."""
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    ma_dir = tmp_path / "mapanything"
+    recon = tmp_path / "recon"
+    ma_xyz = np.column_stack(
+        [np.full(120, 100.0), np.linspace(0, 10, 120), np.linspace(0, 4, 120)]
+    )
+    flow_xyz = np.column_stack(
+        [np.full(80, 1.0), np.linspace(0, 10, 80), np.linspace(0, 3, 80)]
+    )
+    ma_ply = ma_dir / "cloud.ply"
+    flow_ply = recon / "cloud_flow.ply"
+    _write_xyz_ply(ma_ply, ma_xyz)
+    _write_xyz_ply(flow_ply, flow_xyz)
+
+    frames = []
+    rng = np.random.default_rng(21)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        pth = tmp_path / f"ds{i}.jpg"
+        cv2.imwrite(str(pth), img)
+        frames.append(
+            {
+                "path": str(pth),
+                "e": 0.0,
+                "n": float(i),
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"ds{i}",
+            }
+        )
+
+    captured: dict = {}
+
+    def _fake_planes(ply_path, cam_c, **kwargs):  # noqa: ANN001
+        captured["ma_ply"] = Path(ply_path)
+        captured["peel_xyz_max_x"] = float(np.asarray(kwargs.get("xyz")).max()) if kwargs.get("xyz") is not None else None
+        return ([], {"z": 0.0}, 0)
+
+    def _fake_search(frames_in, xyz=None, **kwargs):  # noqa: ANN001
+        captured["a_xyz"] = None if xyz is None else np.asarray(xyz)
+        captured["a_ground_z"] = kwargs.get("ground_z")
+        return [
+            _a_plane((8.0, 0.0), zncc=0.42),
+        ]
+
+    def _fake_score(hyps, frames_in, **kwargs):  # noqa: ANN001
+        captured["score_seed"] = kwargs.get("seed_hyps")
+        return []
+
+    monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _fake_search)
+    monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
+
+    meta = extract_facades(
+        ma_ply,
+        recon / "facades.obj",
+        frames=frames,
+        n_planes=16,
+        zncc_accept=0.35,
+        planarize=True,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=True,
+        hybrid_a_full_search=True,
+        a_ply_path=flow_ply,
+        a_source="flow",
+    )
+    assert captured["ma_ply"] == ma_ply
+    assert captured["score_seed"] is None
+    assert captured["a_xyz"] is not None
+    assert float(captured["a_xyz"][:, 0].max()) < 20.0  # flow x≈1, not MA x=100
+    assert meta.get("a_ply") == str(flow_ply)
+    assert meta.get("ma_ply") == str(ma_ply)
+    assert meta.get("a_kept") == 1
+
+
+def test_control_does_not_overwrite_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A-only / --no-planarize writes *.control and leaves *.candidate intact."""
+    import json
+
+    import ps1_hood.reconstruct.photo_planes as pp
+
+    dest = tmp_path / "facades.obj"
+    tex_dir = tmp_path / "textures"
+    tex_dir.mkdir()
+    dest.write_text(
+        "\n".join(
+            ["# product", "mtllib facades.mtl"]
+            + [f"v {i} 0 0" for i in range(16)]
+            + ["usemtl ground", "f 1 2 3 4"]
+            + ["usemtl facade_00", "f 5 6 7 8"]
+            + ["# pad"] * 40
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    (tmp_path / "facades.mtl").write_text("newmtl facade_00\n", encoding="ascii")
+    planes = [
+        {
+            "id": f"facade_{i:02d}",
+            "n": [1.0, 0.0, 0.0],
+            "d": -5.0,
+            "zncc": 0.42,
+            "texture": f"textures/facade_{i:02d}.jpg" if i < 5 else None,
+            "width_m": 8.0,
+            "height_m": 6.0,
+            "source": "photo_consistency",
+        }
+        for i in range(7)
+    ]
+    (tmp_path / "planes.json").write_text(
+        json.dumps(
+            {
+                "frame": "ENU",
+                "source": "photo_consistency",
+                "ground_z": 0.0,
+                "planes": planes,
+                "residual_points": 0,
+                "gates": {"mean_zncc": 0.42, "plane_count": 7},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for i in range(5):
+        cv2.imwrite(
+            str(tex_dir / f"facade_{i:02d}.jpg"),
+            np.full((16, 16, 3), 30 + i, dtype=np.uint8),
+        )
+
+    cand_obj = tmp_path / "facades.candidate.obj"
+    cand_json = tmp_path / "planes.candidate.json"
+    cand_body = "# hybrid candidate - must survive control rerun\n"
+    cand_obj.write_text(cand_body, encoding="ascii")
+    cand_json.write_text('{"source":"mapanything_hybrid","planes":[1,2,3,4]}\n', encoding="utf-8")
+    (tex_dir / "candidate").mkdir()
+    cv2.imwrite(str(tex_dir / "candidate" / "facade_00.jpg"), np.full((8, 8, 3), 9, dtype=np.uint8))
+    prior_cand_obj = cand_obj.read_bytes()
+    prior_cand_json = cand_json.read_text(encoding="utf-8")
+    prior_product = dest.read_bytes()
+    prior_planes = (tmp_path / "planes.json").read_text(encoding="utf-8")
+
+    xyz = _synthetic_street_cloud(n_wall=80, n_ground=40)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(23)
+    for i in range(2):
+        img = rng.integers(0, 255, (60, 80, 3), dtype=np.uint8)
+        pth = tmp_path / f"ctl{i}.jpg"
+        cv2.imwrite(str(pth), img)
+        frames.append(
+            {
+                "path": str(pth),
+                "e": float(i),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"ctl{i}",
+            }
+        )
+
+    def _ctrl_search(*a, **k):  # noqa: ANN001
+        return [_a_plane((8.0, 0.0), zncc=0.37), _a_plane((8.0, 20.0), zncc=0.36)]
+
+    monkeypatch.setattr(pp, "search_photo_consistent_planes", _ctrl_search)
+
+    meta = extract_facades(
+        ply,
+        dest,
+        frames=frames,
+        n_planes=8,
+        zncc_accept=0.35,
+        planarize=False,
+        keep_previous_on_fail=True,
+        fallback_heading=False,
+        a_source="flow",
+        control_out=False,
+    )
+    assert meta.get("output_kind") == "control"
+    assert (tmp_path / "facades.control.obj").is_file()
+    assert (tmp_path / "planes.control.json").is_file()
+    assert cand_obj.read_bytes() == prior_cand_obj
+    assert cand_json.read_text(encoding="utf-8") == prior_cand_json
+    assert dest.read_bytes() == prior_product
+    assert (tmp_path / "planes.json").read_text(encoding="utf-8") == prior_planes
+    assert (tex_dir / "candidate" / "facade_00.jpg").is_file()
+
+
+def test_candidate_survives_no_planarize_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit --control-out never writes facades.candidate.*."""
+    import ps1_hood.reconstruct.photo_planes as pp
+
+    dest = tmp_path / "facades.obj"
+    dest.write_text("# empty start\n", encoding="ascii")
+    xyz = _synthetic_street_cloud(n_wall=40, n_ground=20)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(29)
+    for i in range(2):
+        img = rng.integers(0, 255, (40, 50, 3), dtype=np.uint8)
+        pth = tmp_path / f"np{i}.jpg"
+        cv2.imwrite(str(pth), img)
+        frames.append(
+            {
+                "path": str(pth),
+                "e": float(i),
+                "n": 0.0,
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"np{i}",
+            }
+        )
+
+    monkeypatch.setattr(
+        pp,
+        "search_photo_consistent_planes",
+        lambda *a, **k: [_a_plane((8.0, 0.0), zncc=0.40)],
+    )
+    meta = extract_facades(
+        ply,
+        dest,
+        frames=frames,
+        planarize=False,
+        keep_previous_on_fail=False,
+        control_out=True,
+        a_source="flow",
+    )
+    assert meta.get("output_kind") == "control"
+    assert (tmp_path / "facades.control.obj").is_file()
+    assert not (tmp_path / "facades.candidate.obj").exists()
+    assert (tmp_path / "planes.control.json").is_file()
+    assert not (tmp_path / "planes.candidate.json").exists()
+
+
+def test_planes_from_product_json_is_a_family(tmp_path: Path) -> None:
+    import json
+
+    payload = {
+        "planes": [
+            {
+                "n": [1.0, 0.0, 0.0],
+                "d": -8.0,
+                "quad": [[8, 0, 0], [8, 8, 0], [8, 8, 9], [8, 0, 9]],
+                "width_m": 8.0,
+                "height_m": 9.0,
+                "zncc": 0.42,
+            }
+        ]
+    }
+    path = tmp_path / "planes.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    locked = planes_from_product_json(path)
+    assert len(locked) == 1
+    assert locked[0]["source"] == "product_lock"
+    assert is_a_source(locked[0]["source"])
