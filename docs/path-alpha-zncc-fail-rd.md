@@ -349,3 +349,14 @@ is recorded. FAIL-LOUD must include `scored=` / `finite=` / skip histogram and
 label `SENTINEL` when no finite score. Cam-depth gate uses **center→nearest-cam
 Euclidean** (not min `|n·C+d|` alone), defaults 2–35 m.
 
+
+---
+
+## Post–PR #17 addendum — real ZNCC / warp fix
+
+**Root cause:** not warp sign. Pre-refine depth gating + mid-block slab centers
+prevented finite scores (`scored=0` SENTINEL) or sampled wrong 12 m crops
+(ZNCC≈−0.08). Milestone A on the same frames still scored ≈0.42.
+
+**Fix:** long-wall split → deferred soft depth after ±n refine → re-pick views /
+flip `n` toward ref → `|c|<0.5` reject. Quality-keep unchanged.

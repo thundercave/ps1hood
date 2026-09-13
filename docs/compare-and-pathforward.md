@@ -207,5 +207,20 @@ First PR: smoke-block planarize only (no Instant Meshes / organic remesh). See r
 1. **Promote only if strictly better** (more textured, else more planes, else higher mean_zncc+eps); else write `facades.candidate.*` / `planes.candidate.json` and **keep product**. 2-plane fallback cannot clobber 7-plane.
 2. Depth gate → **center→cam Euclidean** (defaults 2–35 m); FAIL-LOUD prints `SENTINEL` when `scored=0` or no finite z, plus skip counts (`tilt/xy40/depth/views/load`).
 
-**R&D:** `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` (also fold into `docs/path-alpha-zncc-fail-rd.md`). Path α real ZNCC / warp sign remains follow-up if greps show finite anti-corr.
+**R&D:** `/workspace/path-alpha-zncc-neg1-and-quality-keep.md` (also fold into `docs/path-alpha-zncc-fail-rd.md`).
+
+---
+
+## 12) Path α real ZNCC / warp fix (2026-09-13)
+
+**Root cause (sentinel / weak ZNCC on MA peels):** hard **pre-refine** cam-depth gate + **unsplit street-slab AABB centers** mid-block → `scored=0` SENTINEL or uncorrelated 12 m crops. Warp/`H` path itself was fine (Milestone A ZNCC≈0.42 on same cameras).
+
+**This PR:**
+1. **Split** peels wider than 12 m into overlapping ~10 m façade windows (same `n,d`) before scoring.
+2. **Defer soft depth band** to per-candidate (post ±n refine); hard reject only outside 1–50 m Euclidean.
+3. **Re-pick views per candidate** + flip `n` toward nearest / ref cam so the wall faces the scorer.
+4. Reject ill-conditioned plane-induced `H` when `|c|<0.5`; optional peel `corners=` into `score_vertical_plane`.
+5. Keep quality-keep / `keep_previous` from PR #17 unchanged.
+
+Synthetic tests: photo-consistent MA hyp → ZNCC≥0.35; long-wall split; refine tries depth offsets; SENTINEL telemetry retained.
 

@@ -100,7 +100,9 @@ def plane_homography(
     t_rel = t_src - R_rel @ t_ref
     n_ref = R_ref @ n
     c = float(n @ (R_ref.T @ t_ref) - d)
-    if abs(c) < 1e-8:
+    # |c| is signed plane distance of the ref camera (up to sign convention).
+    # Tiny |c| → ill-conditioned / folding H (path-alpha-zncc-neg1 §2).
+    if abs(c) < 0.5:
         raise ValueError("plane through/near reference camera")
     return K_src @ (R_rel + np.outer(t_rel, n_ref) / c) @ np.linalg.inv(K_ref)
 
@@ -195,16 +197,22 @@ def score_vertical_plane(
     patch: int = 64,
     zncc_accept: float = DEFAULT_ZNCC_ACCEPT,
     min_views: int = 2,
+    corners: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Mean ZNCC of sources warped into ref ortho; accept if mean >= threshold.
 
     ``views[0]`` is the reference; remaining are cross-pano sources.
+    Optional ``corners`` (4x3 BL,BR,TR,TL) overrides the rebuilt rectangle when
+    Path α peels already provide a façade quad.
     """
     if len(views) < 2:
         return {"ok": False, "reason": "need >=2 views", "zncc": float("nan")}
 
     ref = views[0]
-    corners = sample_plane_quad_world(n, d, center, width_m, height_m)
+    if corners is not None:
+        corners = np.asarray(corners, dtype=np.float64).reshape(4, 3)
+    else:
+        corners = sample_plane_quad_world(n, d, center, width_m, height_m)
     Pref = P_from_Rt(ref.K, ref.Rcw, ref.t)
     uv_ref, front = project_points(Pref, corners)
     if not bool(front.all()):
@@ -230,11 +238,15 @@ def score_vertical_plane(
     scores: list[float] = []
     for src_view in views[1:]:
         try:
+            # Also reject ill-conditioned src (plane near src camera).
+            c_src = float(n @ (src_view.Rcw.T @ src_view.t) - d)
+            if abs(c_src) < 0.5:
+                continue
             H = plane_homography(
                 ref.K, ref.Rcw, ref.t, src_view.K, src_view.Rcw, src_view.t, n, d
             )
             H_src_to_ortho = H_ref @ np.linalg.inv(H)
-        except (ValueError, np.linalg.LinAlgError) as exc:
+        except (ValueError, np.linalg.LinAlgError):
             continue
         src_gray = cv2.cvtColor(src_view.image_bgr, cv2.COLOR_BGR2GRAY)
         warped = cv2.warpPerspective(

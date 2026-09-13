@@ -447,3 +447,13 @@ if not accepted and fallback_heading:
 ---
 
 *End. Pointer: path-forward §11.*
+
+---
+
+## 8) Post–PR #17 — real ZNCC / warp fix (landed)
+
+**Root cause:** sentinel/`scored=0` from hard pre-refine depth + unsplit slab
+centers — not anti-correlated warp sign. Milestone A ZNCC path was healthy.
+
+**Landed:** long-wall split; soft depth after ±n refine; re-pick views / flip `n`
+toward ref; `|c|<0.5` H reject; corners optional; quality-keep unchanged.
