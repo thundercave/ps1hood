@@ -10,6 +10,7 @@ from typing import Any
 from ps1_hood.align.bag_edges import snap_camera_to_bag
 from ps1_hood.align.georef import (
     ALIGN_PRIORS,
+    clip_recon_clouds_to_ortho,
     fit_se2,
     georef_payload,
     refresh_scene_cameras,
@@ -264,12 +265,16 @@ def stage_align(
     progress: Progress | None = None,
     *,
     align_prior: str | None = None,
+    sat_edge_weight: float | None = None,
+    cloud_clip_sat: bool | None = None,
+    sat_cloud_margin_m: float | None = None,
 ) -> list:
     """GPS/OSM prior → sat or BAG absolute seat.
 
-    Default ``align_prior=sat``: Ortho NCC + feature SE(2) bundle; **never**
-    ``snap_camera_to_bag``; skip footprint push that fights sat. Writes
-    ``align/georef.json`` and seats existing recon artefacts with one SE(2).
+    Default ``align_prior=sat``: Ortho edge+NCC fuse + feature SE(2) bundle;
+    **never** ``snap_camera_to_bag``; skip footprint push that fights sat.
+    After seat, optionally clip MA cloud to Ortho ENU ± margin.
+    Writes ``align/georef.json`` and seats existing recon artefacts with one SE(2).
     ``align_prior=bag`` keeps legacy BAG-first behaviour for debug.
     """
     spec = project.load_spec()
@@ -279,6 +284,12 @@ def stage_align(
     if align_prior is not None and getattr(spec, "align_prior", None) != prior:
         spec.align_prior = prior
         project.save_spec(spec)
+
+    w_edge = float(0.65 if sat_edge_weight is None else sat_edge_weight)
+    w_edge = min(1.0, max(0.0, w_edge))
+    w_ncc = 1.0 - w_edge
+    do_clip = True if cloud_clip_sat is None else bool(cloud_clip_sat)
+    clip_margin = float(2.0 if sat_cloud_margin_m is None else sat_cloud_margin_m)
 
     shots = project.read_json(project.cropped_dir / "shots.json")
     shots, dropped = _shots_in_bbox(shots, spec.bbox)
@@ -308,7 +319,7 @@ def stage_align(
             old_poses = None
 
     if prior == "sat":
-        _emit(progress, "align", "sat prior: Ortho NCC + feature SE(2); BAG snap off")
+        _emit(progress, "align", f"sat prior: Ortho edge+NCC (w_edge={w_edge:.2f}) + feature SE(2); BAG snap off")
         use_satellite = True
         use_features = True
     else:
@@ -325,6 +336,8 @@ def stage_align(
         ortho,
         use_satellite=use_satellite,
         use_features=use_features,
+        w_ncc=w_ncc,
+        w_edge=w_edge,
     )
 
     if prior == "bag":
@@ -394,6 +407,10 @@ def stage_align(
     T_sat = summarize_se2(poses_before, poses)
     scores = [float(p["sat_score"]) for p in poses if p.get("sat_score") is not None]
     sat_mean = sum(scores) / len(scores) if scores else None
+    ncc_vals = [float(p["sat_ncc"]) for p in poses if p.get("sat_ncc") is not None and float(p["sat_ncc"]) > -0.5]
+    edge_vals = [float(p["sat_edge"]) for p in poses if p.get("sat_edge") is not None and float(p["sat_edge"]) > -0.5]
+    sat_ncc_mean = sum(ncc_vals) / len(ncc_vals) if ncc_vals else None
+    sat_edge_mean = sum(edge_vals) / len(edge_vals) if edge_vals else None
     snapped_n = sum(1 for p in poses if p.get("bag_snapped"))
     georef = georef_payload(
         prior=prior,
@@ -401,6 +418,12 @@ def stage_align(
         sat_score_mean=sat_mean,
         bag_snapped=snapped_n,
         n_poses=len(poses),
+        extra={
+            "sat_ncc_mean": sat_ncc_mean,
+            "sat_edge_mean": sat_edge_mean,
+            "w_ncc": w_ncc,
+            "w_edge": w_edge,
+        },
     )
 
     # Seat existing product artefacts with one SE(2) (old poses → new) so Studio
@@ -426,6 +449,29 @@ def stage_align(
         georef["artefacts_seated"] = stats
         if stats:
             log.info("applied T_sat to recon artefacts (no prior poses): %s", stats)
+
+    # Floater gate: drop MA pts outside Ortho ENU ± margin (façades untouched)
+    if prior == "sat" and do_clip and (project.recon_dir / "cloud.ply").is_file():
+        clip_stats = clip_recon_clouds_to_ortho(
+            project.recon_dir,
+            ortho.sw,
+            ortho.sh,
+            ortho.ee,
+            ortho.nn,
+            margin_m=clip_margin,
+        )
+        georef["cloud_clipped"] = clip_stats
+        log.info(
+            "sat cloud clip kept=%s dropped=%s margin=%.1fm",
+            clip_stats.get("kept"),
+            clip_stats.get("dropped"),
+            clip_margin,
+        )
+        _emit(
+            progress,
+            "align",
+            f"clipped MA cloud: dropped {clip_stats.get('dropped', 0)} outside Ortho ±{clip_margin:.0f}m",
+        )
 
     cameras = explode_orbit_cameras(poses, shots)
     project.write_json(project.align_dir / "poses.json", poses)
@@ -456,11 +502,13 @@ def stage_align(
         )
     if prior == "sat":
         log.info(
-            "sat georef T_sat tx=%.2f ty=%.2f yaw=%.2f°  sat_score_mean=%s",
+            "sat georef T_sat tx=%.2f ty=%.2f yaw=%.2f°  sat_score_mean=%s ncc=%s edge=%s",
             T_sat["tx_m"],
             T_sat["ty_m"],
             T_sat["yaw_deg"],
             f"{sat_mean:.3f}" if sat_mean is not None else "n/a",
+            f"{sat_ncc_mean:.3f}" if sat_ncc_mean is not None else "n/a",
+            f"{sat_edge_mean:.3f}" if sat_edge_mean is not None else "n/a",
         )
     _emit(
         progress,
@@ -713,6 +761,9 @@ def run_all(
     from_stage: str = "discover",
     progress: Progress | None = None,
     align_prior: str | None = None,
+    sat_edge_weight: float | None = None,
+    cloud_clip_sat: bool | None = None,
+    sat_cloud_margin_m: float | None = None,
 ) -> None:
     if from_stage not in STAGES:
         raise ValueError(f"unknown stage {from_stage}")
@@ -723,7 +774,14 @@ def run_all(
         "crop": lambda: stage_crop(project, settings, progress),
         "satellite": lambda: stage_satellite(project, progress),
         "bag": lambda: stage_bag(project, progress),
-        "align": lambda: stage_align(project, progress, align_prior=align_prior),
+        "align": lambda: stage_align(
+            project,
+            progress,
+            align_prior=align_prior,
+            sat_edge_weight=sat_edge_weight,
+            cloud_clip_sat=cloud_clip_sat,
+            sat_cloud_margin_m=sat_cloud_margin_m,
+        ),
         "interpolate": lambda: stage_interpolate(project, progress),
         "reconstruct": lambda: stage_reconstruct(project, progress),
     }

@@ -387,3 +387,27 @@ Expect a_kept nearer ~7 if `cloud_flow` / flow `cloud.ply` present; ma_added non
 **PC smoke-dense:** `git pull` → `uv run ps1hood align smoke-dense --align-prior sat` → (artefacts auto-seated or `uv run python scripts/apply_georef.py smoke-dense`) → Studio hard-reload → cams+façades on sat streets ~metre; BAG off.
 
 **R&D pack:** [`sat-absolute-xy-register-rd.md`](sat-absolute-xy-register-rd.md)
+
+
+---
+
+## 22) Sat edge+NCC fuse + MA floater clip (2026-09-13)
+
+**Depends:** PR #28 (`--align-prior sat`) merged. Sacred unchanged: Ortho = absolute XY; photo relative 3D; BAG not hero.
+
+**Problem after #28:** mean photometric NCC ≈ 0.26 (soft); MA cloud floaters outside Ortho tile distract Studio.
+
+**This PR:**
+1. Fuse Ortho road/roof **Canny** (remap + Chamfer vs photo edges) with NCC in `align_camera_to_satellite`: `score = w_ncc·ncc + w_edge·edge` (default **0.35 / 0.65**). Telemetry: `sat_score`, `sat_ncc`, `sat_edge`, means in `georef.json`.
+2. PR1 shortcut: per-cam fused search + existing `_bundle_se2` (relative kept). Fine stage ±2 m / ±4°.
+3. After sat seat: **clip** `cloud.ply` / `cloud_photo.ply` to `Ortho.enu_corners` ± margin (default **2 m**); sidecar `*_satclipped.ply`; façades untouched.
+4. CLI: `--sat-edge-weight`, `--cloud-clip-sat/--no-cloud-clip-sat`, `--sat-cloud-margin-m`.
+
+**PC after merge:**
+```
+ps1hood align smoke-dense --align-prior sat
+# optional: --sat-edge-weight 0.65 --sat-cloud-margin-m 5
+```
+Expect higher `sat_edge` / fused `sat_score_mean`; fewer MA pts outside Ortho; Studio cleaner.
+
+**R&D pack:** [`sat-edge-ncc-tighten-rd.md`](sat-edge-ncc-tighten-rd.md)
