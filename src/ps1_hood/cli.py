@@ -464,7 +464,7 @@ def export_mapanything_bundle_cmd(
     show_default=True,
     help="Path α Open3D/numpy segment_plane peel (auto-on for dense MA PLY in extract_facades)",
 )
-@click.option("--zncc-accept", default=0.40, show_default=True, type=float)
+@click.option("--zncc-accept", default=0.35, show_default=True, type=float)
 @click.option("--voxel", "voxel_m", default=0.08, show_default=True, type=float)
 @click.option("--plane-dist", "plane_dist_m", default=0.08, show_default=True, type=float)
 @click.option("--max-planes", default=12, show_default=True, type=int)
