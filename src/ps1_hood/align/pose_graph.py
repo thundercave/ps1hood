@@ -150,12 +150,17 @@ def refine_poses(
     *,
     use_satellite: bool = True,
     use_features: bool = True,
+    w_ncc: float = 0.35,
+    w_edge: float = 0.65,
 ) -> list[dict[str, Any]]:
     refined = [dict(p) for p in poses]
     sat_obs: list[dict[str, Any]] = []
     feat_obs: list[dict[str, Any]] = []
 
     if use_satellite and ortho is not None:
+        from ps1_hood.align.sat_edges import ortho_edge_bgr
+
+        edge_img = ortho_edge_bgr(ortho)
         for i, pose in enumerate(refined):
             photo = cv2.imread(pose["shot_path"], cv2.IMREAD_COLOR)
             if photo is None:
@@ -172,8 +177,14 @@ def refine_poses(
                 fov_deg=pose["fov"],
                 max_shift_m=8.0,
                 max_heading_deg=15.0,
+                w_ncc=w_ncc,
+                w_edge=w_edge,
+                ortho_edges_bgr=edge_img,
             )
             pose["sat_score"] = hit["score"]
+            pose["sat_ncc"] = hit.get("ncc")
+            pose["sat_edge"] = hit.get("edge")
+            # Accept fused peak; soft floor keeps relative graph stable
             if hit["score"] > 0.08:
                 pose["e"] = hit["e"]
                 pose["n"] = hit["n"]

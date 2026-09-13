@@ -185,7 +185,7 @@ def georef_payload(
     if sat_score_mean is not None:
         out["sat_score_mean"] = float(sat_score_mean)
     if extra:
-        out.update(extra)
+        out.update({k: v for k, v in extra.items() if v is not None})
     return out
 
 
@@ -371,6 +371,209 @@ def apply_se2_to_planes_json(path: Path, T: dict[str, float], *, pivot_e: float 
     return n
 
 
+
+def clip_ply_to_ortho_enu(
+    path: Path,
+    sw: float,
+    sh: float,
+    ee: float,
+    nn: float,
+    *,
+    margin_m: float = 2.0,
+    dest: Path | None = None,
+) -> dict[str, Any]:
+    """Drop PLY verts whose XY (ENU e,n) lie outside Ortho bbox ± margin.
+
+    Does not touch façades.obj / quality metrics. Rewrites ``dest`` (default:
+    in-place ``path``) with kept vertices only. Returns counts + bbox used.
+    """
+    if not path.is_file():
+        return {"kept": 0, "dropped": 0, "margin_m": float(margin_m), "skipped": True}
+    e_lo, e_hi = float(sw) - margin_m, float(ee) + margin_m
+    n_lo, n_hi = float(sh) - margin_m, float(nn) + margin_m
+    raw = path.read_bytes()
+    header_end = raw.find(b"end_header")
+    if header_end < 0:
+        raise RuntimeError(f"not a PLY: {path}")
+    header = raw[:header_end].decode("ascii", errors="replace")
+    body = raw[header_end + len(b"end_header") :]
+    nl = b"\n"
+    if body.startswith(b"\r\n"):
+        body = body[2:]
+        nl = b"\r\n"
+    elif body.startswith(b"\n"):
+        body = body[1:]
+
+    fmt = "ascii"
+    n_verts = 0
+    props: list[tuple[str, str]] = []
+    in_vertex = False
+    header_lines = header.splitlines()
+    for line in header_lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            fmt = parts[1]
+        elif parts[0] == "element" and parts[1] == "vertex":
+            n_verts = int(parts[2])
+            in_vertex = True
+        elif parts[0] == "element":
+            in_vertex = False
+        elif in_vertex and parts[0] == "property":
+            props.append((parts[1], parts[2]))
+
+    if n_verts <= 0:
+        return {
+            "kept": 0,
+            "dropped": 0,
+            "margin_m": float(margin_m),
+            "bbox_enu": [e_lo, n_lo, e_hi, n_hi],
+        }
+
+    out_path = dest if dest is not None else path
+    dropped = 0
+
+    if fmt == "ascii":
+        text_body = body.decode("ascii", errors="replace")
+        lines = text_body.splitlines(keepends=True)
+        kept_str: list[str] = []
+        for i, line in enumerate(lines):
+            if i >= n_verts:
+                break
+            parts = line.split()
+            if len(parts) < 3:
+                dropped += 1
+                continue
+            x, y = float(parts[0]), float(parts[1])
+            if e_lo <= x <= e_hi and n_lo <= y <= n_hi:
+                kept_str.append(line if line.endswith("\n") else line + "\n")
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_str)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + "".join(kept_str).encode("ascii"))
+        kept = len(kept_str)
+    else:
+        type_map = {
+            "char": "b",
+            "uchar": "B",
+            "int8": "b",
+            "uint8": "B",
+            "short": "h",
+            "ushort": "H",
+            "int16": "h",
+            "uint16": "H",
+            "int": "i",
+            "uint": "I",
+            "int32": "i",
+            "uint32": "I",
+            "float": "f",
+            "float32": "f",
+            "double": "d",
+            "float64": "d",
+        }
+        endian = "<" if "little" in fmt else ">"
+        fmt_chars = []
+        for t, _name in props:
+            if t not in type_map:
+                raise RuntimeError(f"unsupported PLY prop type {t} in {path}")
+            fmt_chars.append(type_map[t])
+        if len(fmt_chars) < 3 or fmt_chars[0] not in "fd" or fmt_chars[1] not in "fd":
+            raise RuntimeError(f"PLY {path} does not start with float x/y")
+        vert_fmt = endian + "".join(fmt_chars)
+        vert_size = struct.calcsize(vert_fmt)
+        if len(body) < n_verts * vert_size:
+            raise RuntimeError(f"PLY body short: {path}")
+        kept_blobs: list[bytes] = []
+        for i in range(n_verts):
+            off = i * vert_size
+            chunk = body[off : off + vert_size]
+            vals = struct.unpack_from(vert_fmt, body, off)
+            x, y = float(vals[0]), float(vals[1])
+            if e_lo <= x <= e_hi and n_lo <= y <= n_hi:
+                kept_blobs.append(bytes(chunk))
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_blobs)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + b"".join(kept_blobs))
+        kept = len(kept_blobs)
+
+    log.info(
+        "clip_ply_to_ortho_enu %s: kept=%s dropped=%s margin=%.1fm",
+        out_path.name,
+        kept,
+        dropped,
+        margin_m,
+    )
+    return {
+        "kept": int(kept),
+        "dropped": int(dropped),
+        "margin_m": float(margin_m),
+        "bbox_enu": [float(e_lo), float(n_lo), float(e_hi), float(n_hi)],
+        "path": str(out_path),
+        "source": str(path),
+    }
+
+
+def clip_recon_clouds_to_ortho(
+    recon_dir: Path,
+    sw: float,
+    sh: float,
+    ee: float,
+    nn: float,
+    *,
+    margin_m: float = 2.0,
+    ply_names: tuple[str, ...] = ("cloud.ply", "cloud_photo.ply"),
+    write_sidecar: bool = True,
+) -> dict[str, Any]:
+    """Clip MA product clouds to Ortho ENU ± margin after sat seat.
+
+    Writes ``*_satclipped.ply`` sidecars and replaces the live product PLY so
+    Studio picks up the cleaned cloud. Façades are never clipped here.
+    """
+    summary: dict[str, Any] = {"margin_m": float(margin_m), "clouds": {}}
+    total_dropped = 0
+    total_kept = 0
+    for name in ply_names:
+        p = recon_dir / name
+        if not p.is_file():
+            continue
+        sidecar = recon_dir / name.replace(".ply", "_satclipped.ply")
+        dest = sidecar if write_sidecar else p
+        try:
+            stats = clip_ply_to_ortho_enu(
+                p, sw, sh, ee, nn, margin_m=margin_m, dest=dest
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("georef clip: skip %s (%s)", p, exc)
+            summary["clouds"][name] = {"error": str(exc)}
+            continue
+        if write_sidecar and dest != p and dest.is_file():
+            p.write_bytes(dest.read_bytes())
+        summary["clouds"][name] = stats
+        total_dropped += int(stats.get("dropped", 0))
+        total_kept += int(stats.get("kept", 0))
+    summary["kept"] = total_kept
+    summary["dropped"] = total_dropped
+    return summary
+
+
 def seat_recon_artefacts(
     recon_dir: Path,
     T: dict[str, float],
@@ -420,6 +623,10 @@ def refresh_scene_cameras(
         cam["heading"] = src["heading"]
         if "sat_score" in src:
             cam["sat_score"] = src["sat_score"]
+        if "sat_ncc" in src:
+            cam["sat_ncc"] = src["sat_ncc"]
+        if "sat_edge" in src:
+            cam["sat_edge"] = src["sat_edge"]
         if "residual_m" in src:
             cam["residual_m"] = src["residual_m"]
         cam["bag_snapped"] = bool(src.get("bag_snapped"))

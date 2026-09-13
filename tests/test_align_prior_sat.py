@@ -131,7 +131,7 @@ def _fake_initial(shots, spec, frame, osm):
     return out
 
 
-def _fake_refine(poses, spec, frame, ortho, *, use_satellite=True, use_features=True):
+def _fake_refine(poses, spec, frame, ortho, *, use_satellite=True, use_features=True, **_kw):
     refined = [dict(p) for p in poses]
     for p in refined:
         if use_satellite:

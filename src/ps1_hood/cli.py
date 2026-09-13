@@ -173,7 +173,17 @@ def bag_download_cmd() -> None:
     default=None,
     help="Absolute XY prior for align: sat (Ortho, default) or bag (legacy debug).",
 )
-def run_cmd(name: str, from_stage: str, align_prior: str | None) -> None:
+@click.option("--sat-edge-weight", "sat_edge_weight", type=float, default=None)
+@click.option("--cloud-clip-sat/--no-cloud-clip-sat", "cloud_clip_sat", default=None)
+@click.option("--sat-cloud-margin-m", "sat_cloud_margin_m", type=float, default=None)
+def run_cmd(
+    name: str,
+    from_stage: str,
+    align_prior: str | None,
+    sat_edge_weight: float | None,
+    cloud_clip_sat: bool | None,
+    sat_cloud_margin_m: float | None,
+) -> None:
     """Run the pipeline (or resume from a stage)."""
     settings = Settings.from_env()
     project = open_project(name)
@@ -183,7 +193,15 @@ def run_cmd(name: str, from_stage: str, align_prior: str | None) -> None:
         project.save_spec(spec)
     click.echo(f"run {project.root}  from {from_stage}")
     try:
-        run_all(project, settings, from_stage=from_stage, align_prior=align_prior)
+        run_all(
+            project,
+            settings,
+            from_stage=from_stage,
+            align_prior=align_prior,
+            sat_edge_weight=sat_edge_weight,
+            cloud_clip_sat=cloud_clip_sat,
+            sat_cloud_margin_m=sat_cloud_margin_m,
+        )
     except Exception as exc:
         click.echo(f"failed: {exc}", err=True)
         raise SystemExit(1) from exc
@@ -230,9 +248,38 @@ def satellite_cmd(name: str) -> None:
     type=click.Choice(["sat", "bag"]),
     default="sat",
     show_default=True,
-    help="Absolute XY prior: sat = Ortho NCC + SE(2) (no BAG snap); bag = legacy.",
+    help="Absolute XY prior: sat = Ortho edge+NCC + SE(2) (no BAG snap); bag = legacy.",
 )
-def align_cmd(name: str, align_prior: str) -> None:
+@click.option(
+    "--sat-edge-weight",
+    "sat_edge_weight",
+    type=float,
+    default=0.65,
+    show_default=True,
+    help="Weight for Ortho Canny edge term in fused sat score (w_ncc = 1 - w_edge).",
+)
+@click.option(
+    "--cloud-clip-sat/--no-cloud-clip-sat",
+    "cloud_clip_sat",
+    default=True,
+    show_default=True,
+    help="After sat seat, clip MA cloud.ply to Ortho ENU bbox ± margin.",
+)
+@click.option(
+    "--sat-cloud-margin-m",
+    "sat_cloud_margin_m",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="ENU margin (m) outside Ortho bbox when --cloud-clip-sat.",
+)
+def align_cmd(
+    name: str,
+    align_prior: str,
+    sat_edge_weight: float,
+    cloud_clip_sat: bool,
+    sat_cloud_margin_m: float,
+) -> None:
     from ps1_hood.pipeline import stage_align
 
     project = open_project(name)
@@ -240,7 +287,13 @@ def align_cmd(name: str, align_prior: str) -> None:
     if getattr(spec, "align_prior", None) != align_prior:
         spec.align_prior = align_prior
         project.save_spec(spec)
-    stage_align(project, align_prior=align_prior)
+    stage_align(
+        project,
+        align_prior=align_prior,
+        sat_edge_weight=sat_edge_weight,
+        cloud_clip_sat=cloud_clip_sat,
+        sat_cloud_margin_m=sat_cloud_margin_m,
+    )
 
 
 @main.command("interpolate")
