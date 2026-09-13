@@ -510,6 +510,50 @@ def export_mapanything_bundle_cmd(
     type=float,
     help="Overlap between consecutive split windows (m)",
 )
+@click.option(
+    "--min-inliers",
+    default=400,
+    show_default=True,
+    type=int,
+    help="Peel: minimum inliers for a RANSAC plane (Path α)",
+)
+@click.option(
+    "--residual-stop",
+    default=1500,
+    show_default=True,
+    type=int,
+    help="Peel: stop when remaining cloud points fall below this",
+)
+@click.option(
+    "--vertical-dot",
+    default=0.15,
+    show_default=True,
+    type=float,
+    help="Peel: max |n·up| to accept as vertical façade",
+)
+@click.option(
+    "--peel-max-planes",
+    default=24,
+    show_default=True,
+    type=int,
+    help="Peel budget (distinct from keep --max-planes)",
+)
+@click.option(
+    "--nms-xy",
+    "nms_xy_m",
+    default=6.0,
+    show_default=True,
+    type=float,
+    help="NMS XY center radius (m); split siblings use --nms-xy-split",
+)
+@click.option(
+    "--nms-xy-split",
+    "nms_xy_split_m",
+    default=4.0,
+    show_default=True,
+    type=float,
+    help="NMS XY radius (m) when either hyp has split_parent",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -524,6 +568,12 @@ def facades_cmd(
     split_trigger_width_m: float,
     split_window_m: float,
     split_overlap_m: float,
+    min_inliers: int,
+    residual_stop: int,
+    vertical_dot: float,
+    peel_max_planes: int,
+    nms_xy_m: float,
+    nms_xy_split_m: float,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -582,6 +632,12 @@ def facades_cmd(
             split_trigger_width_m=split_trigger_width_m,
             split_window_m=split_window_m,
             split_overlap_m=split_overlap_m,
+            min_inliers=min_inliers,
+            residual_stop=residual_stop,
+            vertical_dot=vertical_dot,
+            peel_max_planes=peel_max_planes,
+            nms_xy_m=nms_xy_m,
+            nms_xy_split_m=nms_xy_split_m,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)

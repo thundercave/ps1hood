@@ -71,17 +71,17 @@ Also log (add if missing): pre-NMS accept count, split window count, per-hyp bes
 |------|---------|-------|-----------|
 | `voxel` | 0.08 m | `planes_from_mapanything_ply` | `--voxel` |
 | `distance_threshold` | 0.08 m | peel | `--plane-dist` |
-| `min_inliers` | 400 | peel | **not exposed** |
-| `residual_stop` | 1500 | peel | **not exposed** |
-| `vertical_dot_max` | 0.15 | peel | **not exposed** |
-| `max_planes` | 24 (peel) / 12 keep | peel / score | `--max-planes` (keep; peel uses `max(n_planes,24)`) |
+| `min_inliers` | 400 | peel | `--min-inliers` (PR-2) |
+| `residual_stop` | 1500 | peel | `--residual-stop` (PR-2) |
+| `vertical_dot_max` | 0.15 | peel | `--vertical-dot` (PR-2) |
+| `max_planes` | 24 (peel) / 12 keep | peel / score | `--peel-max-planes` / `--max-planes` (PR-2) |
+| NMS XY | 6 m / **4 m** split siblings | score | `--nms-xy` / `--nms-xy-split` (PR-2) |
 | `aabb_percentile` | 5–95 | `inliers_to_quad` | no |
 | `max_width/height` | 25 / 15 | quad | no |
 | `min_height` | 2.5 | quad | no |
-| `split_trigger / window / overlap` | 12 / 10 / 2 | `split_long_hyp` | no |
+| `split_trigger / window / overlap` | 8 / 8 / 2 | `split_long_hyp` | `--split-*` (PR-1) |
 | `zncc_accept` | **0.35** | score | `--zncc-accept` |
 | `refine_deltas` | ±0.5…2 m | score | no |
-| NMS | n·n≥0.85, \|Δd\|<2.5, XY<6 m | score | no |
 
 ### Recommended smoke grid (param sweep = **second** PR)
 
@@ -111,7 +111,7 @@ Run on smoke block with product bak restored; `--keep-previous-on-fail` on; log 
 | B4 | 12 | 8 | 2 | split earlier length, smaller crops |
 
 **Wire CLI (minimal for smoke):**  
-`--min-inliers`, `--residual-stop`, `--vertical-dot`, `--split-trigger`, `--split-window`, `--split-overlap`, `--peel-max-planes` (distinct from keep `max-planes`).
+`--min-inliers`, `--residual-stop`, `--vertical-dot`, `--split-trigger`, `--split-window`, `--split-overlap`, `--peel-max-planes` (distinct from keep `max-planes`), `--nms-xy` / `--nms-xy-split` (PR-2).
 
 **Do not** lower `zncc_accept` below 0.35 for product runs (smoke may try 0.30 for telemetry only).
 
@@ -282,12 +282,21 @@ Do **not** change `_is_strictly_better` floors (min textured 3 / mean 0.35) — 
 - Full peel param sweep / exposing all peel knobs (PR-2).  
 - Changing zncc_accept, quality-keep floors, OSM/BAG, Poisson.
 
-### PR-2 — peel param sweep
+### PR-2 — peel param sweep ★ (ship after #21)
+
+**PC #21:** hybrid kept **5** @ mean 0.399; promote NO vs product **7/5/0.42**. Quality-keep correct — grow count via peel grid, do not weaken promote.
 
 **In**
-- CLI: `--min-inliers`, `--residual-stop`, `--vertical-dot`, `--peel-max-planes`.  
-- Smoke grid A (§2); pick new defaults only if PC shows ≥+2 textured without slab spam.  
-- Optional: NMS XY 4 m for split siblings; max_score_windows cap.
+- CLI: `--min-inliers`, `--residual-stop`, `--vertical-dot`, `--peel-max-planes` (defaults **unchanged**; knobs for PC grid).  
+- NMS XY **4 m** for `split_parent` siblings (`--nms-xy` 6 / `--nms-xy-split` 4); log `pre_nms→kept`.  
+- Smoke grid A (§2) first cell **A1**, then **B1**; pick new defaults only if PC shows ≥+2 textured without slab spam.  
+- Docs: compare §14 + this note. `detect_planar_patches` / DBSCAN remain parked.
+
+**First PC recipe (A1):**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --voxel 0.06 --plane-dist 0.06 --min-inliers 300 --residual-stop 1000 --peel-max-planes 32
+```
 
 ---
 
