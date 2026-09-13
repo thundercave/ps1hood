@@ -410,9 +410,16 @@ def _is_strictly_better(
 ) -> tuple[bool, str]:
     """Promote only if new is strictly better than existing product.
 
-    Order: more textured → more planes (same textured) → higher mean_zncc
-    (same textured+planes, by > eps). Never demote a product that already
-    meets soft floors (textured≥min or mean_zncc≥min).
+    Never promote on textured↑ alone when plane count drops or mean ZNCC
+    regresses by more than ``zncc_eps``. Soft floors (textured≥min or
+    mean_zncc≥min) still protect an already-good product from weak replaces.
+
+    Clauses (first match wins; reason string names the clause):
+      1. textured_new > textured_prior AND planes_new ≥ planes_prior
+         AND mean_zncc_new ≥ mean_prior − eps
+      2. textured equal AND planes_new > planes_prior
+         AND mean_zncc_new ≥ mean_prior − eps
+      3. textured and planes equal AND mean_zncc_new ≥ mean_prior + eps
     """
     nt = int(new_q.get("textured") or 0)
     pt = int(prev_q.get("textured") or 0)
@@ -427,35 +434,52 @@ def _is_strictly_better(
     old_good = pt >= min_textured or (
         pm is not None and float(pm) >= float(min_mean_zncc)
     )
-    if old_good:
-        if nt < pt:
-            return False, f"fewer textured ({nt}<{pt})"
-        if nt == pt and np_ < pp_:
-            return False, f"fewer planes ({np_}<{pp_})"
-        if (
-            nt == pt
-            and np_ == pp_
-            and pm is not None
-            and (nm is None or float(nm) <= float(pm) + float(zncc_eps))
-        ):
-            return False, (
-                f"not higher mean_zncc ({nm} vs {pm})"
-            )
 
-    if nt > pt:
-        return True, "more textured walls"
-    if nt == pt and np_ > pp_:
-        return True, "more planes"
-    if (
-        nt == pt
-        and np_ == pp_
-        and nm is not None
-        and pm is not None
-        and float(nm) > float(pm) + float(zncc_eps)
-    ):
-        return True, "higher mean_zncc"
+    def _mean_not_regress() -> bool:
+        if pm is None:
+            return True
+        if nm is None:
+            return False
+        return float(nm) >= float(pm) - float(zncc_eps)
+
+    def _mean_improved() -> bool:
+        if nm is None or pm is None:
+            return False
+        return float(nm) >= float(pm) + float(zncc_eps)
+
+    # Clause 1: more textured, planes not down, mean within eps of prior
+    if nt > pt and np_ >= pp_ and _mean_not_regress():
+        return True, "clause1:more textured (planes≥, mean within eps)"
+
+    # Clause 2: same textured, more planes, mean not material regress
+    if nt == pt and np_ > pp_ and _mean_not_regress():
+        return True, "clause2:more planes (mean within eps)"
+
+    # Clause 3: same textured + planes, mean up by ≥ eps
+    if nt == pt and np_ == pp_ and _mean_improved():
+        return True, "clause3:higher mean_zncc"
+
     if not old_good and (np_ > 0 or nt > 0):
         return True, "replace empty/weak product"
+
+    if nt < pt:
+        return False, f"fewer textured ({nt}<{pt})"
+    if nt > pt and np_ < pp_:
+        return False, (
+            f"more textured but fewer planes ({np_}<{pp_})"
+        )
+    if nt > pt and not _mean_not_regress():
+        return False, (
+            f"more textured but mean_zncc regress ({nm} vs {pm})"
+        )
+    if nt == pt and np_ < pp_:
+        return False, f"fewer planes ({np_}<{pp_})"
+    if nt == pt and np_ > pp_ and not _mean_not_regress():
+        return False, (
+            f"more planes but mean_zncc regress ({nm} vs {pm})"
+        )
+    if nt == pt and np_ == pp_:
+        return False, f"not higher mean_zncc ({nm} vs {pm})"
     return False, "candidate not strictly better"
 
 
@@ -568,9 +592,11 @@ def extract_facades(
     write diagnostics to ``*.failed`` instead.
 
     Quality gate: with ``keep_previous_on_fail``, **promote only if strictly
-    better** than the existing product (more textured walls, or same textured
-    with more planes / higher ``mean_zncc``). Weaker or equal results —
-    including Milestone A fallback after Path α 0 accepts — go to
+    better** than the existing product — more textured only when planes do
+    not drop and mean ZNCC stays within ``zncc_eps`` of prior; or same
+    textured with more planes (mean within eps) / higher mean (+eps). Never
+    textured↑ alone when planes↓ or mean regresses >eps. Weaker or equal
+    results — including Milestone A fallback after Path α 0 accepts — go to
     ``*.candidate`` and the live product is kept.
     """
     import logging
