@@ -202,6 +202,8 @@ def _warp_facade_texture(
     quad: list[tuple[float, float, float]],
     frame: dict[str, Any],
     dest: Path,
+    *,
+    ps1_tex_size: int | None = 128,
 ) -> bool:
     img = frame.get("_img")
     if img is None:
@@ -239,8 +241,15 @@ def _warp_facade_texture(
     )
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (tw, th), flags=cv2.INTER_LINEAR)
+    if ps1_tex_size is not None and int(ps1_tex_size) > 0:
+        from ps1_hood.reconstruct.ps1_facades import apply_ps1_texture
+
+        warped = apply_ps1_texture(warped, tex_size=int(ps1_tex_size))
+        jpeg_q = 85
+    else:
+        jpeg_q = 88
     dest.parent.mkdir(parents=True, exist_ok=True)
-    return bool(cv2.imwrite(str(dest), warped, [int(cv2.IMWRITE_JPEG_QUALITY), 88]))
+    return bool(cv2.imwrite(str(dest), warped, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]))
 
 
 def _ground_satellite_texture(
@@ -675,6 +684,8 @@ def extract_facades(
     a_source: str = "flow",
     output_kind: str = "auto",
     control_out: bool = False,
+    ps1_rectify: bool = True,
+    ps1_tex_size: int | None = 128,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -1095,6 +1106,12 @@ def extract_facades(
     for pl in accepted:
         planes.append(plane_dict_for_obj(pl, ground_z))
 
+    if ps1_rectify and planes:
+        from ps1_hood.reconstruct.ps1_facades import manhattan_rectify_planes
+
+        planes = manhattan_rectify_planes(planes)
+        log.info("facades: PS1 manhattan_rectify_planes on %s accepts", len(planes))
+
     dest_obj.parent.mkdir(parents=True, exist_ok=True)
     tex_dir = dest_obj.parent / "textures"
     mtl_path = dest_obj.with_suffix(".mtl")
@@ -1262,7 +1279,9 @@ def extract_facades(
             cam = _pick_frontal_camera(pl, quad, frames)
             if cam is not None:
                 tex_path = bake_tex_dir / f"facade_{i:02d}.jpg"
-                if _warp_facade_texture(quad, cam, tex_path):
+                if _warp_facade_texture(
+                    quad, cam, tex_path, ps1_tex_size=ps1_tex_size
+                ):
                     map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
                     textured += 1
         materials.append(
