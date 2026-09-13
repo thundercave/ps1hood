@@ -43,10 +43,12 @@ DEFAULT_REFINE_DELTAS_M = (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0)
 DEFAULT_HARD_MIN_CAM_DIST_M = 1.0
 DEFAULT_HARD_MAX_CAM_DIST_M = 50.0
 # Split long street-slab peels into overlapping façade windows before ZNCC.
-DEFAULT_SPLIT_TRIGGER_WIDTH_M = 12.0
-DEFAULT_SPLIT_WINDOW_M = 10.0
+# PR-1 denser defaults (was 12 / 10 / 2) — NL row-house scale ~6–10 m.
+DEFAULT_SPLIT_TRIGGER_WIDTH_M = 8.0
+DEFAULT_SPLIT_WINDOW_M = 8.0
 DEFAULT_SPLIT_OVERLAP_M = 2.0
 DEFAULT_SCORE_CLAMP_M = 12.0
+DEFAULT_MAX_HEADING_SEEDS = 24
 
 try:
     import open3d as o3d
@@ -153,6 +155,8 @@ def inliers_to_quad(
     t0, t1 = (float(x) for x in np.percentile(t, [lo, hi]))
     if ground_z is not None:
         t0 = max(t0, float(ground_z) - float(c @ up_t) - 0.2)
+    raw_width_m = float(s1 - s0)
+    raw_height_m = float(t1 - t0)
     # Clamp huge street-slab peels about AABB center
     mid_s = 0.5 * (s0 + s1)
     mid_t = 0.5 * (t0 + t1)
@@ -179,6 +183,8 @@ def inliers_to_quad(
         "center": corners.mean(axis=0),
         "width_m": float(width_m),
         "height_m": float(height_m),
+        "raw_width_m": float(raw_width_m),
+        "raw_height_m": float(raw_height_m),
         "corners": corners,
         "source": "ma_segment",
     }
@@ -194,11 +200,16 @@ def split_long_hyp(
     """Split a wide peel into overlapping façade-sized windows (same n, d).
 
     Street-slab AABB centers often sit mid-block far from cams → depth/view
-    skips (sentinel scored=0) or wrong 12 m crops. Overlapping 8–12 m windows
-    give ZNCC a chance on real façades (path-alpha-zncc-fail-rd Fix C).
+    skips (sentinel scored=0) or wrong crops. Overlapping ~8 m windows give
+    ZNCC a chance on real façades (path-alpha-zncc-fail-rd Fix C; PR-1 denser
+    defaults). When ``raw_width_m`` (pre-clamp percentile span) exceeds the
+    clamped ``width_m``, expand the split span about the center so long peels
+    still yield façade-local windows.
     """
     w = float(hyp.get("width_m") or 0.0)
-    if w <= trigger_width_m + 1e-6:
+    raw_w = float(hyp.get("raw_width_m") or 0.0)
+    span = max(w, raw_w)
+    if span <= trigger_width_m + 1e-6:
         return [hyp]
     corners = hyp.get("corners")
     n = np.asarray(hyp["n"], dtype=np.float64)
@@ -221,6 +232,11 @@ def split_long_hyp(
         t_vals = (corners - origin) @ up
         t0, t1 = float(t_vals.min()), float(t_vals.max())
         height_m = float(hyp.get("height_m") or (t1 - t0))
+        # Expand to pre-clamp raw span when AABB clamp hid true length
+        if raw_w > (s1 - s0) + 1e-6:
+            mid = 0.5 * (s0 + s1)
+            half = 0.5 * raw_w
+            s0, s1 = mid - half, mid + half
     else:
         # Reconstruct local frame like inliers_to_quad
         up_t = UP - n * float(n @ UP)
@@ -233,7 +249,7 @@ def split_long_hyp(
         up = np.cross(n, right)
         up /= np.linalg.norm(up) + 1e-12
         origin = center.copy()
-        half = 0.5 * w
+        half = 0.5 * span
         s0, s1 = -half, half
         height_m = float(hyp.get("height_m") or 6.0)
         t0, t1 = -0.5 * height_m, 0.5 * height_m
@@ -598,6 +614,10 @@ def score_planar_hyps(
     hard_min_cam_dist_m: float = DEFAULT_HARD_MIN_CAM_DIST_M,
     hard_max_cam_dist_m: float = DEFAULT_HARD_MAX_CAM_DIST_M,
     split_long: bool = True,
+    seed_hyps: list[dict[str, Any]] | None = None,
+    split_trigger_width_m: float = DEFAULT_SPLIT_TRIGGER_WIDTH_M,
+    split_window_m: float = DEFAULT_SPLIT_WINDOW_M,
+    split_overlap_m: float = DEFAULT_SPLIT_OVERLAP_M,
 ) -> list[dict[str, Any]]:
     """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
 
@@ -613,11 +633,19 @@ def score_planar_hyps(
        *after* ±n refine (so refine can rescue depth).
     3. Re-picks views per candidate (esp. after normal flip).
     4. Flips ``n`` toward the nearest cam before scoring so the ref sees the front.
+    5. Optional ``seed_hyps`` (Milestone A heading×distance) scored in the same
+       pass + NMS → union(A, MA) promote (PR-1 hybrid).
     """
     from ps1_hood.reconstruct import photo_planes as pp
     from ps1_hood.reconstruct.photo_planes import load_view
 
-    if not hyps:
+    ma_hyps = list(hyps or [])
+    extra = list(seed_hyps or [])
+    for h in ma_hyps:
+        if not h.get("source"):
+            h["source"] = "ma_segment"
+    all_hyps = ma_hyps + extra
+    if not all_hyps:
         return []
     if len(frames) < 2:
         log.error(
@@ -638,11 +666,26 @@ def score_planar_hyps(
         dtype=np.float64,
     )
 
-    score_hyps = expand_hyps_for_scoring(hyps) if split_long else list(hyps)
-    if split_long and len(score_hyps) != len(hyps):
+    if split_long:
+        score_hyps = expand_hyps_for_scoring(
+            all_hyps,
+            trigger_width_m=split_trigger_width_m,
+            window_m=split_window_m,
+            overlap_m=split_overlap_m,
+        )
+    else:
+        score_hyps = list(all_hyps)
+    if split_long and len(score_hyps) != len(all_hyps):
         log.info(
             "planarize: expanded %s peels → %s score windows (long-wall split)",
-            len(hyps),
+            len(all_hyps),
+            len(score_hyps),
+        )
+    if extra:
+        log.info(
+            "planarize hybrid: ma=%s a=%s → windows=%s",
+            len(ma_hyps),
+            len(extra),
             len(score_hyps),
         )
 
@@ -804,15 +847,29 @@ def score_planar_hyps(
         if len(kept) >= max_keep:
             break
 
+    def _is_ma_source(src: str | None) -> bool:
+        s = (src or "ma_segment").lower()
+        return s.startswith("ma_") or s in {"ma_segment", "mapanything_planarize"}
+
+    def _is_a_source(src: str | None) -> bool:
+        s = (src or "").lower()
+        return s in {"heading_distance", "manhattan", "sparse"} or s.startswith(
+            "photo_"
+        )
+
+    n_pre_nms = len(accepted)
+    ma_kept = sum(1 for p in kept if _is_ma_source(p.get("source")))
+    a_kept = sum(1 for p in kept if _is_a_source(p.get("source")))
+
     if not kept:
         sentinel = n_scored == 0 or n_finite == 0
         tag = "SENTINEL" if sentinel else "measured"
         log.error(
-            "planarize: FAIL-LOUD — 0 / %s MA hyps passed ZNCC≥%.2f "
+            "planarize: FAIL-LOUD — 0 / %s hyps passed ZNCC≥%.2f "
             "(best rejected≈%.3f %s; scored=%s finite=%s; "
             "skips tilt=%s xy40=%s depth=%s soft_depth=%s views=%s load=%s; "
-            "windows=%s). Not inventing RANSAC/OSM walls.",
-            len(hyps),
+            "windows=%s; pre_nms=%s; ma=%s a=%s). Not inventing RANSAC/OSM walls.",
+            len(all_hyps),
             zncc_accept,
             best_reject,
             tag,
@@ -825,19 +882,26 @@ def score_planar_hyps(
             skip["views"],
             skip["load"],
             len(score_hyps),
+            n_pre_nms,
+            len(ma_hyps),
+            len(extra),
         )
     else:
         mean_z = float(np.mean([float(p["zncc"]) for p in kept]))
         if mean_z < 0.42:
             log.warning("planarize: mean ZNCC of kept=%.3f < 0.42 (soft warn)", mean_z)
         log.info(
-            "planarize: kept %s / %s MA hyps (ZNCC≥%.2f, mean=%.3f, scored=%s, windows=%s)",
+            "planarize: kept %s / %s hyps (ZNCC≥%.2f, mean=%.3f, scored=%s, "
+            "windows=%s, pre_nms=%s, ma_kept=%s a_kept=%s)",
             len(kept),
-            len(hyps),
+            len(all_hyps),
             zncc_accept,
             mean_z,
             n_scored,
             len(score_hyps),
+            n_pre_nms,
+            ma_kept,
+            a_kept,
         )
     return kept
 

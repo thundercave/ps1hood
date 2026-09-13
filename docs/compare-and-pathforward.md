@@ -234,3 +234,18 @@ Codified NL public-space sizes (kenteken 520×110 mm, zebra 0.50/0.50, Type-I si
 
 Full note: [`docs/nl-codified-street-measures.md`](nl-codified-street-measures.md).
 
+
+
+---
+
+## 13) Path α after PR #20 (2026-09-13) — more accepts / hybrid
+
+**PC:** Path α kept **1 / 24** MA hyps at **ZNCC=0.439** (above 0.35) — peel+threshold **WORKS**. Quality-keep correctly refused promote (1 textured ≪ product **7/5/0.42**).
+
+**Bottleneck:** not ZNCC kernel — **hypothesis coverage**. Ranked: (1) A heading seeds only run when MA accepts=0 (idle when MA keeps 1); (2) RANSAC largest-vertical peel budget; (3) split defaults coarse (trigger 12 / window 10 / overlap 2); (4) NMS XY<6 m collapses split siblings.
+
+**Next PR (smallest):** denser façade splits (8–12 m windows) + **hybrid** inject Milestone A heading×distance into `score_planar_hyps` alongside MA peels + promote **union(A,MA)** via existing quality-keep if textured_count or mean_zncc beats product. Peel param smoke grid = second PR.
+
+**R&D pack:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md).
+
+**PR-1 scope (this):** denser splits + hybrid A seeds + union promote. Open3D addendum (DBSCAN on inliers / `detect_planar_patches` / MVS dist 0.03–0.10) is **parked** — not in PR-1.
