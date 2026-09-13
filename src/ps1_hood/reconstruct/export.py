@@ -44,6 +44,7 @@ def scene_payload(
     satellite: dict[str, Any] | None,
     cloud: dict[str, Any] | None,
     buildings: list[dict[str, Any]] | None = None,
+    georef: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cameras = []
     for p in poses:
@@ -62,7 +63,7 @@ def scene_payload(
                 "bag_snapped": p.get("bag_snapped"),
             }
         )
-    return {
+    out: dict[str, Any] = {
         "name": spec_name,
         "bbox": bbox.as_dict(),
         "origin": {"lat": frame.lat0, "lon": frame.lon0},
@@ -72,6 +73,9 @@ def scene_payload(
         "satellite": satellite_with_enu(satellite, frame),
         "cloud": cloud,
     }
+    if georef is not None:
+        out["georef"] = georef
+    return out
 
 
 def write_scene(path: Path, payload: dict[str, Any]) -> None:

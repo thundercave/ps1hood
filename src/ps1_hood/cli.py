@@ -11,7 +11,7 @@ import click
 from ps1_hood import __version__
 from ps1_hood.config import Settings
 from ps1_hood.geo import BBox
-from ps1_hood.pipeline import STAGES, run_all  # includes bag + 3DBAG edge snap
+from ps1_hood.pipeline import STAGES, run_all  # align-prior sat (default) or bag
 from ps1_hood.project import create_project, default_runs_root, open_project
 from ps1_hood.config import ProjectSpec
 
@@ -166,13 +166,24 @@ def bag_download_cmd() -> None:
 @main.command("run")
 @click.argument("name")
 @click.option("--from-stage", "from_stage", default="discover", type=click.Choice(STAGES))
-def run_cmd(name: str, from_stage: str) -> None:
+@click.option(
+    "--align-prior",
+    "align_prior",
+    type=click.Choice(["sat", "bag"]),
+    default=None,
+    help="Absolute XY prior for align: sat (Ortho, default) or bag (legacy debug).",
+)
+def run_cmd(name: str, from_stage: str, align_prior: str | None) -> None:
     """Run the pipeline (or resume from a stage)."""
     settings = Settings.from_env()
     project = open_project(name)
+    if align_prior is not None:
+        spec = project.load_spec()
+        spec.align_prior = align_prior
+        project.save_spec(spec)
     click.echo(f"run {project.root}  from {from_stage}")
     try:
-        run_all(project, settings, from_stage=from_stage)
+        run_all(project, settings, from_stage=from_stage, align_prior=align_prior)
     except Exception as exc:
         click.echo(f"failed: {exc}", err=True)
         raise SystemExit(1) from exc
@@ -213,10 +224,23 @@ def satellite_cmd(name: str) -> None:
 
 @main.command("align")
 @click.argument("name")
-def align_cmd(name: str) -> None:
+@click.option(
+    "--align-prior",
+    "align_prior",
+    type=click.Choice(["sat", "bag"]),
+    default="sat",
+    show_default=True,
+    help="Absolute XY prior: sat = Ortho NCC + SE(2) (no BAG snap); bag = legacy.",
+)
+def align_cmd(name: str, align_prior: str) -> None:
     from ps1_hood.pipeline import stage_align
 
-    stage_align(open_project(name))
+    project = open_project(name)
+    spec = project.load_spec()
+    if getattr(spec, "align_prior", None) != align_prior:
+        spec.align_prior = align_prior
+        project.save_spec(spec)
+    stage_align(project, align_prior=align_prior)
 
 
 @main.command("interpolate")

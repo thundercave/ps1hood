@@ -365,3 +365,25 @@ Expect a_kept nearer ~7 if `cloud_flow` / flow `cloud.ply` present; ma_added non
 
 **Survey / R&D:** [`studio-layer-alignment-survey.md`](studio-layer-alignment-survey.md) · [`studio-overlay-enu-align-rd.md`](studio-overlay-enu-align-rd.md)
 
+
+
+---
+
+## 21) Sat absolute XY register (2026-09-13) — shipped `--align-prior sat`
+
+**Sacred lock:** WGS84 Esri ortho = **absolute real-world XY**. BAG untrusted / not hero. Photo multi-view keeps **relative** 3D; one SE(2) seats cams+cloud+façades on Ortho.
+
+**Strategy flip vs PR #27:** PR #27 fixed Studio *viewer* sat plane placement (Ortho ENU) + default-hide BAG. This PR locks *poses + recon* to sat streets (not BAG edges). Viewer placement ≠ pose authority — both needed.
+
+**CLI:** `ps1hood align <run> --align-prior {sat,bag}` (default **`sat`**); same flag on `run`.
+
+| Prior | Sat NCC + feature SE(2) | `snap_camera_to_bag` | `push_out_of_footprints` |
+|-------|-------------------------|----------------------|--------------------------|
+| **sat** (default) | ON | never | skipped |
+| **bag** (debug) | off when BAG present (legacy) | ON when buildings | ON |
+
+**Persist:** `align/georef.json` + `scene.json.georef = { prior, T_sat, scores }` (centroid before→after + mean yaw). After sat align, same SE(2) seats existing `cloud.ply` / `facades.obj` when prior `poses.json` exists (`T_applied`); else `scripts/apply_georef.py`.
+
+**PC smoke-dense:** `git pull` → `uv run ps1hood align smoke-dense --align-prior sat` → (artefacts auto-seated or `uv run python scripts/apply_georef.py smoke-dense`) → Studio hard-reload → cams+façades on sat streets ~metre; BAG off.
+
+**R&D pack:** [`sat-absolute-xy-register-rd.md`](sat-absolute-xy-register-rd.md)
