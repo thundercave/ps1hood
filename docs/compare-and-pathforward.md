@@ -249,3 +249,23 @@ Full note: [`docs/nl-codified-street-measures.md`](nl-codified-street-measures.m
 **R&D pack:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md).
 
 **PR-1 scope (this):** denser splits + hybrid A seeds + union promote. Open3D addendum (DBSCAN on inliers / `detect_planar_patches` / MVS dist 0.03–0.10) is **parked** — not in PR-1.
+
+
+---
+
+## 14) Path α after PR #21 (2026-09-13) — peel knobs + NMS XY (PR-2)
+
+**PC after #21 (hybrid + denser splits):** hybrid `ma=24 a=165 → windows=344; pre_nms=10; kept **5** (ma_kept=2 a_kept=3) mean_zncc=**0.399** source=mapanything_hybrid`. Promote **NO** vs product **7/5/0.42** (fewer planes; textured tied; mean lower). Product held correctly — do **not** weaken quality-keep yet.
+
+**Goal:** raise textured_count above 5 and/or mean_zncc enough to beat quality-keep, without demoting product. Grow unique façade **COUNT** via peel aggressiveness + less NMS merge of split siblings.
+
+**PR-2 (this):** expose peel CLI knobs (defaults unchanged: min_inliers=400, residual_stop=1500, vertical_dot=0.15, peel_max_planes=24) + NMS XY **4 m** for `split_parent` siblings (`--nms-xy` default 6 / `--nms-xy-split` default 4). Log `pre_nms→kept` + nms radii. `detect_planar_patches` / DBSCAN stay parked.
+
+**Recommended first PC smoke (grid A1 then B1):**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --voxel 0.06 --plane-dist 0.06 --min-inliers 300 --residual-stop 1000 --peel-max-planes 32
+```
+Do **not** lower `zncc_accept` below 0.35 for product runs.
+
+**R&D:** [`docs/path-alpha-more-accepts-rd.md`](path-alpha-more-accepts-rd.md) §2 grids A/B, §6 PR-2.

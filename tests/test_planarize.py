@@ -14,6 +14,7 @@ from ps1_hood.reconstruct.planarize import (
     HAS_OPEN3D,
     expand_hyps_for_scoring,
     inliers_to_quad,
+    nms_keep_planes,
     planes_from_mapanything_ply,
     resolve_dense_ply,
     score_planar_hyps,
@@ -1107,3 +1108,167 @@ def test_extract_facades_hybrid_default(
     assert len(called["seed_hyps"]) >= 1
     assert meta.get("path_alpha") is True
 
+
+def _plane(center_xy, *, zncc=0.5, split=False, d=-8.0):
+    x, y = center_xy
+    return {
+        "n": np.array([1.0, 0.0, 0.0]),
+        "d": float(d),
+        "center": np.array([float(x), float(y), 4.0]),
+        "width_m": 8.0,
+        "height_m": 8.0,
+        "zncc": float(zncc),
+        "source": "ma_segment",
+        "split_parent": bool(split),
+    }
+
+
+def test_nms_split_siblings_keep_beyond_4m() -> None:
+    """Split siblings ~5 m apart survive at split_xy=4; closer pair collapses."""
+    far = [
+        _plane((8.0, 0.0), zncc=0.55, split=True),
+        _plane((8.0, 5.0), zncc=0.50, split=True),  # 5 m > 4 m
+    ]
+    kept_far = nms_keep_planes(far, max_keep=8)
+    assert len(kept_far) == 2
+
+    near = [
+        _plane((8.0, 0.0), zncc=0.55, split=True),
+        _plane((8.0, 3.0), zncc=0.50, split=True),  # 3 m < 4 m
+    ]
+    kept_near = nms_keep_planes(near, max_keep=8)
+    assert len(kept_near) == 1
+    assert float(kept_near[0]["zncc"]) == pytest.approx(0.55)
+
+
+def test_nms_non_split_still_collapses_under_6m() -> None:
+    """Without split_parent, default XY=6 still merges a 5 m pair."""
+    pair = [
+        _plane((8.0, 0.0), zncc=0.55, split=False),
+        _plane((8.0, 5.0), zncc=0.50, split=False),
+    ]
+    kept = nms_keep_planes(pair, max_keep=8)
+    assert len(kept) == 1
+
+    # Same pair with one marked split uses 4 m → both keep
+    mixed = [
+        _plane((8.0, 0.0), zncc=0.55, split=True),
+        _plane((8.0, 5.0), zncc=0.50, split=False),
+    ]
+    kept_mixed = nms_keep_planes(mixed, max_keep=8)
+    assert len(kept_mixed) == 2
+
+
+def test_extract_facades_peel_knobs_forwarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI peel knobs reach planes_from_mapanything_ply + score_planar_hyps."""
+    import ps1_hood.reconstruct.photo_planes as pp
+    import ps1_hood.reconstruct.planarize as pl
+
+    xyz = _synthetic_street_cloud(n_wall=400, n_ground=200)
+    ply = tmp_path / "cloud.ply"
+    _write_xyz_ply(ply, xyz)
+    frames = []
+    rng = np.random.default_rng(7)
+    for i in range(2):
+        img = rng.integers(0, 255, (80, 100, 3), dtype=np.uint8)
+        p = tmp_path / f"pk{i}.jpg"
+        cv2.imwrite(str(p), img)
+        frames.append(
+            {
+                "path": str(p),
+                "e": 0.0,
+                "n": float(i),
+                "u": 2.0,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "pano_id": f"pk{i}",
+            }
+        )
+
+    seen: dict = {}
+
+    def _fake_planes(ply_path, cam_c, **kwargs):  # noqa: ANN001
+        seen["planes_kwargs"] = dict(kwargs)
+        return (
+            [
+                {
+                    "n": np.array([1.0, 0.0, 0.0]),
+                    "d": -5.0,
+                    "center": np.array([5.0, 0.0, 3.0]),
+                    "width_m": 8.0,
+                    "height_m": 6.0,
+                    "source": "ma_segment",
+                }
+            ],
+            {"z": 0.0},
+            10,
+        )
+
+    def _fake_score(hyps, frames, **kwargs):  # noqa: ANN001
+        seen["score_kwargs"] = dict(kwargs)
+        return [
+            {
+                "n": np.array([1.0, 0.0, 0.0]),
+                "d": -5.0,
+                "center": np.array([5.0, 0.0, 3.0]),
+                "width_m": 8.0,
+                "height_m": 6.0,
+                "zncc": 0.5,
+                "ok": True,
+                "source": "ma_segment",
+                "count": 100,
+            }
+        ]
+
+    monkeypatch.setattr(pl, "planes_from_mapanything_ply", _fake_planes)
+    monkeypatch.setattr(pl, "score_planar_hyps", _fake_score)
+    monkeypatch.setattr(pp, "hypothesize_vertical_planes", lambda *a, **k: [])
+
+    extract_facades(
+        ply,
+        tmp_path / "facades.obj",
+        frames=frames,
+        n_planes=8,
+        zncc_accept=0.35,
+        planarize=True,
+        keep_previous_on_fail=False,
+        fallback_heading=False,
+        hybrid_heading=False,
+        min_inliers=300,
+        residual_stop=1000,
+        vertical_dot=0.18,
+        peel_max_planes=32,
+        nms_xy_m=6.0,
+        nms_xy_split_m=4.0,
+    )
+    pk = seen["planes_kwargs"]
+    assert pk["min_inliers"] == 300
+    assert pk["residual_stop"] == 1000
+    assert pk["vertical_dot_max"] == pytest.approx(0.18)
+    assert pk["max_planes"] == 32
+    sk = seen["score_kwargs"]
+    assert sk["nms_xy_m"] == pytest.approx(6.0)
+    assert sk["nms_xy_split_m"] == pytest.approx(4.0)
+
+
+def test_facades_cli_exposes_peel_knobs() -> None:
+    from click.testing import CliRunner
+
+    from ps1_hood.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["facades", "--help"])
+    assert result.exit_code == 0
+    help_text = result.output
+    for flag in (
+        "--min-inliers",
+        "--residual-stop",
+        "--vertical-dot",
+        "--peel-max-planes",
+        "--nms-xy",
+        "--nms-xy-split",
+    ):
+        assert flag in help_text

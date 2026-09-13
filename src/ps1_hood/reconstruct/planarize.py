@@ -49,6 +49,10 @@ DEFAULT_SPLIT_WINDOW_M = 8.0
 DEFAULT_SPLIT_OVERLAP_M = 2.0
 DEFAULT_SCORE_CLAMP_M = 12.0
 DEFAULT_MAX_HEADING_SEEDS = 24
+# NMS: general XY dup radius 6 m; split siblings use 4 m so adjacent
+# façade windows on the same wall can both keep (PR-2 / R&D §3).
+DEFAULT_NMS_XY_M = 6.0
+DEFAULT_NMS_XY_SPLIT_M = 4.0
 
 try:
     import open3d as o3d
@@ -537,6 +541,7 @@ def planes_from_mapanything_ply(
     min_inliers: int = DEFAULT_MIN_INLIERS,
     max_planes: int = DEFAULT_MAX_PLANES,
     residual_stop: int = DEFAULT_RESIDUAL_STOP,
+    vertical_dot_max: float = DEFAULT_VERTICAL_DOT,
     prefer_open3d: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, int]:
     """MA ENU PLY → photo_planes-compatible vertical façade hypotheses.
@@ -555,6 +560,7 @@ def planes_from_mapanything_ply(
             min_inliers=min_inliers,
             max_planes=max_planes,
             residual_stop=residual_stop,
+            vertical_dot_max=vertical_dot_max,
             ground_z=ground_z,
         )
         n_residual = len(residual.points)
@@ -584,6 +590,7 @@ def planes_from_mapanything_ply(
             min_inliers=min_inl,
             max_planes=max_planes,
             residual_stop=residual_stop,
+            vertical_dot_max=vertical_dot_max,
             ground_z=ground_z,
         )
         n_residual = len(residual_xyz)
@@ -598,6 +605,47 @@ def planes_from_mapanything_ply(
         ply_path.name,
     )
     return hyps, ground, n_residual
+
+
+
+def nms_keep_planes(
+    accepted: list[dict[str, Any]],
+    *,
+    max_keep: int = 16,
+    nms_xy_m: float = DEFAULT_NMS_XY_M,
+    nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
+    n_dot_min: float = 0.85,
+    d_tol_m: float = 2.5,
+) -> list[dict[str, Any]]:
+    """NMS on ZNCC-sorted accepts.
+
+    When either hyp has ``split_parent``, use ``nms_xy_split_m`` (default 4 m)
+    instead of ``nms_xy_m`` (default 6 m) so denser split windows on the same
+    wall are less likely to collapse each other.
+    """
+    kept: list[dict[str, Any]] = []
+    for pl in accepted:
+        n = pl["n"]
+        d = pl["d"]
+        dup = False
+        pl_split = bool(pl.get("split_parent"))
+        for k in kept:
+            if abs(float(n @ k["n"])) < n_dot_min:
+                continue
+            if abs(float(d - k["d"])) < d_tol_m or abs(float(d + k["d"])) < d_tol_m:
+                xy_thresh = (
+                    float(nms_xy_split_m)
+                    if (pl_split or bool(k.get("split_parent")))
+                    else float(nms_xy_m)
+                )
+                if float(np.linalg.norm(pl["center"][:2] - k["center"][:2])) < xy_thresh:
+                    dup = True
+                    break
+        if not dup:
+            kept.append(pl)
+        if len(kept) >= max_keep:
+            break
+    return kept
 
 
 def score_planar_hyps(
@@ -618,6 +666,8 @@ def score_planar_hyps(
     split_trigger_width_m: float = DEFAULT_SPLIT_TRIGGER_WIDTH_M,
     split_window_m: float = DEFAULT_SPLIT_WINDOW_M,
     split_overlap_m: float = DEFAULT_SPLIT_OVERLAP_M,
+    nms_xy_m: float = DEFAULT_NMS_XY_M,
+    nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
 ) -> list[dict[str, Any]]:
     """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
 
@@ -830,22 +880,12 @@ def score_planar_hyps(
             accepted.append(best_local)
 
     accepted.sort(key=lambda p: -float(p.get("zncc") or 0.0))
-    kept: list[dict[str, Any]] = []
-    for pl in accepted:
-        n = pl["n"]
-        d = pl["d"]
-        dup = False
-        for k in kept:
-            if abs(float(n @ k["n"])) < 0.85:
-                continue
-            if abs(float(d - k["d"])) < 2.5 or abs(float(d + k["d"])) < 2.5:
-                if float(np.linalg.norm(pl["center"][:2] - k["center"][:2])) < 6.0:
-                    dup = True
-                    break
-        if not dup:
-            kept.append(pl)
-        if len(kept) >= max_keep:
-            break
+    kept = nms_keep_planes(
+        accepted,
+        max_keep=max_keep,
+        nms_xy_m=float(nms_xy_m),
+        nms_xy_split_m=float(nms_xy_split_m),
+    )
 
     def _is_ma_source(src: str | None) -> bool:
         s = (src or "ma_segment").lower()
@@ -892,7 +932,8 @@ def score_planar_hyps(
             log.warning("planarize: mean ZNCC of kept=%.3f < 0.42 (soft warn)", mean_z)
         log.info(
             "planarize: kept %s / %s hyps (ZNCC≥%.2f, mean=%.3f, scored=%s, "
-            "windows=%s, pre_nms=%s, ma_kept=%s a_kept=%s)",
+            "windows=%s, pre_nms=%s→kept=%s, ma_kept=%s a_kept=%s, "
+            "nms_xy=%.1f split_xy=%.1f)",
             len(kept),
             len(all_hyps),
             zncc_accept,
@@ -900,8 +941,11 @@ def score_planar_hyps(
             n_scored,
             len(score_hyps),
             n_pre_nms,
+            len(kept),
             ma_kept,
             a_kept,
+            float(nms_xy_m),
+            float(nms_xy_split_m),
         )
     return kept
 

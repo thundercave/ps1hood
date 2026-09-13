@@ -539,6 +539,12 @@ def extract_facades(
     split_window_m: float | None = None,
     split_overlap_m: float | None = None,
     max_heading_seeds: int = 24,
+    min_inliers: int | None = None,
+    residual_stop: int | None = None,
+    vertical_dot: float | None = None,
+    peel_max_planes: int | None = None,
+    nms_xy_m: float | None = None,
+    nms_xy_split_m: float | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -573,9 +579,15 @@ def extract_facades(
         search_photo_consistent_planes,
     )
     from ps1_hood.reconstruct.planarize import (
+        DEFAULT_MAX_PLANES,
+        DEFAULT_MIN_INLIERS,
+        DEFAULT_NMS_XY_M,
+        DEFAULT_NMS_XY_SPLIT_M,
+        DEFAULT_RESIDUAL_STOP,
         DEFAULT_SPLIT_OVERLAP_M,
         DEFAULT_SPLIT_TRIGGER_WIDTH_M,
         DEFAULT_SPLIT_WINDOW_M,
+        DEFAULT_VERTICAL_DOT,
         DEFAULT_ZNCC_ACCEPT_MA,
         PLANARIZE_AUTO_MIN_POINTS,
         planes_from_mapanything_ply,
@@ -623,6 +635,24 @@ def extract_facades(
             if frames
             else xyz.mean(axis=0)
         )
+        peel_n = (
+            int(peel_max_planes)
+            if peel_max_planes is not None
+            else int(DEFAULT_MAX_PLANES)
+        )
+        peel_min_inl = (
+            int(min_inliers) if min_inliers is not None else int(DEFAULT_MIN_INLIERS)
+        )
+        peel_resid = (
+            int(residual_stop)
+            if residual_stop is not None
+            else int(DEFAULT_RESIDUAL_STOP)
+        )
+        peel_vdot = (
+            float(vertical_dot)
+            if vertical_dot is not None
+            else float(DEFAULT_VERTICAL_DOT)
+        )
         hyps, ground, residual_pts = planes_from_mapanything_ply(
             Path(ply_path),
             cam_c,
@@ -630,7 +660,10 @@ def extract_facades(
             ground_z=ground_z,
             voxel=voxel_m,
             distance_threshold=plane_dist_m,
-            max_planes=max(n_planes, 24),
+            min_inliers=peel_min_inl,
+            max_planes=peel_n,
+            residual_stop=peel_resid,
+            vertical_dot_max=peel_vdot,
         )
         if ground is not None and ground.get("z") is not None:
             ground_z = float(ground["z"])
@@ -662,6 +695,10 @@ def extract_facades(
                 len(seed_hyps),
             )
 
+        nms_xy = float(DEFAULT_NMS_XY_M if nms_xy_m is None else nms_xy_m)
+        nms_xy_split = float(
+            DEFAULT_NMS_XY_SPLIT_M if nms_xy_split_m is None else nms_xy_split_m
+        )
         accepted = score_planar_hyps(
             hyps,
             frames,
@@ -671,6 +708,8 @@ def extract_facades(
             split_trigger_width_m=split_trigger,
             split_window_m=split_window,
             split_overlap_m=split_overlap,
+            nms_xy_m=nms_xy,
+            nms_xy_split_m=nms_xy_split,
         )
 
         def _is_ma(src: str | None) -> bool:
