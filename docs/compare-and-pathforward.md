@@ -320,3 +320,30 @@ Keep soft floors (min textured 3 / mean 0.35). Do **not** lower `zncc_accept`. L
 ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
   --union-strategy a_priority --max-planes 16
 ```
+
+
+---
+
+## 18) Path α after PR #25 (2026-09-13) — dual-source A(flow) + MA(peels)
+
+**PC after #25 dual-arm:** A_arm kept=**1** (both arms on **MA ply**); MA_arm 9→3; **a_kept=1 ma_added=3 union 4/4/0.454**; promote NO (4 textured < product 5). A-only `--no-planarize` on the same MA ply: **2/2/0.374**. Product held **7/5/0.42**. Side: A-only control overwrote `facades.candidate.*`.
+
+**Cause:** dual-arm *search path* is correct; dual-**source** was missing. Historic 7 is flow-era A on `recon/cloud.ply` (~99k), not MA-ply A (ceiling ~1–2). Pipeline `_facade_pass` swapped the single seed to MA whenever MA existed.
+
+**This PR (dual-source):**
+1. Split PLY: A xyz/`ground_z` from `--a-source flow` (`recon/cloud_flow.ply` if present, else `recon/cloud.ply`); MA peels from `--ma-source mapanything`. `--source` is MA-only compat.
+2. Keep dual-arm: A = `search_photo_consistent_planes` on flow; MA = peels → `score_planar_hyps` `seed_hyps=None`; union `a_priority`.
+3. `--a-source product` locks live `planes.json` as the A family (also fallback when flow is thin).
+4. Controls (`--no-planarize` / `--control-out`) write `facades.control.*` / `planes.control.json` — never clobber `*.candidate` or live product.
+5. Quality-keep (PR #24 / §16) unchanged. No OSM/BAG. No peel/α2 dig.
+6. Telemetry: `a_ply=… ma_ply=… a_kept=… ma_added=…`.
+7. `_facade_pass` passes flow `cloud_ply` as `a_ply_path`; MA is peel-only.
+
+**PC after merge:**
+```
+ps1-hood facades smoke-dense --planarize --source mapanything --zncc-accept 0.35 \
+  --a-source flow --union-strategy a_priority --max-planes 16
+```
+Expect a_kept nearer ~7 if `cloud_flow` / flow `cloud.ply` present; ma_added non-dup; promote only if beats 7/5/0.42.
+
+**R&D pack:** [`docs/path-alpha-flow-a-ma-union-rd.md`](path-alpha-flow-a-ma-union-rd.md).

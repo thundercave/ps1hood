@@ -464,21 +464,25 @@ def stage_reconstruct(project: Project, progress: Progress | None = None) -> dic
 
     def _facade_pass(cloud_ply: Path, meta: dict) -> None:
         try:
-            # Path α: prefer MapAnything ENU product PLY for plane seeds when present
-            ma_ply = project.root / "mapanything" / "cloud.ply"
-            ma_recon = project.recon_dir / "cloud_mapanything.ply"
-            seed = cloud_ply
-            for cand in (ma_ply, ma_recon):
+            # Dual-source: A xyz stays on the triangulated flow cloud;
+            # MA peels use MapAnything ENU when present. Do not swap A onto MA.
+            ma_ply = None
+            for cand in (
+                project.root / "mapanything" / "cloud.ply",
+                project.recon_dir / "cloud_mapanything.ply",
+            ):
                 if cand.is_file():
-                    seed = cand
+                    ma_ply = cand
                     break
             fac = extract_facades(
-                seed,
+                ma_ply or cloud_ply,
                 project.recon_dir / "facades.obj",
                 frames=frames,
                 satellite=sat,
                 local_frame=frame,
                 planarize=None,  # auto when dense ≳50k
+                a_ply_path=cloud_ply,
+                a_source="flow",
             )
             meta["facades"] = fac
             if int(fac.get("planes") or 0) == 0:
