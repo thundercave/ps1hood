@@ -52,7 +52,7 @@
 
     const sceneJson = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/scene')).json();
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
-      + `<br><label><input type="checkbox" id="togCloud" checked> cloud</label>`
+      + `<br><label><input type="checkbox" id="togCloud"> cloud (raw MA)</label>`
       + ` <label><input type="checkbox" id="togZclean"> zclean</label>`
       + ` <label><input type="checkbox" id="togOfftile"> offtile</label>`
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
@@ -204,6 +204,7 @@
       remapEnuGeometry(geom);
       const mat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, opacity: 0.45, transparent: true });
       cloudPoints = new THREE.Points(geom, mat);
+      cloudPoints.visible = false;  // hero default: façades + sat roofs; cloud = debug toggle
       scene.add(cloudPoints);
     } catch (err) {
       hud.innerHTML += '<br>no point cloud yet';
