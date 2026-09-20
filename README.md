@@ -101,6 +101,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Façade gap fill (PR-C):** `ps1hood facades <run> --gap-fill` keeps the hybrid 10/8 A core, adds ZNCC-gated manhattan/sat-corner seeds + road-rejected MA peels for side/return walls, promotes only via quality-keep. See [`docs/facade-gap-fill.md`](docs/facade-gap-fill.md).
 
+**Worst-cam gap fill:** `--gap-fill --worst-cams id,id,...` or `--worst-from-compare N` seeds planes toward those compare cams (8–20 m × yaw); locks product; NMS-adds new; bakes new textures only; quality-keep vs 18/18. See [`docs/worst-cam-gap-fill.md`](docs/worst-cam-gap-fill.md).
+
 **Sat-locked roofs/yards (PR-A):** `ps1hood roofs <run>` builds flat Ortho-ENU shells from sat Canny+flood, Z from MA median / façade top, textures from sat crop → `recon/roofs.obj`. Studio **roofs** toggle. See [`docs/sat-roof-yard-shells.md`](docs/sat-roof-yard-shells.md).
 
 **Pano↔mesh compare (diagnose):** `ps1hood compare <run>` reprojects façades+roofs into SV with known ENU poses → ZNCC + edge + sat footprint Chamfer; writes `recon/compare/` overlays + `summary.json` (worst cams). No densify / free-pose / product wipe. See [`docs/pano-mesh-compare.md`](docs/pano-mesh-compare.md).

@@ -64,6 +64,10 @@ rg -n "gap_fill|candidate NOT promoted|clause|union_kept|road-center" \
 
 ---
 
+See also [`worst-cam-gap-fill.md`](worst-cam-gap-fill.md) for targeted seeds toward compare worst cams (`--worst-cams` / `--worst-from-compare`).
+
+---
+
 ## Non-goals
 
 BAG/OSM shells · free-pose · peel-as-hero (peel_max >32) · PS1 polish before gaps closed · hungry cloud clip

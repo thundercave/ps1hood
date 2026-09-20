@@ -423,8 +423,15 @@ def _pick_scoring_views(
     *,
     max_views: int = 4,
     min_frontal: float = 0.25,
+    prefer_indices: list[int] | None = None,
+    prefer_boost: float = 2.0,
 ) -> list[int]:
-    """Pick up to max_views frame indices (cross-pano) that see the plane frontally."""
+    """Pick up to max_views frame indices (cross-pano) that see the plane frontally.
+
+    ``prefer_indices`` (e.g. worst-cam frame indices) get ``prefer_boost`` on
+    the rank score so the picker includes those views when frontal enough.
+    """
+    prefer = set(int(i) for i in (prefer_indices or []))
     n_xy = n[:2] / (np.linalg.norm(n[:2]) + 1e-12)
     scored: list[tuple[float, int]] = []
     for i, fr in enumerate(frames):
@@ -449,7 +456,10 @@ def _pick_scoring_views(
         dist = float(np.linalg.norm(C - center))
         if dist < 2.0 or dist > 35.0:
             continue
-        scored.append((frontal / (1.0 + 0.03 * dist), i))
+        score = frontal / (1.0 + 0.03 * dist)
+        if i in prefer:
+            score *= float(prefer_boost)
+        scored.append((score, i))
 
     scored.sort(key=lambda t: -t[0])
     # Cross-pano only among selected
