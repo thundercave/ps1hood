@@ -213,11 +213,21 @@ uv run pytest
 
 ## Forced sat SE(2) (`sat-offset`)
 
-When edge re-seat no-ops but product (red) is stuck vs Ortho edges (yellow), measure one rigid SE(2) from façade long edges vs Ortho Canny and force-apply it (bak first; skip sat-native roofs/street):
+When edge re-seat no-ops but product (red) is stuck vs Ortho edges (yellow):
+
+1. **Prefer Studio yellow↔red corner picks** (≥3 pairs) → fit preview → apply only on confirm.
+2. Auto Chamfer measure is available but **do not auto-apply** — NN pairs can latch road/tree.
 
 ```bash
+# Studio picks (CLI):
+uv run ps1hood sat-offset fit-pairs smoke-dense --pairs pairs.json   # preview → align/T_pick.json
+uv run ps1hood sat-offset apply smoke-dense --from align/T_pick.json # bak + apply after confirm
+
+# Auto Chamfer (suspect until pairs overlay looks wall↔wall):
 uv run ps1hood sat-offset measure smoke-dense --out align/T_force.json
-uv run ps1hood sat-offset apply smoke-dense --from align/T_force.json
+# hold apply until Studio preview agrees
 ```
+
+Studio: viewer → **sat-offset pick** → yellow then red corners → **fit preview** → **apply T**.
 
 See [`docs/sat-forced-se2.md`](docs/sat-forced-se2.md).

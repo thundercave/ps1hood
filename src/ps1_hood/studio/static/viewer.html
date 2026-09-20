@@ -67,6 +67,11 @@
       + ` <button type="button" id="btnSculptUndo" disabled>undo</button>`
       + `<br><span id="sculptStatus" style="color:#9ad">sculpt: off</span>`
       + `<br><label>bake cam <select id="sculptCam" disabled><option value="">frontal</option></select></label>`
+      + `<br><label><input type="checkbox" id="togSatPick"> sat-offset pick</label>`
+      + ` <button type="button" id="btnSatFit" disabled>fit preview</button>`
+      + ` <button type="button" id="btnSatApply" disabled>apply T</button>`
+      + ` <button type="button" id="btnSatClear" disabled>clear</button>`
+      + `<br><span id="satPickStatus" style="color:#e8c36a">sat-offset: off · do not auto-apply Chamfer T</span>`
       + `<br><a href="/">back</a>`;
 
     // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
@@ -584,6 +589,7 @@
           width_m: Number(pl.width_m) || 1,
           height_m: Number(pl.height_m) || 1,
           zncc: pl.zncc, mesh,
+          quad: quad.map((c) => c.slice()),
         });
       });
     };
@@ -705,10 +711,214 @@
       location.reload();
     });
 
+
+    // --- sat-offset Studio corner picks (yellow sat ↔ red product) ---
+    // Preview-only fit; apply requires explicit confirm. Never auto-applies Chamfer T.
+    let satPickOn = false;
+    let satExpect = 'yellow'; // alternate yellow then red
+    let satPairs = []; // {yellow:{e,n}, red:{e,n}}
+    let satPendingYellow = null;
+    let satPreview = null;
+    const satPickGroup = new THREE.Group();
+    scene.add(satPickGroup);
+    const satGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const satHit = new THREE.Vector3();
+    const satRay = new THREE.Raycaster();
+    const satPtr = new THREE.Vector2();
+
+    const from3 = (v) => ({ e: v.x, n: -v.z, u: v.y });
+
+    function clearSatMarkers() {
+      while (satPickGroup.children.length) {
+        const c = satPickGroup.children.pop();
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+      }
+    }
+
+    function addSatMarker(e, n, color, y = 0.4) {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 12, 10),
+        new THREE.MeshBasicMaterial({ color, depthTest: false })
+      );
+      mesh.position.copy(to3(e, n, y));
+      mesh.renderOrder = 10;
+      satPickGroup.add(mesh);
+      return mesh;
+    }
+
+    function addSatSegment(a, b, color) {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        to3(a.e, a.n, 0.35),
+        to3(b.e, b.n, 0.35),
+      ]);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, depthTest: false }));
+      line.renderOrder = 10;
+      satPickGroup.add(line);
+    }
+
+    function redrawSatPicks() {
+      clearSatMarkers();
+      for (const p of satPairs) {
+        addSatMarker(p.yellow.e, p.yellow.n, 0xf0e060, 0.5);
+        addSatMarker(p.red.e, p.red.n, 0xe05050, 0.5);
+        addSatSegment(p.red, p.yellow, 0xffffff);
+      }
+      if (satPendingYellow) {
+        addSatMarker(satPendingYellow.e, satPendingYellow.n, 0xf0e060, 0.55);
+      }
+      if (satPreview && satPreview.preview) {
+        const mapped = satPreview.preview.red_mapped || [];
+        for (const m of mapped) {
+          addSatMarker(m.e, m.n, 0x50e0f0, 0.7);
+        }
+        for (const ar of (satPreview.preview.arrows || [])) {
+          if (ar.from && ar.mapped) addSatSegment(ar.from, ar.mapped, 0x50e0f0);
+        }
+      }
+    }
+
+    function updateSatStatus() {
+      const el = document.getElementById('satPickStatus');
+      if (!el) return;
+      if (!satPickOn) {
+        el.textContent = 'sat-offset: off · do not auto-apply Chamfer T';
+        return;
+      }
+      const n = satPairs.length;
+      let msg = `sat-offset pick: next=${satExpect}  pairs=${n}/3+`;
+      if (satPendingYellow) msg += ' (yellow set — click red façade corner)';
+      if (satPreview) {
+        msg += `  |  T tx=${satPreview.tx_m.toFixed(2)} ty=${satPreview.ty_m.toFixed(2)} yaw=${satPreview.yaw_deg.toFixed(2)}° rms=${satPreview.rms_m.toFixed(3)}m — preview only`;
+      }
+      el.textContent = msg;
+      const fitBtn = document.getElementById('btnSatFit');
+      const applyBtn = document.getElementById('btnSatApply');
+      const clearBtn = document.getElementById('btnSatClear');
+      if (fitBtn) fitBtn.disabled = n < 3;
+      if (applyBtn) applyBtn.disabled = !satPreview;
+      if (clearBtn) clearBtn.disabled = false;
+    }
+
+    function setSatPick(on) {
+      satPickOn = !!on;
+      if (satPickOn && sculptOn) {
+        const ts = document.getElementById('togSculpt');
+        if (ts) { ts.checked = false; ts.dispatchEvent(new Event('change')); }
+      }
+      if (satPickOn) {
+        const tf = document.getElementById('togFacades');
+        if (tf && !tf.checked) { tf.checked = true; tf.dispatchEvent(new Event('change')); }
+        // nudge camera toward top-down for corner picking
+        camera.position.set(camera.position.x, Math.max(camera.position.y, 55), camera.position.z);
+        controls.update();
+      }
+      updateSatStatus();
+      redrawSatPicks();
+    }
+
+    function pickGroundEnu(ev) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      satPtr.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      satPtr.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+      satRay.setFromCamera(satPtr, camera);
+      const ok = satRay.ray.intersectPlane(satGroundPlane, satHit);
+      if (!ok) return null;
+      return from3(satHit);
+    }
+
+    function nearestFacadeCorner(enu, maxDist = 1.5) {
+      let best = null, bestD = maxDist;
+      const consider = (c) => {
+        if (!c || c.length < 2) return;
+        const d = Math.hypot(c[0] - enu.e, c[1] - enu.n);
+        if (d < bestD) { bestD = d; best = { e: c[0], n: c[1] }; }
+      };
+      for (const ent of (planeEntries || [])) {
+        for (const c of (ent.quad || ent.corners || [])) consider(c);
+      }
+      if (!best && planesPayload && planesPayload.planes) {
+        for (const pl of planesPayload.planes) {
+          for (const c of (pl.quad || pl.corners || [])) consider(c);
+        }
+      }
+      return best;
+    }
+
+    document.getElementById('togSatPick')?.addEventListener('change', (ev) => {
+      setSatPick(ev.target.checked);
+    });
+    document.getElementById('btnSatClear')?.addEventListener('click', () => {
+      satPairs = [];
+      satPendingYellow = null;
+      satExpect = 'yellow';
+      satPreview = null;
+      redrawSatPicks();
+      updateSatStatus();
+    });
+    document.getElementById('btnSatFit')?.addEventListener('click', async () => {
+      if (satPairs.length < 3) { alert('need ≥3 yellow↔red pairs'); return; }
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sat-offset/pairs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pairs: satPairs }),
+      });
+      const data = await resp.json();
+      if (!data.ok) { alert('fit failed: ' + (data.error || resp.status)); return; }
+      satPreview = data;
+      redrawSatPicks();
+      updateSatStatus();
+    });
+    document.getElementById('btnSatApply')?.addEventListener('click', async () => {
+      if (!satPreview) { alert('fit preview first'); return; }
+      const msg = `Apply SE(2) tx=${satPreview.tx_m.toFixed(2)} ty=${satPreview.ty_m.toFixed(2)} yaw=${satPreview.yaw_deg.toFixed(2)}° rms=${satPreview.rms_m.toFixed(3)}m?\nBak first; moves cams+cloud+facades+planes; skips roofs/street.\nDoes NOT auto-apply Chamfer T.`;
+      if (!confirm(msg)) return;
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sat-offset/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, from: 'T_pick' }),
+      });
+      const data = await resp.json();
+      if (!data.ok) { alert('apply failed: ' + (data.error || resp.status)); return; }
+      location.reload();
+    });
+
+    renderer.domElement.addEventListener('pointerdown', (ev) => {
+      if (!satPickOn || ev.button !== 0) return;
+      if (sculptOn) return;
+      const enu = pickGroundEnu(ev);
+      if (!enu) return;
+      if (satExpect === 'yellow') {
+        satPendingYellow = { e: enu.e, n: enu.n };
+        satExpect = 'red';
+      } else {
+        let red = { e: enu.e, n: enu.n };
+        const snap = nearestFacadeCorner(enu, 2.0);
+        if (snap) red = snap;
+        satPairs.push({ yellow: satPendingYellow, red });
+        satPendingYellow = null;
+        satExpect = 'yellow';
+        satPreview = null; // invalidate preview after edit
+      }
+      redrawSatPicks();
+      updateSatStatus();
+      ev.stopPropagation();
+    }, true);
+
+    addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && satPickOn) {
+        satPendingYellow = null;
+        satExpect = 'yellow';
+        updateSatStatus();
+        redrawSatPicks();
+      }
+    });
+
+
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
     renderer.domElement.addEventListener('pointerdown', (ev) => {
-      if (!sculptOn || ev.button !== 0) return;
+      if (!sculptOn || satPickOn || ev.button !== 0) return;
       if (tcontrols.dragging) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;

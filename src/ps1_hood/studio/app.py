@@ -324,6 +324,108 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify(result)
 
+
+    @app.post("/api/runs/<name>/sat-offset/pairs")
+    def api_sat_offset_pairs(name: str):
+        """Fit SE(2) from ≥3 yellow↔red corner picks — preview only, no apply."""
+        from ps1_hood.align.sat_offset import SatOffsetError, fit_pairs_se2, persist_t_pick
+
+        body = request.get_json(force=True) or {}
+        pairs = body.get("pairs")
+        if not isinstance(pairs, list):
+            return jsonify({"ok": False, "error": "pairs must be a list"}), 400
+        project = open_project(name)
+        try:
+            payload = fit_pairs_se2(
+                pairs,
+                max_rms_m=float(body.get("max_rms_m") or 1.5),
+                min_pairs=int(body.get("min_pairs") or 3),
+                max_yaw_deg=float(body.get("max_yaw_deg") or 15.0),
+                max_translation_m=float(body.get("max_translation_m") or 10.0),
+            )
+            paths = persist_t_pick(project, payload)
+        except SatOffsetError as exc:
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "applied": False,
+                "tx_m": payload["tx_m"],
+                "ty_m": payload["ty_m"],
+                "yaw_deg": payload["yaw_deg"],
+                "s": payload["s"],
+                "pivot_e": payload["pivot_e"],
+                "pivot_n": payload["pivot_n"],
+                "rms_m": payload["rms_m"],
+                "n_pairs": payload["n_pairs"],
+                "source": payload["source"],
+                "preview": payload.get("preview") or {},
+                "pairs": payload.get("pairs") or [],
+                "paths": paths,
+                "T": {
+                    "tx_m": payload["tx_m"],
+                    "ty_m": payload["ty_m"],
+                    "yaw_deg": payload["yaw_deg"],
+                    "s": payload["s"],
+                    "pivot_e": payload["pivot_e"],
+                    "pivot_n": payload["pivot_n"],
+                    "source": payload["source"],
+                    "rms_m": payload["rms_m"],
+                    "n_pairs": payload["n_pairs"],
+                },
+            }
+        )
+
+    @app.post("/api/runs/<name>/sat-offset/apply")
+    def api_sat_offset_apply(name: str):
+        """Explicit confirm: bak then apply T_pick (or given --from) via sat-offset apply.
+
+        Never auto-applies Chamfer T_force — body.confirm must be true.
+        """
+        from ps1_hood.align.sat_offset import SatOffsetError, apply_forced_se2, load_t_force
+
+        body = request.get_json(force=True, silent=True) or {}
+        if not body.get("confirm"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "confirm:true required — preview first via POST …/sat-offset/pairs",
+                    "applied": False,
+                }
+            ), 400
+        project = open_project(name)
+        which = str(body.get("from") or body.get("which") or "T_pick").strip()
+        if which.endswith(".json"):
+            src = Path(which)
+            if not src.is_absolute():
+                src = project.root / src if (project.root / src).is_file() else (project.align_dir / Path(which).name)
+        elif which in ("T_pick", "pick", "studio"):
+            src = project.align_dir / "T_pick.json"
+        elif which in ("T_force", "force", "chamfer"):
+            # Allowed only with explicit confirm + which — still not auto.
+            src = project.align_dir / "T_force.json"
+        else:
+            src = project.align_dir / f"{which}.json" if not which.endswith(".json") else project.align_dir / which
+        try:
+            T = load_t_force(src)
+            meta = apply_forced_se2(
+                project,
+                T,
+                targets=str(body.get("targets") or "cams,cloud,facades,planes"),
+                skip=str(body.get("skip") or "roofs,street"),
+                bak=bool(body.get("bak", True)),
+            )
+        except SatOffsetError as exc:
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        return jsonify({"ok": True, "applied": True, "from": str(src), **meta})
+
+
     @app.get("/api/runs/<name>/file")
     def api_file(name: str):
         rel = request.args.get("path", "")
