@@ -1,4 +1,4 @@
-"""Studio product viewer layer defaults (hero = façades + sat roofs)."""
+"""Studio product viewer layer defaults (hero = façades + sat roofs + street)."""
 
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ def test_viewer_hero_layer_defaults() -> None:
     assert 'id="togCloud">' in body
     assert "cloud (raw MA)" in body
     assert "cloudPoints.visible = false" in body
-    # Façades + sat roofs ON
+    # Façades + sat roofs + street ON
     assert 'id="togFacades" checked' in body
     assert 'id="togRoofs" checked' in body
+    assert 'id="togStreet" checked' in body
     # BAG / zclean / offtile OFF
     assert 'id="togBag">' in body
     assert 'id="togBag" checked' not in body

@@ -58,6 +58,7 @@
       + ` <label><input type="checkbox" id="togOfftile"> offtile</label>`
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
       + ` <label><input type="checkbox" id="togRoofs" checked> roofs</label>`
+      + ` <label><input type="checkbox" id="togStreet" checked> street</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
       + `<br><label><input type="checkbox" id="togSculpt"> sculpt</label>`
       + ` <button type="button" id="btnSculptTranslate" disabled>nudge n</button>`
@@ -330,6 +331,53 @@
       hud.innerHTML += '<br>no sat roofs yet';
     }
 
+
+
+    // Sat-locked street/ground shells — Ortho ENU XY, separate from roofs/façades
+    let streetRoot = null;
+    try {
+      const base = '/api/runs/' + encodeURIComponent(run) + '/';
+      const mtlLoader = new MTLLoader();
+      mtlLoader.setPath(base);
+      const streetMats = await mtlLoader.loadAsync('street.mtl');
+      streetMats.preload();
+      for (const mat of Object.values(streetMats.materials)) {
+        if (!mat) continue;
+        mat.side = THREE.DoubleSide;
+        if (mat.map) {
+          mat.map.colorSpace = THREE.SRGBColorSpace;
+          mat.map.magFilter = THREE.NearestFilter;
+          mat.map.minFilter = THREE.NearestFilter;
+          mat.map.generateMipmaps = false;
+          mat.map.needsUpdate = true;
+        }
+      }
+      const objLoader = new OBJLoader();
+      objLoader.setMaterials(streetMats);
+      objLoader.setPath(base);
+      streetRoot = await objLoader.loadAsync('street.obj');
+      streetRoot.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+          remapEnuGeometry(child.geometry);
+          if (child.material) {
+            const mats = Array.isArray(child.material) ? child.material : [child.material];
+            for (const m of mats) {
+              m.side = THREE.DoubleSide;
+              if (m.map) {
+                m.map.colorSpace = THREE.SRGBColorSpace;
+                m.map.magFilter = THREE.NearestFilter;
+                m.map.minFilter = THREE.NearestFilter;
+                m.map.generateMipmaps = false;
+                m.map.needsUpdate = true;
+              }
+            }
+          }
+        }
+      });
+      scene.add(streetRoot);
+    } catch (err) {
+      hud.innerHTML += '<br>no sat street yet';
+    }
 
     // --- ENU façade sculpt (TransformControls; n-only translate + w×h scale; no free-pose) ---
     const SCULPT_MAX_D = 3.0;
@@ -701,6 +749,9 @@
     });
     document.getElementById('togRoofs')?.addEventListener('change', (ev) => {
       if (roofRoot) roofRoot.visible = ev.target.checked;
+    });
+    document.getElementById('togStreet')?.addEventListener('change', (ev) => {
+      if (streetRoot) streetRoot.visible = ev.target.checked;
     });
     document.getElementById('togBag')?.addEventListener('change', (ev) => {
       bagGroup.visible = ev.target.checked;

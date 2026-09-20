@@ -1,7 +1,7 @@
 # Studio hero — default-hide raw MA cloud
 
 **Date:** 2026-09-20 · **STOP** further cloud-gate peels (offtile killed high-z; long arms remain in soft fringe)  
-**Sacred:** **don’t delete** product `cloud.ply` / zclean / offtile · façades + sat roofs stay · sat XY · no free-pose
+**Sacred:** **don’t delete** product `cloud.ply` / zclean / offtile · façades + sat roofs + street stay · sat XY · no free-pose
 
 ---
 
@@ -13,6 +13,7 @@ Product Studio view = **complete-looking scene** without MA halo arms:
 |---|---|
 | Façades (`facades.obj`) | **ON** |
 | Sat roofs/yards (`roofs.obj`) | **ON** |
+| Sat street/ground (`street.obj`) | **ON** |
 | BAG | **OFF** (already) |
 | Raw MA / recon `cloud.ply` | **OFF** |
 | `cloud_zclean.ply` | OFF (debug) |
@@ -23,14 +24,14 @@ User turns **cloud (raw MA)** on when diagnosing densify — not for the hero pr
 
 ## Wire
 
-`viewer.html`: `#togCloud` unchecked; after `loadAsync(cloud.ply)` set `cloudPoints.visible = false`. Façades + roofs stay checked; BAG / zclean / offtile stay off. No server delete; API paths unchanged; `cloud.ply` remains on disk for Path α / densify.
+`viewer.html`: `#togCloud` unchecked; after `loadAsync(cloud.ply)` set `cloudPoints.visible = false`. Façades + roofs + street stay checked; BAG / zclean / offtile stay off. No server delete; API paths unchanged; `cloud.ply` remains on disk for Path α / densify.
 
 ## Acceptance
 
-- Cold open Studio smoke-dense: façades + sat roofs, **no** point-cloud arms
+- Cold open Studio smoke-dense: façades + sat roofs + street, **no** point-cloud arms
 - Toggle cloud → raw PLY appears; untoggle → gone
 - Files on disk unchanged
 
 ## One-liner
 
-*Studio default-hide raw MA cloud; hero = façades + sat roofs/yards; cloud stays on disk for a debug toggle — stop peeling the fringe.*
+*Studio default-hide raw MA cloud; hero = façades + sat roofs/yards + street ground; cloud stays on disk for a debug toggle — stop peeling the fringe.*
