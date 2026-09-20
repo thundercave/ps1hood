@@ -18,7 +18,13 @@ Writes `runs/<name>/recon/compare/`:
 | `<pano>_hNNN.jpg` | Side-by-side: **photo \| mesh reproject \| absdiff+edge** (HUD: zncc, edge, #quads) |
 | `summary.json` | All cams ranked worst-first by mean ZNCC; `worst` top 10; `global` means + sat footprint Chamfer (m) |
 
-CLI prints the worst 10. Soft-warn when global ZNCC ≪ façade accept (0.35).
+CLI prints the worst 10 (**finite ZNCC only** — cams that only see untextured
+quads score `zncc=nan` and are counted in `global.n_cams_nan_zncc`, not in
+`worst`). Soft-warn when global ZNCC ≪ façade accept (0.35).
+
+**Note:** product `mean_zncc` (plane extract, photo↔photo multi-view) is a
+different metric from compare `global.zncc_mean` (photo↔mesh-texture). Roofs/
+yards and untextured façades pull compare means down; extract scores stay high.
 
 ## What it measures
 
