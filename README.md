@@ -97,6 +97,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Path α planar façades (MapAnything):** `uv sync --extra planarize` then `ps1hood facades <run> --source mapanything` — voxel + vertical `segment_plane` peel → ZNCC gate → `recon/facades.obj` + `planes.json`. Auto in `extract_facades` when PLY ≳50k. See `docs/path-alpha-planarize-recipe.md`.
 
+**Re-texture bare façades:** `ps1hood facades-retexture <run> --bare-only --candidate` retries ortho bake for walls that passed ZNCC but lack `map_Kd` (post-rectify warp fail). Multi-cam + looser margin; quality-keep promote; does not re-run gap-fill/planarize/densify. See [`docs/facades-retexture-bare.md`](docs/facades-retexture-bare.md).
+
 **Façade gap fill (PR-C):** `ps1hood facades <run> --gap-fill` keeps the hybrid 10/8 A core, adds ZNCC-gated manhattan/sat-corner seeds + road-rejected MA peels for side/return walls, promotes only via quality-keep. See [`docs/facade-gap-fill.md`](docs/facade-gap-fill.md).
 
 **Sat-locked roofs/yards (PR-A):** `ps1hood roofs <run>` builds flat Ortho-ENU shells from sat Canny+flood, Z from MA median / façade top, textures from sat crop → `recon/roofs.obj`. Studio **roofs** toggle. See [`docs/sat-roof-yard-shells.md`](docs/sat-roof-yard-shells.md).
