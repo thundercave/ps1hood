@@ -1857,6 +1857,82 @@ def roofs_cmd(name: str, min_area_m2: float, edge_gate_m: float) -> None:
 
 
 
+@main.command("street")
+@click.argument("name")
+@click.option(
+    "--min-area-m2",
+    default=8.0,
+    show_default=True,
+    type=float,
+    help="Minimum street tile area (m²)",
+)
+@click.option(
+    "--building-dilate-m",
+    default=1.5,
+    show_default=True,
+    type=float,
+    help="Dilate roof∪yard punch (m) so walls get no ground slab",
+)
+@click.option(
+    "--cam-corridor-m",
+    default=4.0,
+    show_default=True,
+    type=float,
+    help="Optional cam XY corridor dilate (m); 0 disables",
+)
+@click.option(
+    "--camera-height-m",
+    default=2.5,
+    show_default=True,
+    type=float,
+    help="ground_z = median(cam_u) − this (m)",
+)
+def street_cmd(
+    name: str,
+    min_area_m2: float,
+    building_dilate_m: float,
+    cam_corridor_m: float,
+    camera_height_m: float,
+) -> None:
+    """Sat-locked street/ground shells from Ortho. Writes recon/street.obj.
+
+    street_mask − dilated roof∪yard → flat ENU tiles at ground_z (planes or
+    cam_u−height), sat-crop textured. Never touches façades.* / roofs.* / planes.json.
+    """
+    from ps1_hood.reconstruct.sat_street import SatStreetError, build_sat_street
+
+    project = open_project(name)
+    try:
+        meta = build_sat_street(
+            project.root,
+            min_area_m2=float(min_area_m2),
+            building_dilate_m=float(building_dilate_m),
+            cam_corridor_m=float(cam_corridor_m),
+            camera_height_m=float(camera_height_m),
+        )
+    except SatStreetError as exc:
+        click.echo(f"street failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"street failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    scene_path = project.recon_dir / "scene.json"
+    if scene_path.is_file():
+        import json
+
+        payload = json.loads(scene_path.read_text(encoding="utf-8"))
+        payload["street"] = meta
+        scene_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    click.echo(
+        f"street ok  tiles={meta.get('n_street')}  textured={meta.get('textured')}  "
+        f"ground_z={meta.get('ground_z')}  z_source={meta.get('z_source')}  "
+        f"obj={meta.get('obj')}"
+    )
+
+
+
 @main.command("compare")
 @click.argument("name")
 @click.option(

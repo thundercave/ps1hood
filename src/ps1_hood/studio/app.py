@@ -188,6 +188,22 @@ def create_app() -> Flask:
         return send_file(path)
 
 
+
+    @app.get("/api/runs/<name>/street.obj")
+    def api_street_obj(name: str):
+        path = open_project(name).recon_dir / "street.obj"
+        if not path.is_file():
+            return jsonify({"error": "no street yet"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/street.mtl")
+    def api_street_mtl(name: str):
+        path = open_project(name).recon_dir / "street.mtl"
+        if not path.is_file():
+            return jsonify({"error": "no street mtl yet"}), 404
+        return send_file(path)
+
+
     @app.get("/api/runs/<name>/compare/summary.json")
     def api_compare_summary(name: str):
         path = open_project(name).recon_dir / "compare" / "summary.json"

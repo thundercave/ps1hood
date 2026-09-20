@@ -103,6 +103,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Worst-cam gap fill:** `--gap-fill --worst-cams id,id,...` or `--worst-from-compare N` seeds planes toward those compare cams (8–20 m × yaw); locks product; NMS-adds new; bakes new textures only; quality-keep vs 18/18. See [`docs/worst-cam-gap-fill.md`](docs/worst-cam-gap-fill.md).
 
+**Sat-locked street/ground shells:** `ps1hood street <run>` builds flat Ortho-ENU ground quads from `street_mask − dilate(roof∪yard)` at `ground_z` (planes / cam_u−2.5), sat-crop textured → `recon/street.obj`. Studio **street** toggle (default ON). Does not clobber façades/roofs. See [`docs/sat-street-shell.md`](docs/sat-street-shell.md).
+
 **Sat-locked roofs/yards (PR-A):** `ps1hood roofs <run>` builds flat Ortho-ENU shells from sat Canny+flood, Z from MA median / façade top, textures from sat crop → `recon/roofs.obj`. Studio **roofs** toggle. See [`docs/sat-roof-yard-shells.md`](docs/sat-roof-yard-shells.md).
 
 **Soft Z cloud clean (opt-in):** `ps1hood cloud-zclean <run> --margin-m 1.5` drops pts inside sat roof AABBs with `z > shell_z + 1.5 m` → `recon/cloud_zclean.ply` (+ georef stats). Does **not** hungry-XY-clip or replace default `cloud.ply`. Studio **zclean** toggle. Mapillary garage fill is a separate non-goal. See [`docs/roof-floater-zclean.md`](docs/roof-floater-zclean.md).
@@ -111,7 +113,7 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Studio ENU sculpt (MVP):** toggle **sculpt** in the viewer → pick a façade → TransformControls along **n** (±3 m) + resize **w×h** about center → **save+bake** re-warps from a known pano (bak first; undo restores). No free-pose; sat XY locked; never wipes other planes. CLI: `ps1hood sculpt-apply <run> --plane facade_03 --delta-d 0.4` / `sculpt-undo`. See [`docs/studio-sculpt-mvp.md`](docs/studio-sculpt-mvp.md).
 
-**Studio hero defaults:** façades + sat roofs **ON**; raw MA `cloud.ply` **OFF** (`#togCloud` debug toggle — file stays on disk); BAG / zclean / offtile OFF. See [`docs/studio-hero-hide-cloud.md`](docs/studio-hero-hide-cloud.md).
+**Studio hero defaults:** façades + sat roofs + street **ON**; raw MA `cloud.ply` **OFF** (`#togCloud` debug toggle — file stays on disk); BAG / zclean / offtile OFF. See [`docs/studio-hero-hide-cloud.md`](docs/studio-hero-hide-cloud.md).
 
 **Pano↔mesh compare (diagnose):** `ps1hood compare <run>` reprojects façades+roofs into SV with known ENU poses → ZNCC + edge + sat footprint Chamfer; writes `recon/compare/` overlays + `summary.json` (worst cams). No densify / free-pose / product wipe. See [`docs/pano-mesh-compare.md`](docs/pano-mesh-compare.md).
 
