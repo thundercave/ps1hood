@@ -34,6 +34,8 @@ uv run ps1hood facades smoke-dense --gap-fill --a-source product --gap-seeds sat
 
 **Acceptance:** ZNCC-accept sat_edge either re-anchors onto its edge and adds, or rejects `refine_drift` — never a `dist≈5` mystery. Garage return appears in uncovered (or explicit cover log). Product stays 18 unless a same-building add promotes cleanly.
 
+**Follow-up:** [`sat-edge-union-dup.md`](sat-edge-union-dup.md) — edge-aware a_priority dup (no opposite-d / tighter XY vs product_lock).
+
 **Non-goals:** widen gate for MA peels · free-pose · wipe 18 · invent peels when needs>0 · densify / clutter promote
 
 ---

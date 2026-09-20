@@ -3,7 +3,7 @@
 **Date:** 2026-09-20 · Product **18/18/0.440** (lock) · depends on PR **#41**  
 **Sacred:** lock 18 · sat XY · no free-pose · no wipe · no densify
 
-**Follow-up:** [`sat-edge-reanchor.md`](sat-edge-reanchor.md) — re-anchor after ZNCC, seed-edge AABB, prefer returns, optional sat_edge-only soft gate.
+**Follow-up:** [`sat-edge-reanchor.md`](sat-edge-reanchor.md) · [`sat-edge-union-dup.md`](sat-edge-union-dup.md) — re-anchor after ZNCC, seed-edge AABB, prefer returns, optional sat_edge-only soft gate.
 
 Pack: `/workspace/sat-edge-gap-seeds-rd.md`.
 

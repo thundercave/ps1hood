@@ -802,6 +802,9 @@ def test_cli_gap_seeds_sat_edge_default() -> None:
     assert "--sat-edge-reanchor" in result.output
     assert "--sat-edge-max-drift" in result.output
     assert "--sat-aabb-gate-sat-edge" in result.output
+    assert "--gap-nms-xy" in result.output
+    assert "--gap-nms-d-tol" in result.output
+    assert "--gap-nms-no-opposite" in result.output
 
 
 def test_sat_edge_cover_center_tightened() -> None:
