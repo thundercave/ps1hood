@@ -1929,6 +1929,82 @@ def compare_cmd(name: str, max_cams: int, out_dir: Path | None, patch: int) -> N
         )
 
 
+@main.command("sculpt-apply")
+@click.argument("name")
+@click.option("--plane", "plane_id", required=True, help="facade_XX id")
+@click.option("--delta-d", type=float, default=None, help="Nudge along normal (m), clamp ±3")
+@click.option("--delta-t", type=float, default=None, help="Optional tangent slide (m), clamp ±2")
+@click.option("--width-m", type=float, default=None)
+@click.option("--height-m", type=float, default=None)
+@click.option("--bake/--no-bake", default=True, show_default=True)
+@click.option("--bake-cam", default=None, help="pano_id of known posed cam")
+@click.option("--margin-px", type=float, default=120.0, show_default=True)
+def sculpt_apply_cmd(
+    name: str,
+    plane_id: str,
+    delta_d: float | None,
+    delta_t: float | None,
+    width_m: float | None,
+    height_m: float | None,
+    bake: bool,
+    bake_cam: str | None,
+    margin_px: float,
+) -> None:
+    """ENU façade sculpt: bak + write one plane (no free-pose / no wipe)."""
+    from ps1_hood.reconstruct.keyframes import load_keyframes
+    from ps1_hood.reconstruct.sculpt import apply_sculpt
+
+    project = open_project(name)
+    frames = load_keyframes(project)
+    for fr in frames:
+        if "path" not in fr and fr.get("shot_path"):
+            fr["path"] = fr["shot_path"]
+    try:
+        meta = apply_sculpt(
+            project.recon_dir,
+            plane_id,
+            delta_d=delta_d,
+            delta_t=delta_t,
+            width_m=width_m,
+            height_m=height_m,
+            bake=bake,
+            bake_cam=bake_cam,
+            frames=frames,
+            margin_px=margin_px,
+        )
+    except Exception as exc:
+        click.echo(f"sculpt-apply failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    pl = meta.get("plane") or {}
+    click.echo(
+        f"sculpt-apply ok  plane={meta.get('plane_id')}  "
+        f"d={pl.get('d')}  w={pl.get('width_m')}  h={pl.get('height_m')}  "
+        f"bake={meta.get('bake_ok')}  planes={meta.get('plane_count')}  "
+        f"bak={meta.get('bak', {}).get('stamp')}"
+    )
+    if meta.get("bake_error"):
+        click.echo(f"  bake note: {meta['bake_error']}")
+
+
+@main.command("sculpt-undo")
+@click.argument("name")
+@click.option("--stamp", default=None, help="bak_sculpt stamp; default=latest")
+def sculpt_undo_cmd(name: str, stamp: str | None) -> None:
+    """Restore latest bak_sculpt_* (planes/obj/mtl/textures)."""
+    from ps1_hood.reconstruct.sculpt import undo_sculpt
+
+    project = open_project(name)
+    try:
+        meta = undo_sculpt(project.recon_dir, stamp=stamp)
+    except Exception as exc:
+        click.echo(f"sculpt-undo failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(
+        f"sculpt-undo ok  stamp={meta.get('stamp')}  "
+        f"restored={len(meta.get('restored') or [])}"
+    )
+
+
 @main.command("studio")
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
