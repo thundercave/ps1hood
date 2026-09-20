@@ -204,7 +204,19 @@ def _warp_facade_texture(
     dest: Path,
     *,
     ps1_tex_size: int | None = 128,
+    margin_px: float = 40.0,
+    allow_clip: bool = True,
 ) -> bool:
+    """Perspective-bake one façade quad into ``dest``.
+
+    Soft fail recovery (post-rectify full-quad coverage):
+      1. try ``margin_px`` (default 40 — historic hard gate)
+      2. on fail, retry with ``max(margin_px, 120)``
+      3. if still out-of-frame and ``allow_clip``, clip UV to the image
+         rectangle (keeps center; notes via logger) and warp anyway
+    """
+    import logging
+
     img = frame.get("_img")
     if img is None:
         img = cv2.imread(frame["path"], cv2.IMREAD_COLOR)
@@ -215,15 +227,7 @@ def _warp_facade_texture(
     uv = _project_points(frame, w, h, pts)
     if not np.isfinite(uv).all():
         return False
-    # Allow slight out-of-frame corners; clamp for warp stability.
-    margin = 40.0
-    if (
-        (uv[:, 0] < -margin).any()
-        or (uv[:, 1] < -margin).any()
-        or (uv[:, 0] > w + margin).any()
-        or (uv[:, 1] > h + margin).any()
-    ):
-        return False
+
     width_m = float(np.linalg.norm(pts[1][:2] - pts[0][:2]))
     height_m = float(abs(pts[3][2] - pts[0][2]))
     aspect = max(width_m, 0.5) / max(height_m, 0.5)
@@ -231,25 +235,137 @@ def _warp_facade_texture(
     tw = _next_pot(int(round(th * aspect)))
     tw = int(np.clip(tw, 64, 1024))
     th = int(np.clip(th, 64, 1024))
-    src = uv.astype(np.float32)
-    # Keep corners near the frame so getPerspectiveTransform stays stable.
-    src[:, 0] = np.clip(src[:, 0], -margin, w + margin)
-    src[:, 1] = np.clip(src[:, 1], -margin, h + margin)
     dst = np.array(
         [[0, th - 1], [tw - 1, th - 1], [tw - 1, 0], [0, 0]],
         dtype=np.float32,
     )
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img, M, (tw, th), flags=cv2.INTER_LINEAR)
-    if ps1_tex_size is not None and int(ps1_tex_size) > 0:
-        from ps1_hood.reconstruct.ps1_facades import apply_ps1_texture
 
-        warped = apply_ps1_texture(warped, tex_size=int(ps1_tex_size))
-        jpeg_q = 85
-    else:
-        jpeg_q = 88
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    return bool(cv2.imwrite(str(dest), warped, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]))
+    def _outside(uv_arr: np.ndarray, margin: float) -> bool:
+        return bool(
+            (uv_arr[:, 0] < -margin).any()
+            or (uv_arr[:, 1] < -margin).any()
+            or (uv_arr[:, 0] > w + margin).any()
+            or (uv_arr[:, 1] > h + margin).any()
+        )
+
+    def _write(src_uv: np.ndarray, margin: float) -> bool:
+        src = src_uv.astype(np.float32).copy()
+        src[:, 0] = np.clip(src[:, 0], -margin, w + margin)
+        src[:, 1] = np.clip(src[:, 1], -margin, h + margin)
+        try:
+            M = cv2.getPerspectiveTransform(src, dst)
+        except cv2.error:
+            return False
+        warped = cv2.warpPerspective(img, M, (tw, th), flags=cv2.INTER_LINEAR)
+        if ps1_tex_size is not None and int(ps1_tex_size) > 0:
+            from ps1_hood.reconstruct.ps1_facades import apply_ps1_texture
+
+            warped = apply_ps1_texture(warped, tex_size=int(ps1_tex_size))
+            jpeg_q = 85
+        else:
+            jpeg_q = 88
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return bool(cv2.imwrite(str(dest), warped, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]))
+
+    margins = [float(margin_px)]
+    loose = max(float(margin_px), 120.0)
+    if loose not in margins:
+        margins.append(loose)
+
+    for margin in margins:
+        if _outside(uv, margin):
+            continue
+        if _write(uv, margin):
+            return True
+
+    if allow_clip:
+        # Last resort: clip UV to the frame (crop to in-frame bbox / corners).
+        logging.getLogger(__name__).info(
+            "facades warp: clipping UV to frame for %s (corners outside margin %.0f)",
+            dest.name,
+            loose,
+        )
+        clipped = uv.copy()
+        clipped[:, 0] = np.clip(clipped[:, 0], 0.0, float(w - 1))
+        clipped[:, 1] = np.clip(clipped[:, 1], 0.0, float(h - 1))
+        if _write(clipped, 0.0):
+            return True
+    return False
+
+
+def _rank_frontal_cameras(
+    pl: dict,
+    quad: list[tuple[float, float, float]],
+    frames: list[dict[str, Any]],
+    *,
+    min_frontal: float = 0.20,
+    top_k: int = 5,
+    prefer_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Rank cameras by frontal×coverage; prefer accepted ``view_indices`` first."""
+    nx, ny = float(pl["nx"]), float(pl["ny"])
+    n_xy = np.array([nx, ny], dtype=np.float64)
+    center = np.mean(np.array(quad, dtype=np.float64), axis=0)
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for fi, fr in enumerate(frames):
+        cam = np.array([fr["e"], fr["n"], fr["u"]], dtype=np.float64)
+        n = n_xy.copy()
+        if n @ (cam[:2] - center[:2]) < 0:
+            n = -n
+        fwd = _forward_xy(fr)
+        fn = float(np.linalg.norm(fwd))
+        if fn < 1e-6:
+            continue
+        fwd = fwd / fn
+        frontal = float((-fwd) @ n)
+        if frontal < min_frontal:
+            continue
+        img = fr.get("_img")
+        if img is None:
+            img = cv2.imread(fr["path"], cv2.IMREAD_COLOR) if fr.get("path") else None
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        uv_c = _project_points(fr, w, h, center.reshape(1, 3))[0]
+        if not np.isfinite(uv_c).all():
+            continue
+        uv_q = _project_points(fr, w, h, np.array(quad, dtype=np.float64))
+        finite = np.isfinite(uv_q).all(axis=1)
+        in_frame = (
+            finite
+            & (uv_q[:, 0] >= -40)
+            & (uv_q[:, 1] >= -40)
+            & (uv_q[:, 0] < w + 40)
+            & (uv_q[:, 1] < h + 40)
+        )
+        coverage = float(in_frame.sum()) / max(len(quad), 1)
+        dist = float(np.linalg.norm(cam - center))
+        score = frontal * (0.5 + 0.5 * coverage) * (1.0 / (1.0 + 0.02 * dist))
+        scored.append((score, fi, {**fr, "_img": img, "_frontal": frontal, "_score": score}))
+
+    if not scored:
+        return []
+
+    prefer = set(int(i) for i in (prefer_indices or []) if isinstance(i, (int, float)))
+    # Preferred view_indices that scored, in prefer order, then rest by score desc.
+    by_idx = {fi: (sc, cam) for sc, fi, cam in scored}
+    ordered: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    if prefer_indices:
+        for raw in prefer_indices:
+            fi = int(raw)
+            if fi in by_idx and fi not in seen:
+                ordered.append(by_idx[fi][1])
+                seen.add(fi)
+    rest = sorted(
+        ((sc, fi, cam) for sc, fi, cam in scored if fi not in seen),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    for _sc, fi, cam in rest:
+        ordered.append(cam)
+        seen.add(fi)
+    return ordered[: max(1, int(top_k))]
 
 
 def _ground_satellite_texture(
@@ -1626,3 +1742,392 @@ def _write_obj(
                 f"f {v0 + 1}/{v0 + 1} {v1 + 1}/{v1 + 1} "
                 f"{v2 + 1}/{v2 + 1} {v3 + 1}/{v3 + 1}\n"
             )
+
+
+def _bare_plane_indices(
+    recon_dir: Path,
+    planes: list[dict[str, Any]],
+    *,
+    mtl_path: Path | None = None,
+) -> list[int]:
+    """Indices where texture JPG is missing or MTL lacks map_Kd."""
+    recon_dir = Path(recon_dir)
+    tex_dir = recon_dir / "textures"
+    mtl_path = Path(mtl_path) if mtl_path is not None else recon_dir / "facades.mtl"
+    map_ok: set[str] = set()
+    if mtl_path.is_file():
+        block_name = None
+        has_map = False
+        for line in mtl_path.read_text(encoding="ascii", errors="ignore").splitlines():
+            s = line.strip()
+            if s.startswith("newmtl "):
+                if block_name and has_map:
+                    map_ok.add(block_name)
+                block_name = s.split(None, 1)[1]
+                has_map = False
+            elif s.lower().startswith("map_kd "):
+                has_map = True
+        if block_name and has_map:
+            map_ok.add(block_name)
+
+    bare: list[int] = []
+    for i, pl in enumerate(planes):
+        name = f"facade_{i:02d}"
+        jpg = tex_dir / f"{name}.jpg"
+        tex_field = pl.get("texture") if isinstance(pl, dict) else None
+        has_jpg = jpg.is_file() and jpg.stat().st_size > 32
+        if tex_field and not has_jpg:
+            # planes.json claims a map but file gone → bare
+            bare.append(i)
+            continue
+        if not has_jpg:
+            bare.append(i)
+            continue
+        if map_ok and name not in map_ok:
+            bare.append(i)
+            continue
+        if not tex_field and name not in map_ok and not has_jpg:
+            bare.append(i)
+    return bare
+
+
+def _ensure_plane_nxny(pl: dict[str, Any]) -> dict[str, Any]:
+    """Return plane dict with nx/ny/d_xy for frontal pick / warp."""
+    out = dict(pl)
+    if "nx" in out:
+        return out
+    if out.get("n") is not None:
+        n = np.asarray(out["n"], dtype=np.float64).reshape(-1)
+        out["nx"], out["ny"] = float(n[0]), float(n[1])
+        # planes.json stores n·X+d=0 → facades d_xy = -d
+        if "d" in out:
+            out["d"] = float(-float(out["d"]))
+    return out
+
+
+def _backup_pre_retex(recon_dir: Path) -> dict[str, str]:
+    """Copy product façades artefacts to ``*.pre_retex`` (once)."""
+    import shutil
+
+    recon_dir = Path(recon_dir)
+    backed: dict[str, str] = {}
+    pairs = [
+        (recon_dir / "facades.obj", recon_dir / "facades.obj.pre_retex"),
+        (recon_dir / "facades.mtl", recon_dir / "facades.mtl.pre_retex"),
+        (recon_dir / "planes.json", recon_dir / "planes.json.pre_retex"),
+    ]
+    for src, dst in pairs:
+        if src.is_file() and not dst.is_file():
+            shutil.copy2(src, dst)
+            backed[src.name] = str(dst)
+    tex = recon_dir / "textures"
+    bak_tex = recon_dir / "textures.pre_retex"
+    if tex.is_dir() and not bak_tex.is_dir():
+        shutil.copytree(tex, bak_tex)
+        backed["textures"] = str(bak_tex)
+    return backed
+
+
+def retexture_bare_planes(
+    run: Path,
+    *,
+    margin_px: float = 120.0,
+    top_k_cams: int = 5,
+    ps1_tex_size: int | None = 128,
+    frames: list[dict[str, Any]] | None = None,
+    bare_only: bool = True,
+    candidate: bool = False,
+    in_place: bool = False,
+    dry_run: bool = False,
+    promote: bool = True,
+) -> dict[str, Any]:
+    """Re-bake ortho textures for bare façades only — no gap-fill / planarize / densify.
+
+    Identifies bare = missing ``textures/facade_XX.jpg`` OR MTL without ``map_Kd``.
+    Tries top-K frontal cameras (preferring ``view_indices`` when present) with a
+    loosened warp margin. Stages as ``facades.candidate.*`` or ``--in-place`` with
+    ``*.pre_retex`` backup. Quality-keep: promote when textured rises and plane
+    count is unchanged (clause 1).
+    """
+    import json
+    import logging
+    import shutil
+
+    from ps1_hood.reconstruct.planarize import write_planes_json
+    from ps1_hood.reconstruct.ps1_facades import load_product_planes
+
+    log = logging.getLogger(__name__)
+    run = Path(run)
+    if (run / "recon" / "planes.json").is_file() or (run / "recon").is_dir():
+        recon_dir = run / "recon"
+    elif run.name == "recon" or (run / "planes.json").is_file() or (run / "facades.obj").is_file():
+        recon_dir = run
+    else:
+        recon_dir = run / "recon"
+
+    dest_obj = recon_dir / "facades.obj"
+    mtl_path = recon_dir / "facades.mtl"
+    planes_json = recon_dir / "planes.json"
+    tex_dir = recon_dir / "textures"
+
+    planes, prev_meta = load_product_planes(recon_dir)
+    if not planes:
+        raise FileNotFoundError(f"no product planes under {recon_dir}")
+
+    # Normalize nx/ny for pick/warp
+    planes = [_ensure_plane_nxny(p) for p in planes]
+    bare = _bare_plane_indices(recon_dir, planes, mtl_path=mtl_path)
+    if not bare_only:
+        # Escape hatch: treat all as candidates for bake (still won't wipe good JPGs
+        # unless warp succeeds — we skip indices that already have map_Kd+JPG when
+        # bare_only is the default path).
+        bare = list(range(len(planes)))
+
+    prev_q = _read_facade_quality(dest_obj) or {
+        "textured": max(0, len(planes) - len(bare)),
+        "mean_zncc": (prev_meta or {}).get("gates", {}).get("mean_zncc")
+        if isinstance(prev_meta, dict)
+        else None,
+        "plane_count": len(planes),
+    }
+    # Prefer counting from current bare set for the pre snapshot
+    n_tex_before = sum(
+        1
+        for i in range(len(planes))
+        if (tex_dir / f"facade_{i:02d}.jpg").is_file()
+        and i not in bare
+    )
+    # Also count bare that somehow already have jpg+map (shouldn't be in bare)
+    n_tex_before = int(prev_q.get("textured") or n_tex_before)
+
+    report = {
+        "recon_dir": str(recon_dir),
+        "planes": len(planes),
+        "bare": bare,
+        "bare_ids": [f"facade_{i:02d}" for i in bare],
+        "textured_before": n_tex_before,
+        "dry_run": bool(dry_run),
+        "candidate": bool(candidate),
+        "in_place": bool(in_place),
+        "baked": [],
+        "failed": [],
+        "ok": True,
+    }
+
+    if dry_run:
+        log.info(
+            "facades-retexture dry-run: %s bare of %s planes → %s",
+            len(bare),
+            len(planes),
+            report["bare_ids"],
+        )
+        report["would_bake"] = report["bare_ids"]
+        return report
+
+    if candidate and in_place:
+        raise ValueError("pass only one of candidate= / in_place=")
+    if not candidate and not in_place:
+        # Default to candidate staging (sacred: don't clobber product)
+        candidate = True
+        report["candidate"] = True
+
+    frames = list(frames or [])
+    if not frames:
+        raise RuntimeError(
+            "retexture_bare_planes requires frames= (CLI loads align/cameras.json)"
+        )
+
+    if in_place:
+        report["backup"] = _backup_pre_retex(recon_dir)
+        paths = _facade_output_paths(dest_obj, "product")
+    else:
+        paths = _facade_output_paths(dest_obj, "candidate")
+
+    out_obj = Path(paths["obj"])
+    out_mtl = Path(paths["mtl"])
+    out_json = Path(paths["json"])
+    bake_tex_dir = Path(paths["bake_tex"])
+    tex_map_prefix = str(paths["tex_prefix"])
+    bake_tex_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed bake dir with existing good textures so promote / candidate is complete.
+    if candidate:
+        for old in bake_tex_dir.glob("facade_*.jpg"):
+            old.unlink(missing_ok=True)
+        if tex_dir.is_dir():
+            for src in sorted(tex_dir.glob("facade_*.jpg")):
+                # Skip bare targets — they will be re-baked (or stay missing)
+                try:
+                    idx = int(src.stem.split("_")[1])
+                except (IndexError, ValueError):
+                    idx = -1
+                if idx in bare:
+                    continue
+                shutil.copy2(src, bake_tex_dir / src.name)
+
+    materials: list[dict[str, Any]] = []
+    # Preserve ground material from existing MTL when possible
+    ground_map = None
+    if (tex_dir / "ground.jpg").is_file():
+        ground_map = "textures/ground.jpg"
+    materials.append(
+        {"name": "ground", "map": ground_map, "kd": (0.35, 0.38, 0.32)}
+    )
+
+    baked: list[int] = []
+    failed: list[int] = []
+    tex_maps: list[str | None] = []
+
+    for i, pl in enumerate(planes):
+        quad = pl.get("quad") or pl.get("corners") or _plane_quad(pl)
+        quad_t = [tuple(map(float, c)) for c in quad]
+        mat_name = f"facade_{i:02d}"
+        map_rel: str | None = None
+        existing = bake_tex_dir / f"facade_{i:02d}.jpg"
+        product_jpg = tex_dir / f"facade_{i:02d}.jpg"
+
+        if bare_only and i not in bare:
+            # Keep good texture — copy for in-place is no-op; candidate already seeded
+            if in_place and product_jpg.is_file():
+                map_rel = f"textures/facade_{i:02d}.jpg"
+            elif existing.is_file():
+                map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
+            elif product_jpg.is_file():
+                if candidate:
+                    shutil.copy2(product_jpg, existing)
+                map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
+            materials.append(
+                {"name": mat_name, "map": map_rel, "kd": (0.55, 0.50, 0.42), "quad": quad_t}
+            )
+            tex_maps.append(map_rel)
+            continue
+
+        prefer = pl.get("view_indices")
+        if prefer is not None and not isinstance(prefer, list):
+            prefer = list(prefer) if prefer else None
+        cams = _rank_frontal_cameras(
+            pl,
+            quad_t,
+            frames,
+            top_k=int(top_k_cams),
+            prefer_indices=prefer,
+        )
+        ok = False
+        tex_path = bake_tex_dir / f"facade_{i:02d}.jpg"
+        for cam in cams:
+            if _warp_facade_texture(
+                quad_t,
+                cam,
+                tex_path,
+                ps1_tex_size=ps1_tex_size,
+                margin_px=float(margin_px),
+                allow_clip=True,
+            ):
+                ok = True
+                break
+        if ok:
+            map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
+            baked.append(i)
+        else:
+            failed.append(i)
+            # Keep prior map if any (don't wipe)
+            if product_jpg.is_file() and i not in bare:
+                map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
+            else:
+                map_rel = None
+        materials.append(
+            {"name": mat_name, "map": map_rel, "kd": (0.55, 0.50, 0.42), "quad": quad_t}
+        )
+        tex_maps.append(map_rel)
+
+    # Extent for ground quad — reuse obj verts if present else quad AABB
+    extent_xyz = np.zeros((0, 3), dtype=np.float64)
+    for pl in planes:
+        q = pl.get("quad") or pl.get("corners")
+        if q is not None:
+            extent_xyz = (
+                np.asarray(q, dtype=np.float64)
+                if extent_xyz.size == 0
+                else np.vstack([extent_xyz, np.asarray(q, dtype=np.float64)])
+            )
+    if extent_xyz.size == 0:
+        extent_xyz = np.array([[-10, -10, 0], [10, 10, 0]], dtype=np.float64)
+
+    if in_place:
+        # Only rewrite MTL map_Kd lines + planes.json texture fields; keep obj geometry.
+        _write_mtl(out_mtl, materials)
+        # Obj mtllib / usemtl unchanged — maps live in mtl
+    else:
+        _write_mtl(out_mtl, materials)
+        _write_obj(out_obj, planes, extent_xyz, materials, out_mtl.name)
+
+    ground_z = float((prev_meta or {}).get("ground_z") or 0.0)
+    source = str((prev_meta or {}).get("source") or "photo_consistency")
+    residual = int((prev_meta or {}).get("residual_points") or 0)
+    write_planes_json(
+        out_json,
+        planes=planes,
+        ground_z=ground_z,
+        residual_points=residual,
+        source=source,
+        textured_maps=tex_maps,
+    )
+
+    n_tex_after = sum(1 for m in materials[1:] if m.get("map"))
+    new_q = {
+        "textured": int(n_tex_after),
+        "mean_zncc": prev_q.get("mean_zncc"),
+        "plane_count": int(len(planes)),
+    }
+    report["baked"] = baked
+    report["failed"] = failed
+    report["textured_after"] = n_tex_after
+    report["obj"] = str(out_obj if not in_place else dest_obj)
+    report["mtl"] = str(out_mtl)
+    report["planes_json"] = str(out_json)
+    report["new_quality"] = new_q
+    report["prev_quality"] = prev_q
+
+    promoted = False
+    promote_reason = None
+    if candidate and promote and baked:
+        better, why = _is_strictly_better(new_q, prev_q)
+        report["quality_keep"] = {"better": better, "reason": why}
+        if better:
+            _promote_candidate_facades(
+                dest_obj,
+                cand_obj=out_obj,
+                cand_mtl=out_mtl,
+                cand_json=out_json,
+                cand_tex_dir=bake_tex_dir,
+            )
+            promoted = True
+            promote_reason = why
+            log.info(
+                "facades-retexture: promoted candidate (%s) textured %s→%s planes=%s",
+                why,
+                n_tex_before,
+                n_tex_after,
+                len(planes),
+            )
+        else:
+            log.info(
+                "facades-retexture: candidate NOT promoted — %s "
+                "(baked=%s failed=%s); product kept",
+                why,
+                baked,
+                failed,
+            )
+    elif in_place:
+        log.info(
+            "facades-retexture in-place: baked=%s failed=%s textured %s→%s",
+            baked,
+            failed,
+            n_tex_before,
+            n_tex_after,
+        )
+
+    report["promoted"] = promoted
+    report["promote_reason"] = promote_reason
+    report["ok"] = bool(baked) or n_tex_after >= n_tex_before
+    return report

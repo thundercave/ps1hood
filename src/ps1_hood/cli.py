@@ -964,6 +964,133 @@ def ps1_facades_cmd(name: str, ps1_tex_size: int, no_backup: bool) -> None:
     )
 
 
+@main.command("facades-retexture")
+@click.argument("name")
+@click.option(
+    "--bare-only/--all",
+    default=True,
+    show_default=True,
+    help="Only bake planes missing JPG or map_Kd (default); --all retries every plane",
+)
+@click.option(
+    "--candidate",
+    "stage_candidate",
+    is_flag=True,
+    default=False,
+    help="Write facades.candidate.* + textures/candidate/; quality-keep promote",
+)
+@click.option(
+    "--in-place",
+    is_flag=True,
+    default=False,
+    help="Bake into live product with *.pre_retex backup",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="List bare façade indices only; no writes",
+)
+@click.option(
+    "--margin-px",
+    default=120.0,
+    show_default=True,
+    type=float,
+    help="Warp out-of-frame margin (softens historic 40px hard fail)",
+)
+@click.option(
+    "--top-k-cams",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Try top-K frontal×coverage cameras per bare plane",
+)
+@click.option(
+    "--ps1-tex-size",
+    default=128,
+    show_default=True,
+    type=int,
+    help="Nearest resize short side after warp (0 = skip PS1 quantize)",
+)
+@click.option(
+    "--no-promote",
+    is_flag=True,
+    default=False,
+    help="With --candidate, leave candidate staged even if clause1 would promote",
+)
+def facades_retexture_cmd(
+    name: str,
+    bare_only: bool,
+    stage_candidate: bool,
+    in_place: bool,
+    dry_run: bool,
+    margin_px: float,
+    top_k_cams: int,
+    ps1_tex_size: int,
+    no_promote: bool,
+) -> None:
+    """Re-texture bare façades only (no gap-fill / planarize / densify).
+
+    Post-rectify full-quad warp often fails after ZNCC patch pass — this retries
+    with multi-cam + looser margin. Prefer ``--dry-run`` then ``--bare-only
+    --candidate`` (quality-keep promote when textured↑ planes unchanged).
+    """
+    from ps1_hood.reconstruct.facades import retexture_bare_planes
+    from ps1_hood.reconstruct.keyframes import load_keyframes
+
+    if sum(1 for f in (stage_candidate, in_place, dry_run) if f) > 1:
+        click.echo(
+            "facades-retexture: pass only one of --candidate / --in-place / --dry-run",
+            err=True,
+        )
+        raise SystemExit(2)
+    if not dry_run and not stage_candidate and not in_place:
+        # Pack default path: candidate staging
+        stage_candidate = True
+
+    project = open_project(name)
+    frames = load_keyframes(project)
+    for fr in frames:
+        if "path" not in fr and fr.get("shot_path"):
+            fr["path"] = fr["shot_path"]
+
+    tex_size = int(ps1_tex_size) if int(ps1_tex_size) > 0 else None
+    try:
+        meta = retexture_bare_planes(
+            project.root,
+            margin_px=float(margin_px),
+            top_k_cams=int(top_k_cams),
+            ps1_tex_size=tex_size,
+            frames=frames,
+            bare_only=bool(bare_only),
+            candidate=bool(stage_candidate) and not dry_run and not in_place,
+            in_place=bool(in_place) and not dry_run,
+            dry_run=bool(dry_run),
+            promote=not no_promote,
+        )
+    except Exception as exc:
+        click.echo(f"facades-retexture failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    if dry_run:
+        click.echo(
+            f"facades-retexture dry-run  planes={meta.get('planes')}  "
+            f"bare={meta.get('bare')}  ids={meta.get('bare_ids')}  "
+            f"textured_before={meta.get('textured_before')}"
+        )
+        return
+
+    qk = meta.get("quality_keep") or {}
+    click.echo(
+        f"facades-retexture ok  planes={meta.get('planes')}  "
+        f"baked={meta.get('baked')}  failed={meta.get('failed')}  "
+        f"textured={meta.get('textured_before')}→{meta.get('textured_after')}  "
+        f"promoted={meta.get('promoted')}  "
+        f"reason={meta.get('promote_reason') or qk.get('reason')}  "
+        f"obj={meta.get('obj')}"
+    )
+
+
 @main.command("roofs")
 @click.argument("name")
 @click.option(
