@@ -938,7 +938,7 @@ def ps1_facades_cmd(name: str, ps1_tex_size: int, no_backup: bool) -> None:
 def roofs_cmd(name: str, min_area_m2: float, edge_gate_m: float) -> None:
     """Sat-locked roof/yard shells from Ortho (PR-A). Writes recon/roofs.obj.
 
-    XY from sat absolute ENU; Z from MA cloud median in footprint or façade top.
+    XY from sat absolute ENU; Z from MA high-z in footprint or façade top (yards near ground; street/cam spill rejected).
     No BAG/OSM extruded shells. Fail-loud if ortho missing or zero footprints.
     """
     from ps1_hood.reconstruct.sat_roofs import SatRoofError, build_sat_roofs
