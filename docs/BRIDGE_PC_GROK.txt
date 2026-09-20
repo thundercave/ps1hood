@@ -76,3 +76,12 @@ uv run ps1hood facades smoke-dense \
 uv run ps1hood ps1-facades smoke-dense
 ```
 Keep BAG off. Quality-keep must not demote 10/8/0.418 — expect *.candidate if weaker.
+
+
+## Pano↔mesh compare (diagnose-only)
+```bash
+cd ~/ps1hood && git pull
+uv run ps1hood compare smoke-dense --max-cams 40
+# → runs/smoke-dense/recon/compare/summary.json + *_hNNN.jpg
+# Soft-warn if global zncc ≪ 0.35. Does NOT densify or change poses/product.
+```
