@@ -1072,18 +1072,24 @@ def compare_cmd(name: str, max_cams: int, out_dir: Path | None, patch: int) -> N
         f"compare ok  cams={summary.get('n_cams_scored')}/"
         f"{summary.get('n_cams_considered')}  "
         f"quads={summary.get('n_quads_product')}  "
-        f"zncc_mean={g.get('zncc_mean')}  "
-        f"edge_mean={g.get('edge_mean')}  "
+        f"facade_zncc={g.get('facade_zncc_mean')}  "
+        f"roof_zncc={g.get('roof_zncc_mean')}  "
+        f"facade_edge={g.get('facade_edge_mean')}  "
         f"sat_edge_m={g.get('sat_edge_mean_m')}  "
         f"soft_warn={g.get('soft_zncc_warn')}  "
         f"out={summary.get('out_dir')}"
     )
-    click.echo("worst cams (lowest zncc):")
+    click.echo("worst cams (lowest façade zncc):")
     for w in summary.get("worst") or []:
+        kinds = ",".join(w.get("kinds") or []) or "?"
+        fz = w.get("facade_zncc_mean")
+        fz_s = f"{fz:.3f}" if fz == fz else "nan"
+        fe = w.get("facade_edge_mean", w.get("edge_mean"))
+        fe_s = f"{fe:.3f}" if fe == fe else "nan"
         click.echo(
-            f"  {w['id']}  zncc={w['zncc_mean']:.3f}  "
-            f"edge={w['edge_mean']:.3f}  quads={w['n_quads']}  "
-            f"overlay={w['overlay']}"
+            f"  {w['id']}  facade_zncc={fz_s}  "
+            f"facade_edge={fe_s}  kinds={kinds}  "
+            f"quads={w['n_quads']}  overlay={w['overlay']}"
         )
 
 

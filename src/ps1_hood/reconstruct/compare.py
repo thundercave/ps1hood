@@ -3,7 +3,7 @@
 Reproject product façade/roof quads into SV crops with known ENU poses,
 score ZNCC (photo ortho patch vs mesh tex/gray) + edge Chamfer, and
 project footprints onto Ortho for sat XY Chamfer. Writes side-by-side
-overlays + ``recon/compare/summary.json`` ranked by worst ZNCC.
+overlays + ``recon/compare/summary.json`` ranked by worst *façade* ZNCC.
 
 Sacred: no free-pose, no densify, no product wipe — diagnose only.
 """
@@ -36,6 +36,50 @@ DEFAULT_MAX_CAMS = 40
 SOFT_ZNCC_WARN = 0.35
 MIN_CORNERS = 3
 
+
+
+def _is_facade_kind(kind: str | None) -> bool:
+    return (kind or "facade") == "facade"
+
+
+
+
+def _finite_mean(vals: list[float]) -> float:
+    good = [float(v) for v in vals if v == v]
+    return float(np.mean(good)) if good else float("nan")
+
+
+def _split_kind_scores(scored: list[dict[str, Any]]) -> dict[str, Any]:
+    """Separate façade vs sat-shell (roof/yard) finite means from scored quads."""
+    fac_z: list[float] = []
+    roof_z: list[float] = []
+    fac_e: list[float] = []
+    roof_e: list[float] = []
+    kinds: set[str] = set()
+    for s in scored:
+        kind = str(s.get("kind") or "facade")
+        kinds.add(kind)
+        z = s["zncc"]
+        e = s["edge"]
+        if _is_facade_kind(kind):
+            if z == z:
+                fac_z.append(float(z))
+            if e == e:
+                fac_e.append(float(e))
+        else:
+            if z == z:
+                roof_z.append(float(z))
+            if e == e:
+                roof_e.append(float(e))
+    return {
+        "facade_zncc_mean": _finite_mean(fac_z),
+        "roof_zncc_mean": _finite_mean(roof_z),
+        "facade_edge_mean": _finite_mean(fac_e),
+        "roof_edge_mean": _finite_mean(roof_e),
+        "n_facade_finite_zncc": len(fac_z),
+        "n_roof_finite_zncc": len(roof_z),
+        "kinds": sorted(kinds),
+    }
 
 class CompareError(RuntimeError):
     """Fail-loud compare (empty product / no cameras / nothing visible)."""
@@ -576,17 +620,26 @@ def compare_camera(
     if not scored:
         return None
 
+    split = _split_kind_scores(scored)
+    # Mixed mean kept for overlay HUD; ranking / soft-warn use façade only.
     znccs = [s["zncc"] for s in scored if s["zncc"] == s["zncc"]]
     edges = [s["edge"] for s in scored if s["edge"] == s["edge"]]
     zncc_mean = float(np.mean(znccs)) if znccs else float("nan")
     edge_mean = float(np.mean(edges)) if edges else float("nan")
+    # Prefer façade means on HUD when available (avoids roof pollution display).
+    hud_zncc = split["facade_zncc_mean"]
+    if hud_zncc != hud_zncc:
+        hud_zncc = zncc_mean
+    hud_edge = split["facade_edge_mean"]
+    if hud_edge != hud_edge:
+        hud_edge = edge_mean
     mesh = render_mesh_panel(photo, quads, scored)
     cid = make_cam_id(frame)
     strip = make_overlay_strip(
         photo,
         mesh,
-        zncc_mean=zncc_mean,
-        edge_mean=edge_mean,
+        zncc_mean=hud_zncc,
+        edge_mean=hud_edge,
         n_quads=len(scored),
         cam_id=cid,
     )
@@ -596,7 +649,13 @@ def compare_camera(
         "heading": float(frame.get("heading") or 0.0),
         "zncc_mean": zncc_mean,
         "edge_mean": edge_mean,
+        "facade_zncc_mean": split["facade_zncc_mean"],
+        "roof_zncc_mean": split["roof_zncc_mean"],
+        "facade_edge_mean": split["facade_edge_mean"],
+        "kinds": split["kinds"],
         "n_quads": len(scored),
+        "n_facade_finite_zncc": split["n_facade_finite_zncc"],
+        "n_roof_finite_zncc": split["n_roof_finite_zncc"],
         "quads": [
             {
                 "id": s["id"],
@@ -643,7 +702,13 @@ def run_compare(
                 "heading": result["heading"],
                 "zncc_mean": result["zncc_mean"],
                 "edge_mean": result["edge_mean"],
+                "facade_zncc_mean": result["facade_zncc_mean"],
+                "roof_zncc_mean": result["roof_zncc_mean"],
+                "facade_edge_mean": result["facade_edge_mean"],
+                "kinds": result["kinds"],
                 "n_quads": result["n_quads"],
+                "n_facade_finite_zncc": result["n_facade_finite_zncc"],
+                "n_roof_finite_zncc": result["n_roof_finite_zncc"],
                 "overlay": overlay_name,
                 "quads": result["quads"],
             }
@@ -655,21 +720,44 @@ def run_compare(
             "check poses / planes / crops"
         )
 
-    def _sort_key(r: dict[str, Any]) -> float:
-        # Finite ascending (true worst first). NaN → +inf so unscored/no-tex
-        # cams do not monopolize worst[:10] (gray-mesh ZNCC was always NaN).
-        z = r["zncc_mean"]
+    def _facade_sort_key(r: dict[str, Any]) -> float:
+        # Rank by façade finite ZNCC (ascending). NaN → +inf so roof-only /
+        # untextured cams do not monopolize worst[:10].
+        z = r["facade_zncc_mean"]
         return z if z == z else float("inf")
 
-    ranked = sorted(cam_rows, key=_sort_key)
-    finite = [r for r in ranked if r["zncc_mean"] == r["zncc_mean"]]
-    worst = finite[:10]
+    ranked = sorted(cam_rows, key=_facade_sort_key)
+    finite_facade = [r for r in ranked if r["facade_zncc_mean"] == r["facade_zncc_mean"]]
+    worst = finite_facade[:10]
+
+    # Mixed (legacy) — may be polluted by sat roofs/yards; prefer façade_*.
     znccs = [r["zncc_mean"] for r in cam_rows if r["zncc_mean"] == r["zncc_mean"]]
     edges = [r["edge_mean"] for r in cam_rows if r["edge_mean"] == r["edge_mean"]]
     global_zncc = float(np.mean(znccs)) if znccs else float("nan")
     global_edge = float(np.mean(edges)) if edges else float("nan")
+
+    fac_znccs = [
+        r["facade_zncc_mean"]
+        for r in cam_rows
+        if r["facade_zncc_mean"] == r["facade_zncc_mean"]
+    ]
+    roof_znccs = [
+        r["roof_zncc_mean"] for r in cam_rows if r["roof_zncc_mean"] == r["roof_zncc_mean"]
+    ]
+    fac_edges = [
+        r["facade_edge_mean"]
+        for r in cam_rows
+        if r["facade_edge_mean"] == r["facade_edge_mean"]
+    ]
+    facade_zncc_mean = float(np.mean(fac_znccs)) if fac_znccs else float("nan")
+    roof_zncc_mean = float(np.mean(roof_znccs)) if roof_znccs else float("nan")
+    facade_edge_mean = float(np.mean(fac_edges)) if fac_edges else float("nan")
+
     sat = sat_footprint_edge_mean_m(root, quads)
-    soft_warn = bool(global_zncc == global_zncc and global_zncc < SOFT_ZNCC_WARN)
+    # Soft-warn vs accept gate: façade finite ZNCC only (roofs are sat shells).
+    soft_warn = bool(
+        facade_zncc_mean == facade_zncc_mean and facade_zncc_mean < SOFT_ZNCC_WARN
+    )
 
     summary: dict[str, Any] = {
         "run": root.name,
@@ -683,7 +771,11 @@ def run_compare(
             {
                 "id": w["id"],
                 "zncc_mean": w["zncc_mean"],
+                "facade_zncc_mean": w["facade_zncc_mean"],
+                "roof_zncc_mean": w["roof_zncc_mean"],
+                "facade_edge_mean": w["facade_edge_mean"],
                 "edge_mean": w["edge_mean"],
+                "kinds": w["kinds"],
                 "n_quads": w["n_quads"],
                 "overlay": w["overlay"],
             }
@@ -692,11 +784,17 @@ def run_compare(
         "global": {
             "zncc_mean": global_zncc,
             "edge_mean": global_edge,
+            "facade_zncc_mean": facade_zncc_mean,
+            "roof_zncc_mean": roof_zncc_mean,
+            "facade_edge_mean": facade_edge_mean,
             "sat_edge_mean_m": sat.get("edge_mean_m"),
             "soft_zncc_warn": soft_warn,
             "soft_zncc_threshold": SOFT_ZNCC_WARN,
+            "soft_zncc_applies_to": "facade_zncc_mean",
             "n_cams_finite_zncc": len(znccs),
             "n_cams_nan_zncc": len(cam_rows) - len(znccs),
+            "n_cams_finite_facade_zncc": len(fac_znccs),
+            "n_cams_finite_roof_zncc": len(roof_znccs),
         },
         "sat_footprint": sat,
         "diagnose_only": True,
@@ -706,9 +804,10 @@ def run_compare(
         json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8"
     )
     log.info(
-        "compare: scored %s cams, global zncc=%.3f sat_edge_m=%s → %s",
+        "compare: scored %s cams, facade_zncc=%.3f roof_zncc=%.3f sat_edge_m=%s → %s",
         len(cam_rows),
-        global_zncc if global_zncc == global_zncc else float("nan"),
+        facade_zncc_mean if facade_zncc_mean == facade_zncc_mean else float("nan"),
+        roof_zncc_mean if roof_zncc_mean == roof_zncc_mean else float("nan"),
         sat.get("edge_mean_m"),
         out,
     )

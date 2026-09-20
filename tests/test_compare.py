@@ -11,6 +11,7 @@ import pytest
 
 from ps1_hood.reconstruct.compare import (
     CompareError,
+    _split_kind_scores,
     load_product_quads,
     project_quad,
     quad_visible,
@@ -155,6 +156,11 @@ def test_smoke_dense_compare_writes_summary() -> None:
     assert (out / "summary.json").is_file()
     assert summary["worst"]
     assert "zncc_mean" in summary["global"]
+    assert "facade_zncc_mean" in summary["global"]
+    assert "roof_zncc_mean" in summary["global"]
+    assert "facade_edge_mean" in summary["global"]
+    assert "sat_edge_mean_m" in summary["global"]
+    assert summary["global"].get("soft_zncc_applies_to") == "facade_zncc_mean"
     assert summary.get("diagnose_only") is True
     # product untouched
     assert (root / "recon" / "planes.json").is_file()
@@ -234,10 +240,50 @@ def test_worst_excludes_nan_zncc_cams(tmp_path: Path, monkeypatch: pytest.Monkey
     (tmp_path / "align" / "cameras.json").write_text(json.dumps(cams), encoding="utf-8")
 
     fake = {
-        "nan_a": {"zncc_mean": float("nan"), "edge_mean": 0.5, "n_quads": 1},
-        "bad": {"zncc_mean": -0.2, "edge_mean": 0.1, "n_quads": 4},
-        "ok": {"zncc_mean": 0.5, "edge_mean": 0.4, "n_quads": 3},
-        "nan_b": {"zncc_mean": float("nan"), "edge_mean": 0.2, "n_quads": 2},
+        "nan_a": {
+            "zncc_mean": float("nan"),
+            "facade_zncc_mean": float("nan"),
+            "roof_zncc_mean": float("nan"),
+            "facade_edge_mean": float("nan"),
+            "edge_mean": 0.5,
+            "kinds": ["facade"],
+            "n_quads": 1,
+            "n_facade_finite_zncc": 0,
+            "n_roof_finite_zncc": 0,
+        },
+        "bad": {
+            "zncc_mean": -0.2,
+            "facade_zncc_mean": -0.2,
+            "roof_zncc_mean": float("nan"),
+            "facade_edge_mean": 0.1,
+            "edge_mean": 0.1,
+            "kinds": ["facade"],
+            "n_quads": 4,
+            "n_facade_finite_zncc": 4,
+            "n_roof_finite_zncc": 0,
+        },
+        "ok": {
+            "zncc_mean": 0.5,
+            "facade_zncc_mean": 0.5,
+            "roof_zncc_mean": float("nan"),
+            "facade_edge_mean": 0.4,
+            "edge_mean": 0.4,
+            "kinds": ["facade"],
+            "n_quads": 3,
+            "n_facade_finite_zncc": 3,
+            "n_roof_finite_zncc": 0,
+        },
+        "nan_b": {
+            "zncc_mean": float("nan"),
+            "facade_zncc_mean": float("nan"),
+            "roof_zncc_mean": float("nan"),
+            "facade_edge_mean": float("nan"),
+            "edge_mean": 0.2,
+            "kinds": ["facade"],
+            "n_quads": 2,
+            "n_facade_finite_zncc": 0,
+            "n_roof_finite_zncc": 0,
+        },
     }
 
     def _fake_compare_camera(frame, quads, *, patch=64):
@@ -250,7 +296,13 @@ def test_worst_excludes_nan_zncc_cams(tmp_path: Path, monkeypatch: pytest.Monkey
             "heading": 0.0,
             "zncc_mean": row["zncc_mean"],
             "edge_mean": row["edge_mean"],
+            "facade_zncc_mean": row["facade_zncc_mean"],
+            "roof_zncc_mean": row["roof_zncc_mean"],
+            "facade_edge_mean": row["facade_edge_mean"],
+            "kinds": row["kinds"],
             "n_quads": row["n_quads"],
+            "n_facade_finite_zncc": row["n_facade_finite_zncc"],
+            "n_roof_finite_zncc": row["n_roof_finite_zncc"],
             "quads": [],
             "overlay": strip,
         }
@@ -265,3 +317,198 @@ def test_worst_excludes_nan_zncc_cams(tmp_path: Path, monkeypatch: pytest.Monkey
     assert all(w["zncc_mean"] == w["zncc_mean"] for w in summary["worst"])
     assert summary["global"]["n_cams_nan_zncc"] == 2
     assert summary["global"]["n_cams_finite_zncc"] == 2
+
+
+def test_split_kind_scores_separates_facade_and_roof() -> None:
+    scored = [
+        {"kind": "facade", "zncc": 0.4, "edge": 0.8},
+        {"kind": "facade", "zncc": 0.6, "edge": 0.6},
+        {"kind": "roof", "zncc": 0.05, "edge": 0.2},
+        {"kind": "yard", "zncc": 0.01, "edge": 0.1},
+        {"kind": "facade", "zncc": float("nan"), "edge": 0.5},  # untextured
+    ]
+    split = _split_kind_scores(scored)
+    assert split["facade_zncc_mean"] == pytest.approx(0.5)
+    assert split["roof_zncc_mean"] == pytest.approx(0.03)
+    assert split["facade_edge_mean"] == pytest.approx((0.8 + 0.6 + 0.5) / 3.0)
+    assert split["n_facade_finite_zncc"] == 2
+    assert split["n_roof_finite_zncc"] == 2
+    assert split["kinds"] == ["facade", "roof", "yard"]
+
+
+def test_soft_warn_uses_facade_not_roof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Roofs with tiny ZNCC must not trip soft-warn when façades are healthy."""
+    from ps1_hood.reconstruct import compare as cmp
+
+    (tmp_path / "align").mkdir()
+    (tmp_path / "recon").mkdir()
+    img = tmp_path / "shot.jpg"
+    cv2.imwrite(str(img), np.full((64, 64, 3), 80, dtype=np.uint8))
+    plane = {
+        "planes": [
+            {
+                "id": "f0",
+                "n": [0.0, -1.0, 0.0],
+                "d": 8.0,
+                "quad": [
+                    [-2.0, 8.0, 0.5],
+                    [2.0, 8.0, 0.5],
+                    [2.0, 8.0, 6.0],
+                    [-2.0, 8.0, 6.0],
+                ],
+            }
+        ]
+    }
+    (tmp_path / "recon" / "planes.json").write_text(json.dumps(plane), encoding="utf-8")
+    cams = [
+        {
+            "pano_id": "c0",
+            "shot_path": str(img),
+            "e": 0.0,
+            "n": 0.0,
+            "u": 2.0,
+            "heading": 0.0,
+            "pitch": 0.0,
+            "fov": 90.0,
+        }
+    ]
+    (tmp_path / "align" / "cameras.json").write_text(json.dumps(cams), encoding="utf-8")
+
+    def _fake_compare_camera(frame, quads, *, patch=64):
+        strip = np.zeros((32, 96, 3), dtype=np.uint8)
+        return {
+            "id": "c0_h000",
+            "pano_id": "c0",
+            "heading": 0.0,
+            # Mixed mean polluted by roofs (would soft-warn if used).
+            "zncc_mean": 0.10,
+            "edge_mean": 0.3,
+            "facade_zncc_mean": 0.50,
+            "roof_zncc_mean": 0.02,
+            "facade_edge_mean": 0.7,
+            "kinds": ["facade", "roof"],
+            "n_quads": 5,
+            "n_facade_finite_zncc": 2,
+            "n_roof_finite_zncc": 3,
+            "quads": [],
+            "overlay": strip,
+        }
+
+    monkeypatch.setattr(cmp, "compare_camera", _fake_compare_camera)
+    monkeypatch.setattr(
+        cmp, "sat_footprint_edge_mean_m", lambda *a, **k: {"ok": True, "edge_mean_m": 0.4}
+    )
+    summary = cmp.run_compare(tmp_path, max_cams=10, out_dir=tmp_path / "out")
+    g = summary["global"]
+    assert g["facade_zncc_mean"] == pytest.approx(0.50)
+    assert g["roof_zncc_mean"] == pytest.approx(0.02)
+    assert g["facade_edge_mean"] == pytest.approx(0.7)
+    assert g["sat_edge_mean_m"] == pytest.approx(0.4)
+    assert g["soft_zncc_warn"] is False  # façade healthy despite polluted mixed
+    assert g["soft_zncc_applies_to"] == "facade_zncc_mean"
+    assert g["zncc_mean"] == pytest.approx(0.10)  # legacy mixed still reported
+
+
+def test_worst_ranks_by_facade_not_roof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Roof-only low ZNCC must not outrank a mediocre façade cam in worst[]."""
+    from ps1_hood.reconstruct import compare as cmp
+
+    (tmp_path / "align").mkdir()
+    (tmp_path / "recon").mkdir()
+    img = tmp_path / "shot.jpg"
+    cv2.imwrite(str(img), np.full((64, 64, 3), 80, dtype=np.uint8))
+    plane = {
+        "planes": [
+            {
+                "id": "f0",
+                "n": [0.0, -1.0, 0.0],
+                "d": 8.0,
+                "quad": [
+                    [-2.0, 8.0, 0.5],
+                    [2.0, 8.0, 0.5],
+                    [2.0, 8.0, 6.0],
+                    [-2.0, 8.0, 6.0],
+                ],
+            }
+        ]
+    }
+    (tmp_path / "recon" / "planes.json").write_text(json.dumps(plane), encoding="utf-8")
+    cams = [
+        {
+            "pano_id": pid,
+            "shot_path": str(img),
+            "e": 0.0,
+            "n": 0.0,
+            "u": 2.0,
+            "heading": 0.0,
+            "pitch": 0.0,
+            "fov": 90.0,
+        }
+        for pid in ("roof_only", "facade_bad", "facade_ok")
+    ]
+    (tmp_path / "align" / "cameras.json").write_text(json.dumps(cams), encoding="utf-8")
+
+    fake = {
+        "roof_only": {
+            "zncc_mean": -0.5,
+            "facade_zncc_mean": float("nan"),
+            "roof_zncc_mean": -0.5,
+            "facade_edge_mean": float("nan"),
+            "edge_mean": 0.1,
+            "kinds": ["roof", "yard"],
+            "n_quads": 4,
+            "n_facade_finite_zncc": 0,
+            "n_roof_finite_zncc": 4,
+        },
+        "facade_bad": {
+            "zncc_mean": 0.15,
+            "facade_zncc_mean": 0.15,
+            "roof_zncc_mean": 0.01,
+            "facade_edge_mean": 0.2,
+            "edge_mean": 0.15,
+            "kinds": ["facade", "roof"],
+            "n_quads": 6,
+            "n_facade_finite_zncc": 2,
+            "n_roof_finite_zncc": 4,
+        },
+        "facade_ok": {
+            "zncc_mean": 0.55,
+            "facade_zncc_mean": 0.55,
+            "roof_zncc_mean": 0.02,
+            "facade_edge_mean": 0.6,
+            "edge_mean": 0.4,
+            "kinds": ["facade", "roof"],
+            "n_quads": 5,
+            "n_facade_finite_zncc": 3,
+            "n_roof_finite_zncc": 2,
+        },
+    }
+
+    def _fake_compare_camera(frame, quads, *, patch=64):
+        pid = str(frame.get("pano_id"))
+        row = fake[pid]
+        strip = np.zeros((32, 96, 3), dtype=np.uint8)
+        return {
+            "id": f"{pid}_h000",
+            "pano_id": pid,
+            "heading": 0.0,
+            **{k: row[k] for k in row},
+            "quads": [],
+            "overlay": strip,
+        }
+
+    monkeypatch.setattr(cmp, "compare_camera", _fake_compare_camera)
+    monkeypatch.setattr(
+        cmp, "sat_footprint_edge_mean_m", lambda *a, **k: {"ok": True, "edge_mean_m": 0.3}
+    )
+    summary = cmp.run_compare(tmp_path, max_cams=10, out_dir=tmp_path / "out")
+    worst_ids = [w["id"] for w in summary["worst"]]
+    assert worst_ids == ["facade_bad_h000", "facade_ok_h000"]
+    assert "roof_only_h000" not in worst_ids
+    assert summary["worst"][0]["kinds"] == ["facade", "roof"]
+    assert summary["global"]["n_cams_finite_facade_zncc"] == 2
+    assert summary["global"]["n_cams_finite_roof_zncc"] == 3
