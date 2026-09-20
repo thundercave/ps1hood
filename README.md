@@ -118,12 +118,14 @@ uv run ps1hood densify my-block --backend openmvs
 # See docs/openmvs-densify.md for install + AGPL notes.
 
 # MapAnything densify (Meta, CUDA, ENU pose-lock — not vendored):
-uv run ps1hood export mapanything-bundle my-block --stride 2
+# PR-B: interpolate (lerp_pose mids) → prefer-interp-bundle densify
+uv run ps1hood interpolate my-block
+uv run ps1hood densify my-block --backend mapanything --export-only --stride 2 --prefer-interp-bundle
 # → runs/my-block/mapanything/bundle (images + K + cam2world); CPU OK
-uv run ps1hood densify my-block --backend mapanything --apache --stride 2
-# needs CUDA; without GPU use --export-only then scripts/run_mapanything_bundle.py
-# NEVER --ignore_pose_inputs. Prefer facebook/map-anything-apache.
-# See docs/mapanything-densify.md
+# on CUDA: omit --export-only, or scripts/run_mapanything_bundle.py --import-recon
+# backs up recon/cloud.ply; façades/roofs untouched; NEVER --ignore_pose_inputs
+# Soft sat clip stays opt-in on align/run (--cloud-clip-sat), not densify default.
+# See docs/mapanything-densify.md (PR-B) · docs/complete-scene-no-holes-rd.md
 ```
 
 AMD / ROCm (RX 6900 XT): official MASt3R wants **CUDA**. See [`docs/gpu-mast3r-ubuntu.md`](docs/gpu-mast3r-ubuntu.md) for an honest ROCm feasibility note, uv setup on Ubuntu, denser `smoke-dense` capture, COLMAP posed fallbacks, and cloud-CUDA MASt3R commands.

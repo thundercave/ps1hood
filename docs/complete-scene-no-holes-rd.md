@@ -29,12 +29,38 @@
 
 *Fills cause #1 without BAG.*
 
-### PR-B — Denser drive appearance (ENU lerp only)
+### PR-B — Denser drive appearance (ENU lerp only) ★ shipped glue
 1. FILM (or equivalent) midframes between panos with **`lerp_pose`** — appearance only.  
 2. Re-run MapAnything / densify with **locked poses** (never free-pose).  
 3. Optional soft floater gate (opt-in, not 2 m hungry default).
 
 *Addresses #3–4; sacred one-world-frame.*
+
+**PC recipe (smoke-dense)** — ship from existing interpolate + MA path:
+
+```bash
+# 1) Midframes (poses ALWAYS lerp_pose ENU; film falls back to flow if weights absent)
+uv run ps1hood interpolate smoke-dense
+
+# 2) Pose-locked bundle = real panos + densify-stride mids (≥4 m clearance)
+uv run ps1hood densify smoke-dense --backend mapanything --export-only --stride 2 \
+  --prefer-interp-bundle
+# → runs/smoke-dense/mapanything/bundle  (ignore_pose_inputs=False)
+
+# 3) Infer on CUDA host (this box has no NVIDIA CUDA):
+python scripts/run_mapanything_bundle.py \
+  runs/smoke-dense/mapanything/bundle --apache \
+  --import-recon runs/smoke-dense
+# backs up recon/cloud.ply → cloud.ply.bak; façades/roofs untouched
+
+# Or one-shot when CUDA is available:
+uv run ps1hood densify smoke-dense --backend mapanything --apache --stride 2 \
+  --prefer-interp-bundle --backup
+```
+
+Soft floater clip stays **off** unless you explicitly run  
+`ps1hood align/run … --cloud-clip-sat` (not densify default).  
+Docs: [`mapanything-densify.md`](mapanything-densify.md) §PR-B.
 
 ### PR-C — Façade gap fill (after A/B)
 1. Seed planes from MA vertical peels **or** sat building outlines as *hypotheses only* → ZNCC gate (existing Path α).  

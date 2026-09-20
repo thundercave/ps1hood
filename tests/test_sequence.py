@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ps1_hood.interpolate.sequence import (
+    DENSIFY_MIDFRAME_BASELINE_M,
     DENSIFY_MIDFRAME_STRIDE,
     MIN_LERP_BASELINE_M,
     POSED_MATCH_MIDFRAME_BASELINE_M,
@@ -139,12 +140,12 @@ def test_select_densify_frames_keeps_keyframes_and_strided_mids() -> None:
         _frame(4, interpolated=True, e=4),
         _frame(5, interpolated=False, e=5),
     ]
-    chosen = select_densify_frames(frames, midframe_stride=4)
+    chosen = select_densify_frames(frames, midframe_stride=4, min_baseline_m=0.0)
     assert [f["index"] for f in chosen] == [0, 1, 5]
     # Assert ran on full set — poison a mid that is not selected and ensure fail
     frames[3]["e"] = None
     with pytest.raises(RuntimeError, match="missing"):
-        select_densify_frames(frames, midframe_stride=4)
+        select_densify_frames(frames, midframe_stride=4, min_baseline_m=0.0)
 
 
 def test_select_densify_default_stride() -> None:
@@ -226,7 +227,7 @@ def test_select_posed_sparse_asserts_full_film_rate() -> None:
 
 def test_select_densify_subsample_every_nth() -> None:
     frames = [_frame(i, interpolated=(i not in (0, 9)), e=float(i)) for i in range(10)]
-    chosen = select_densify_frames(frames, midframe_stride=3)
+    chosen = select_densify_frames(frames, midframe_stride=3, min_baseline_m=0.0)
     # keyframes 0,9 + mids at mid_i 0,3,6 → frames index 1,4,7
     assert [f["index"] for f in chosen] == [0, 1, 4, 7, 9]
 
@@ -251,3 +252,44 @@ def test_select_posed_sparse_default_skips_near_mids() -> None:
     mids = [f for f in chosen if f.get("interpolated")]
     assert all(m["e"] >= 4.0 - 1e-9 for m in mids)
     assert 2.0 not in [m["e"] for m in mids]
+
+def test_densify_baseline_default_ge_4m() -> None:
+    assert DENSIFY_MIDFRAME_BASELINE_M >= 4.0
+
+
+def test_select_densify_drops_near_dupe_mids() -> None:
+    """PR-B: densify views need ≥4 m clearance (keyframes always kept)."""
+    frames = [
+        _frame(0, interpolated=False, e=0.0),
+        _frame(1, interpolated=True, e=1.0),   # too close to key 0
+        _frame(2, interpolated=True, e=5.0),   # ok
+        _frame(3, interpolated=True, e=6.0),   # too close to mid@5 if selected
+        _frame(4, interpolated=False, e=20.0),
+    ]
+    chosen = select_densify_frames(frames, midframe_stride=1, min_baseline_m=4.0)
+    assert [f["index"] for f in chosen if not f["interpolated"]] == [0, 4]
+    mids = [f for f in chosen if f["interpolated"]]
+    assert [m["e"] for m in mids] == [5.0]
+    for i, a in enumerate(chosen):
+        for b in chosen[i + 1 :]:
+            if a.get("interpolated") or b.get("interpolated"):
+                assert enu_baseline_m(a, b) >= 4.0 - 1e-9
+
+
+def test_lerp_pose_midframe_is_not_free_pose() -> None:
+    """Midframe ENU is strictly between endpoints — never invented free pose."""
+    a = _frame(0, interpolated=False, e=0.0)
+    a["heading"] = 0.0
+    b = _frame(1, interpolated=False, e=10.0)
+    b["heading"] = 20.0
+    mid = lerp_pose(a, b, 0.5)
+    mid["interpolated"] = True
+    assert_interp_frame_poses([a, mid, b])
+    assert mid["e"] == pytest.approx(5.0)
+    assert mid["heading"] == pytest.approx(10.0)
+    # Free-pose (missing ENU) fails loud before densify
+    free = dict(mid)
+    del free["e"]
+    with pytest.raises(RuntimeError, match="lerp_pose / align ENU"):
+        assert_interp_frame_poses([a, free, b])
+

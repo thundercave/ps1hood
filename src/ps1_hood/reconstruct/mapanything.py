@@ -14,9 +14,11 @@ from camera centers (the ~+50 m float symptom).
 Two paths:
   A) Posed COLMAP folder → upstream
      ``scripts/demo_inference_on_colmap_outputs.py --apache …``
-     (never ``--ignore_pose_inputs``).
-  B) Bundle from align/interp frames → ``preprocess_inputs`` + ``model.infer``
-     with ``ignore_pose_inputs=False``.
+     (never ``--ignore_pose_inputs``). Sparse posed usually has **no** FILM
+     midframes — skip Path A when densifying with lerp midframes.
+  B) Bundle from align/interp frames (keyframes + densify-stride midframes
+     with ``lerp_pose`` ENU) → ``preprocess_inputs`` + ``model.infer``
+     with ``ignore_pose_inputs=False``. **PR-B street densify default.**
 
 Binary / weights are NOT vendored. Without CUDA the densify runner fails
 loud; export-only works on CPU.
@@ -221,6 +223,35 @@ def subsample_frames(
 
         chosen = subsample_evenly(chosen, int(max_views))
     return chosen
+
+
+
+def count_interpolated_frames(frames: list[dict[str, Any]]) -> int:
+    """How many FILM/lerp midframes are in a densify view list."""
+    return sum(1 for f in frames if f.get("interpolated"))
+
+
+def should_prefer_interp_bundle(
+    frames: list[dict[str, Any]] | None,
+    *,
+    prefer_colmap: bool = True,
+    force_colmap: bool = False,
+    force_interp_bundle: bool = False,
+) -> bool:
+    """Path B (interp midframes) wins when densifying with lerp mids.
+
+    Path A COLMAP sparse usually lacks FILM midframes; PR-B street densify
+    must use the pose-locked interp bundle instead.
+    """
+    if force_interp_bundle:
+        return True
+    if force_colmap:
+        return False
+    if not prefer_colmap:
+        return True
+    if frames and count_interpolated_frames(frames) > 0:
+        return True
+    return False
 
 
 def resolve_mapanything_frames(
@@ -491,16 +522,39 @@ def find_mapanything_colmap_demo() -> Path | None:
     return None
 
 
+def backup_recon_cloud(path: Path) -> Path | None:
+    """Copy ``path`` → ``path.bak`` if it exists. Never touches façades/roofs."""
+    src = Path(path)
+    if not src.is_file():
+        return None
+    dest = src.with_suffix(src.suffix + ".bak")
+    shutil.copy2(src, dest)
+    log.info("backed up product cloud %s → %s", src.name, dest.name)
+    return dest
+
+
 def import_dense_ply_to_recon(
     ply_src: Path,
     run_root: Path,
     *,
     also_studio_cloud: bool = True,
+    backup: bool = True,
 ) -> dict[str, Any]:
-    """Copy densify PLY into recon/ for Studio load path."""
+    """Copy densify PLY into recon/ for Studio load path.
+
+    Cloud replace only: backs up existing ``cloud.ply`` /
+    ``cloud_mapanything.ply`` when ``backup=True``. Never modifies
+    ``facades.obj`` / ``roofs.obj`` / ``planes.json`` / ``roofs.json``.
+    """
     recon = run_root.resolve() / "recon"
     recon.mkdir(parents=True, exist_ok=True)
     dest = recon / "cloud_mapanything.ply"
+    backups: dict[str, str] = {}
+    if backup:
+        for name in ("cloud_mapanything.ply", "cloud.ply"):
+            bak = backup_recon_cloud(recon / name)
+            if bak is not None:
+                backups[name] = str(bak)
     shutil.copy2(ply_src, dest)
     studio = None
     if also_studio_cloud:
@@ -511,6 +565,9 @@ def import_dense_ply_to_recon(
         "cloud_mapanything": str(dest),
         "cloud": str(studio) if studio else None,
         "points": n,
+        "backups": backups,
+        "facades_untouched": True,
+        "roofs_untouched": True,
     }
 
 
@@ -995,7 +1052,7 @@ def run_mapanything_colmap_demo(
     ply = next((p for p in ply_candidates if p.stat().st_size > 64), None)
     if ply is None:
         raise RuntimeError(f"MapAnything COLMAP demo wrote no PLY under {out}")
-    imported = import_dense_ply_to_recon(ply, run_root)
+    imported = import_dense_ply_to_recon(ply, run_root, backup=True)
     return {
         "backend": "mapanything",
         "path": imported["cloud_mapanything"],
@@ -1006,6 +1063,9 @@ def run_mapanything_colmap_demo(
         "ignore_pose_inputs": False,
         "apache": apache,
         "path_kind": "colmap_demo",
+        "backups": imported.get("backups") or {},
+        "facades_untouched": True,
+        "roofs_untouched": True,
     }
 
 
@@ -1017,17 +1077,23 @@ def run_mapanything_densify(
     max_views: int | None = DEFAULT_MAX_VIEWS,
     apache: bool = True,
     prefer_colmap: bool = True,
+    force_colmap: bool = False,
+    force_interp_bundle: bool = False,
     also_studio_cloud: bool = True,
+    backup: bool = True,
 ) -> dict[str, Any]:
     """Densify with MapAnything (CUDA). Exports bundle always; runs when possible.
 
-    Prefer Path A (posed COLMAP demo) when sparse exists and demo script is
-    found; else Path B (align/interp bundle + Python API).
+    Path B (align/interp bundle with ``lerp_pose`` midframes) is preferred when
+    the densify view list includes FILM midframes — Path A COLMAP sparse usually
+    has none. Otherwise Path A (posed COLMAP demo) when sparse + demo exist.
+    Cloud replace backs up product PLY; façades/roofs untouched.
     """
     root = Path(run_root).resolve()
     ma_dir = root / "mapanything"
     ma_dir.mkdir(parents=True, exist_ok=True)
 
+    frames: list[dict[str, Any]] | None = None
     # Always ensure a pose-locked bundle exists for cloud hand-off / tests.
     if project is not None:
         frames = resolve_mapanything_frames(
@@ -1045,7 +1111,18 @@ def run_mapanything_densify(
 
     require_cuda_for_densify()
 
-    if prefer_colmap and resolve_posed_colmap(root) is not None:
+    use_interp = should_prefer_interp_bundle(
+        frames,
+        prefer_colmap=prefer_colmap,
+        force_colmap=force_colmap,
+        force_interp_bundle=force_interp_bundle,
+    )
+    n_mids = count_interpolated_frames(frames or [])
+    if (
+        not use_interp
+        and prefer_colmap
+        and resolve_posed_colmap(root) is not None
+    ):
         demo = find_mapanything_colmap_demo()
         if demo is not None:
             try:
@@ -1054,6 +1131,13 @@ def run_mapanything_densify(
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Path A COLMAP demo failed (%s); trying Path B bundle", exc)
+
+    if use_interp and n_mids:
+        log.info(
+            "PR-B Path B: pose-locked interp bundle (%s midframes, %s views pre-stride)",
+            n_mids,
+            len(frames or []),
+        )
 
     if bundle_meta is None:
         raise RuntimeError(
@@ -1069,10 +1153,14 @@ def run_mapanything_densify(
         minibatch_size=1,
     )
     imported = import_dense_ply_to_recon(
-        out_ply, root, also_studio_cloud=also_studio_cloud
+        out_ply, root, also_studio_cloud=also_studio_cloud, backup=backup
     )
     meta["cloud_mapanything"] = imported["cloud_mapanything"]
     meta["studio_cloud"] = imported["cloud"]
     meta["path_kind"] = "bundle_infer"
     meta["bundle_export"] = bundle_meta
+    meta["n_midframes"] = n_mids
+    meta["backups"] = imported.get("backups") or {}
+    meta["facades_untouched"] = True
+    meta["roofs_untouched"] = True
     return meta

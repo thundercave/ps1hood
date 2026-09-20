@@ -305,6 +305,11 @@ def align_cmd(
 @main.command("interpolate")
 @click.argument("name")
 def interpolate_cmd(name: str) -> None:
+    """FILM/flow midframes between panos; poses always from ``lerp_pose`` ENU.
+
+    Appearance only — never invents extrinsics. Asserts full FILM-rate ENU +
+    PINHOLE size before densify/recon consume midframes.
+    """
     from ps1_hood.pipeline import stage_interpolate
 
     stage_interpolate(open_project(name))
@@ -389,6 +394,21 @@ def reconstruct_cmd(name: str, backend: str | None, matcher: str | None) -> None
     default=False,
     help="MapAnything: write pose-locked bundle only (no CUDA infer)",
 )
+@click.option(
+    "--prefer-interp-bundle/--prefer-colmap",
+    "prefer_interp_bundle",
+    default=True,
+    help="MapAnything PR-B: prefer pose-locked FILM/lerp midframe bundle "
+    "(default) over Path A COLMAP sparse (no mids). Auto-skips Path A when "
+    "midframes are present even if --prefer-colmap.",
+)
+@click.option(
+    "--backup/--no-backup",
+    "backup_cloud",
+    default=True,
+    help="MapAnything: backup recon/cloud.ply (+ cloud_mapanything.ply) before "
+    "replace. Never touches façades/roofs. Default on.",
+)
 def densify_cmd(
     name: str,
     backend: str,
@@ -400,12 +420,16 @@ def densify_cmd(
     max_views: int,
     apache: bool,
     export_only: bool,
+    prefer_interp_bundle: bool,
+    backup_cloud: bool,
 ) -> None:
     """Optional densify: OpenMVS (CPU/AGPL) or MapAnything (CUDA, ENU-locked).
 
     OpenMVS: InterfaceCOLMAP + DensifyPointCloud on PATH → openmvs/scene_dense.ply.
-    MapAnything: fixed ENU cam2world + K; never ignore_pose_inputs. Prefer
-    --apache. Without CUDA use --export-only then scripts/run_mapanything_bundle.py.
+    MapAnything (PR-B): FILM/lerp midframes + locked ENU cam2world + K;
+    never ignore_pose_inputs. Prefer --apache. Without CUDA use --export-only
+    then scripts/run_mapanything_bundle.py. Soft sat clip stays opt-in on
+    align/run (--cloud-clip-sat); densify default is unclipped product cloud.
     """
     project = open_project(name)
     if backend == "openmvs":
@@ -447,9 +471,11 @@ def densify_cmd(
         except Exception as exc:
             click.echo(f"mapanything export failed: {exc}", err=True)
             raise SystemExit(1) from exc
+        n_mids = ma.count_interpolated_frames(frames)
         click.echo(
             f"mapanything bundle  {bundle_meta['path']}  "
-            f"views={bundle_meta['n_views']}  pose_lock=True"
+            f"views={bundle_meta['n_views']}  mids≈{n_mids}  "
+            f"pose_lock=True  ignore_pose_inputs=False"
         )
         if export_only:
             click.echo(
@@ -465,15 +491,22 @@ def densify_cmd(
                 stride=stride,
                 max_views=max_views,
                 apache=apache,
+                prefer_colmap=not prefer_interp_bundle,
+                force_interp_bundle=prefer_interp_bundle,
+                backup=backup_cloud,
             )
         except Exception as exc:
             click.echo(f"densify failed: {exc}", err=True)
             click.echo(ma.INSTALL_HINT, err=True)
             raise SystemExit(1) from exc
+        bak = meta.get("backups") or {}
+        bak_note = f"  backups={len(bak)}" if bak else ""
         click.echo(
             f"densify ok  {meta.get('path') or meta.get('cloud_mapanything')}  "
             f"points={meta.get('points')}  backend=mapanything  "
-            f"pose_lock={meta.get('pose_lock')}  path={meta.get('path_kind')}"
+            f"pose_lock={meta.get('pose_lock')}  path={meta.get('path_kind')}  "
+            f"mids={meta.get('n_midframes', 0)}"
+            f"{bak_note}  façades/roofs untouched"
         )
         return
 
