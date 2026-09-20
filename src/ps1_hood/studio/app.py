@@ -222,6 +222,92 @@ def create_app() -> Flask:
             return jsonify({"error": "no satellite yet"}), 404
         return send_file(path)
 
+    @app.get("/api/runs/<name>/planes.json")
+    def api_planes_json(name: str):
+        path = open_project(name).recon_dir / "planes.json"
+        if not path.is_file():
+            return jsonify({"error": "no planes yet"}), 404
+        resp = send_file(path, mimetype="application/json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/runs/<name>/sculpt/cameras")
+    def api_sculpt_cameras(name: str):
+        """Known posed cams for sculpt bake dropdown (no free-pose)."""
+        from ps1_hood.reconstruct.keyframes import load_keyframes
+
+        project = open_project(name)
+        frames = load_keyframes(project)
+        items = []
+        for i, fr in enumerate(frames):
+            items.append(
+                {
+                    "index": i,
+                    "pano_id": fr.get("pano_id"),
+                    "e": fr.get("e"),
+                    "n": fr.get("n"),
+                    "u": fr.get("u"),
+                    "heading": fr.get("heading"),
+                    "path": fr.get("path"),
+                }
+            )
+        return jsonify({"cameras": items, "count": len(items)})
+
+    @app.post("/api/runs/<name>/sculpt")
+    def api_sculpt(name: str):
+        """Bak + write one façade edit; optional re-bake from known pano."""
+        from ps1_hood.reconstruct.keyframes import load_keyframes
+        from ps1_hood.reconstruct.sculpt import apply_sculpt
+
+        body = request.get_json(force=True) or {}
+        plane_id = body.get("plane_id") or body.get("id")
+        if not plane_id:
+            return jsonify({"ok": False, "error": "plane_id required"}), 400
+        project = open_project(name)
+        frames = load_keyframes(project)
+        for fr in frames:
+            if "path" not in fr and fr.get("shot_path"):
+                fr["path"] = fr["shot_path"]
+        try:
+            result = apply_sculpt(
+                project.recon_dir,
+                str(plane_id),
+                delta_d=body.get("delta_d"),
+                delta_t=body.get("delta_t"),
+                width_m=body.get("width_m"),
+                height_m=body.get("height_m"),
+                corners=body.get("corners") or body.get("quad"),
+                n=body.get("n"),
+                d=body.get("d"),
+                bake=bool(body.get("bake", True)),
+                bake_cam=body.get("bake_cam"),
+                frames=frames,
+                margin_px=float(body.get("margin_px") or 120.0),
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except KeyError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify(result)
+
+    @app.post("/api/runs/<name>/sculpt/undo")
+    def api_sculpt_undo(name: str):
+        from ps1_hood.reconstruct.sculpt import undo_sculpt
+
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            result = undo_sculpt(
+                open_project(name).recon_dir,
+                stamp=body.get("stamp"),
+            )
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify(result)
+
     @app.get("/api/runs/<name>/file")
     def api_file(name: str):
         rel = request.args.get("path", "")

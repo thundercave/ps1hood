@@ -109,6 +109,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Off-tile / sky-halo gate (opt-in):** `ps1hood cloud-offtile <run> --support-dilate-m 10 --far-m 15 --z-out-m 8` dilates roof∪yard∪street, drops far halo / z≫local ground → `recon/cloud_offtile.ply`. Also `cloud-zclean --offtile`. **Not** Ortho XY±2 m. Studio **offtile** toggle. See [`docs/off-tile-floater-gate.md`](docs/off-tile-floater-gate.md).
 
+**Studio ENU sculpt (MVP):** toggle **sculpt** in the viewer → pick a façade → TransformControls along **n** (±3 m) + resize **w×h** about center → **save+bake** re-warps from a known pano (bak first; undo restores). No free-pose; sat XY locked; never wipes other planes. CLI: `ps1hood sculpt-apply <run> --plane facade_03 --delta-d 0.4` / `sculpt-undo`. See [`docs/studio-sculpt-mvp.md`](docs/studio-sculpt-mvp.md).
+
 **Studio hero defaults:** façades + sat roofs **ON**; raw MA `cloud.ply` **OFF** (`#togCloud` debug toggle — file stays on disk); BAG / zclean / offtile OFF. See [`docs/studio-hero-hide-cloud.md`](docs/studio-hero-hide-cloud.md).
 
 **Pano↔mesh compare (diagnose):** `ps1hood compare <run>` reprojects façades+roofs into SV with known ENU poses → ZNCC + edge + sat footprint Chamfer; writes `recon/compare/` overlays + `summary.json` (worst cams). No densify / free-pose / product wipe. See [`docs/pano-mesh-compare.md`](docs/pano-mesh-compare.md).

@@ -27,6 +27,7 @@
     import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
     import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
     import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
+    import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
     const params = new URLSearchParams(location.search);
     const run = params.get('run');
@@ -58,6 +59,13 @@
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
       + ` <label><input type="checkbox" id="togRoofs" checked> roofs</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
+      + `<br><label><input type="checkbox" id="togSculpt"> sculpt</label>`
+      + ` <button type="button" id="btnSculptTranslate" disabled>nudge n</button>`
+      + ` <button type="button" id="btnSculptScale" disabled>resize w×h</button>`
+      + ` <button type="button" id="btnSculptSave" disabled>save+bake</button>`
+      + ` <button type="button" id="btnSculptUndo" disabled>undo</button>`
+      + `<br><span id="sculptStatus" style="color:#9ad">sculpt: off</span>`
+      + `<br><label>bake cam <select id="sculptCam" disabled><option value="">frontal</option></select></label>`
       + `<br><a href="/">back</a>`;
 
     // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
@@ -321,6 +329,342 @@
     } catch (err) {
       hud.innerHTML += '<br>no sat roofs yet';
     }
+
+
+    // --- ENU façade sculpt (TransformControls; n-only translate + w×h scale; no free-pose) ---
+    const SCULPT_MAX_D = 3.0;
+    const SCULPT_MAX_T = 2.0;
+    let planesPayload = null;
+    let planeEntries = [];
+    let sculptOn = false;
+    let selected = null; // { id, index, nEnu, centerEnu, width_m, height_m, zncc, mesh }
+    let baseSelect = null;
+    const pickGroup = new THREE.Group();
+    pickGroup.visible = false;
+    scene.add(pickGroup);
+    const sculptPivot = new THREE.Object3D();
+    scene.add(sculptPivot);
+    const tcontrols = new TransformControls(camera, renderer.domElement);
+    tcontrols.enabled = false;
+    tcontrols.visible = false;
+    tcontrols.setSpace('local');
+    tcontrols.showX = false; tcontrols.showY = false; tcontrols.showZ = true;
+    scene.add(tcontrols.getHelper ? tcontrols.getHelper() : tcontrols);
+    tcontrols.addEventListener('dragging-changed', (ev) => { controls.enabled = !ev.value; });
+
+    const facadeAxesEnu = (nArr) => {
+      const nx = nArr[0], ny = nArr[1];
+      const nn = Math.hypot(nx, ny) || 1;
+      const n = [nx / nn, ny / nn, 0];
+      const t = [-n[1], n[0], 0]; // cross(up, n)
+      const u = [0, 0, 1];
+      return { n, t, u };
+    };
+    const cornersEnu = (center, nArr, w, h) => {
+      const { t, u } = facadeAxesEnu(nArr);
+      const hw = 0.5 * w, hh = 0.5 * h;
+      const add = (a, s, b) => [a[0] + s * b[0], a[1] + s * b[1], a[2] + s * b[2]];
+      return [
+        add(add(center, -hw, t), -hh, u),
+        add(add(center, +hw, t), -hh, u),
+        add(add(center, +hw, t), +hh, u),
+        add(add(center, -hw, t), +hh, u),
+      ];
+    };
+    const setMeshQuadEnu = (mesh, quadEnu) => {
+      if (!mesh || !mesh.geometry) return;
+      const a = to3(...quadEnu[0]), b = to3(...quadEnu[1]);
+      const c = to3(...quadEnu[2]), d = to3(...quadEnu[3]);
+      const arr = new Float32Array([
+        a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z,
+        a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z,
+      ]);
+      mesh.geometry.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      mesh.geometry.computeVertexNormals();
+    };
+    const orientPivot = (centerEnu, nArr) => {
+      const { n, t, u } = facadeAxesEnu(nArr);
+      const x = to3(t[0], t[1], t[2]).normalize();
+      const y = to3(u[0], u[1], u[2]).normalize();
+      const z = to3(n[0], n[1], n[2]).normalize();
+      const m = new THREE.Matrix4().makeBasis(x, y, z);
+      sculptPivot.position.copy(to3(centerEnu[0], centerEnu[1], centerEnu[2]));
+      sculptPivot.quaternion.setFromRotationMatrix(m);
+      sculptPivot.scale.set(1, 1, 1);
+      sculptPivot.updateMatrixWorld(true);
+    };
+    const updateSculptStatus = () => {
+      const el = document.getElementById('sculptStatus');
+      if (!el) return;
+      if (!sculptOn) { el.textContent = 'sculpt: off'; return; }
+      if (!selected) { el.textContent = 'sculpt: click a façade (Esc clears)'; return; }
+      const s = selected;
+      el.textContent = `sculpt: ${s.id}  zncc=${s.zncc ?? '—'}  w=${s.width_m.toFixed(2)} h=${s.height_m.toFixed(2)}  n=[${s.nEnu.map(v => v.toFixed(2)).join(',')}]`;
+    };
+    const setSculptMode = (mode) => {
+      if (mode === 'scale') {
+        tcontrols.setMode('scale');
+        tcontrols.showX = true; tcontrols.showY = true; tcontrols.showZ = false;
+      } else {
+        tcontrols.setMode('translate');
+        tcontrols.showX = false; tcontrols.showY = false; tcontrols.showZ = true;
+      }
+    };
+    const clearSelect = () => {
+      if (selected && selected.mesh && selected.mesh.material) {
+        selected.mesh.material.opacity = 0.02;
+        selected.mesh.material.color.setHex(0x44aaff);
+      }
+      selected = null;
+      baseSelect = null;
+      tcontrols.detach();
+      tcontrols.visible = false;
+      tcontrols.enabled = false;
+      for (const id of ['btnSculptTranslate', 'btnSculptScale', 'btnSculptSave']) {
+        const b = document.getElementById(id); if (b) b.disabled = true;
+      }
+      updateSculptStatus();
+    };
+    const selectPlane = (entry) => {
+      clearSelect();
+      selected = {
+        id: entry.id,
+        index: entry.index,
+        nEnu: entry.nEnu.slice(),
+        centerEnu: entry.centerEnu.slice(),
+        width_m: entry.width_m,
+        height_m: entry.height_m,
+        zncc: entry.zncc,
+        mesh: entry.mesh,
+      };
+      baseSelect = {
+        centerEnu: entry.centerEnu.slice(),
+        width_m: entry.width_m,
+        height_m: entry.height_m,
+      };
+      if (entry.mesh && entry.mesh.material) {
+        entry.mesh.material.opacity = 0.35;
+        entry.mesh.material.color.setHex(0xe8c36a);
+      }
+      orientPivot(selected.centerEnu, selected.nEnu);
+      tcontrols.attach(sculptPivot);
+      tcontrols.visible = true;
+      tcontrols.enabled = true;
+      setSculptMode('translate');
+      for (const id of ['btnSculptTranslate', 'btnSculptScale', 'btnSculptSave']) {
+        const b = document.getElementById(id); if (b) b.disabled = false;
+      }
+      updateSculptStatus();
+    };
+    const syncSelectedFromPivot = () => {
+      if (!selected || !baseSelect) return;
+      const { n, t } = facadeAxesEnu(selected.nEnu);
+      if (tcontrols.mode === 'translate') {
+        const cur = sculptPivot.position.clone();
+        const base = to3(baseSelect.centerEnu[0], baseSelect.centerEnu[1], baseSelect.centerEnu[2]);
+        const dWorld = cur.sub(base);
+        // Three (e,u,-n) → ENU delta
+        const dEnu = [dWorld.x, -dWorld.z, dWorld.y];
+        let dd = dEnu[0] * n[0] + dEnu[1] * n[1] + dEnu[2] * n[2];
+        let dt = dEnu[0] * t[0] + dEnu[1] * t[1] + dEnu[2] * t[2];
+        dd = Math.max(-SCULPT_MAX_D, Math.min(SCULPT_MAX_D, dd));
+        dt = Math.max(-SCULPT_MAX_T, Math.min(SCULPT_MAX_T, dt));
+        selected.centerEnu = [
+          baseSelect.centerEnu[0] + dd * n[0] + dt * t[0],
+          baseSelect.centerEnu[1] + dd * n[1] + dt * t[1],
+          baseSelect.centerEnu[2] + dd * n[2] + dt * t[2],
+        ];
+        orientPivot(selected.centerEnu, selected.nEnu);
+      } else {
+        let sx = Math.abs(sculptPivot.scale.x) || 1;
+        let sy = Math.abs(sculptPivot.scale.y) || 1;
+        sx = Math.max(0.2, Math.min(4, sx));
+        sy = Math.max(0.2, Math.min(4, sy));
+        selected.width_m = Math.max(0.5, baseSelect.width_m * sx);
+        selected.height_m = Math.max(0.5, baseSelect.height_m * sy);
+      }
+      const quad = cornersEnu(selected.centerEnu, selected.nEnu, selected.width_m, selected.height_m);
+      setMeshQuadEnu(selected.mesh, quad);
+      if (facadeRoot) {
+        facadeRoot.traverse((ch) => {
+          if (!ch.isMesh) return;
+          const mats = Array.isArray(ch.material) ? ch.material : [ch.material];
+          if (!mats.some((m) => m && m.name === selected.id)) return;
+          const pos = ch.geometry.getAttribute('position');
+          if (pos && pos.count >= 4 && pos.count <= 6) setMeshQuadEnu(ch, quad);
+        });
+      }
+      updateSculptStatus();
+    };
+    tcontrols.addEventListener('objectChange', syncSelectedFromPivot);
+
+    const buildPickMeshes = () => {
+      while (pickGroup.children.length) {
+        const c = pickGroup.children.pop();
+        c.geometry?.dispose?.();
+        c.material?.dispose?.();
+      }
+      planeEntries = [];
+      const planes = (planesPayload && planesPayload.planes) || [];
+      planes.forEach((pl, index) => {
+        const id = pl.id || (`facade_${String(index).padStart(2, '0')}`);
+        const quad = pl.quad || pl.corners;
+        if (!quad || quad.length < 4) return;
+        const center = pl.center || [
+          (quad[0][0] + quad[1][0] + quad[2][0] + quad[3][0]) / 4,
+          (quad[0][1] + quad[1][1] + quad[2][1] + quad[3][1]) / 4,
+          (quad[0][2] + quad[1][2] + quad[2][2] + quad[3][2]) / 4,
+        ];
+        const nEnu = (pl.n || [0, 1, 0]).slice(0, 3);
+        nEnu[2] = 0;
+        const mesh = new THREE.Mesh(
+          new THREE.BufferGeometry(),
+          new THREE.MeshBasicMaterial({
+            color: 0x44aaff, transparent: true, opacity: 0.02,
+            side: THREE.DoubleSide, depthWrite: false,
+          })
+        );
+        mesh.userData.planeId = id;
+        setMeshQuadEnu(mesh, quad);
+        pickGroup.add(mesh);
+        planeEntries.push({
+          id, index, nEnu,
+          centerEnu: center.slice(),
+          width_m: Number(pl.width_m) || 1,
+          height_m: Number(pl.height_m) || 1,
+          zncc: pl.zncc, mesh,
+        });
+      });
+    };
+
+    try {
+      planesPayload = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/planes.json')).json();
+      buildPickMeshes();
+      hud.innerHTML += `<br>planes ${planeEntries.length}`;
+    } catch (err) {
+      hud.innerHTML += '<br>no planes.json';
+    }
+    try {
+      const camPayload = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/sculpt/cameras')).json();
+      const sel = document.getElementById('sculptCam');
+      if (sel && camPayload.cameras) {
+        for (const c of camPayload.cameras) {
+          const opt = document.createElement('option');
+          opt.value = c.pano_id || '';
+          const label = (c.pano_id || ('cam' + c.index)).slice(0, 18);
+          opt.textContent = label + ' h' + Math.round(c.heading || 0);
+          sel.appendChild(opt);
+        }
+      }
+    } catch (err) { /* optional */ }
+
+    const setSculptEnabled = (on) => {
+      sculptOn = !!on;
+      pickGroup.visible = sculptOn;
+      const undoBtn = document.getElementById('btnSculptUndo');
+      if (undoBtn) undoBtn.disabled = !sculptOn;
+      const camSel = document.getElementById('sculptCam');
+      if (camSel) camSel.disabled = !sculptOn;
+      if (!sculptOn) clearSelect();
+      else updateSculptStatus();
+    };
+    document.getElementById('togSculpt')?.addEventListener('change', (ev) => {
+      setSculptEnabled(ev.target.checked);
+    });
+    document.getElementById('btnSculptTranslate')?.addEventListener('click', () => {
+      if (!selected) return;
+      baseSelect = { centerEnu: selected.centerEnu.slice(), width_m: selected.width_m, height_m: selected.height_m };
+      sculptPivot.scale.set(1, 1, 1);
+      orientPivot(selected.centerEnu, selected.nEnu);
+      setSculptMode('translate');
+    });
+    document.getElementById('btnSculptScale')?.addEventListener('click', () => {
+      if (!selected) return;
+      baseSelect = { centerEnu: selected.centerEnu.slice(), width_m: selected.width_m, height_m: selected.height_m };
+      sculptPivot.scale.set(1, 1, 1);
+      orientPivot(selected.centerEnu, selected.nEnu);
+      setSculptMode('scale');
+    });
+
+    const postSculpt = async () => {
+      if (!selected) return;
+      const camSel = document.getElementById('sculptCam');
+      const body = {
+        plane_id: selected.id,
+        corners: cornersEnu(selected.centerEnu, selected.nEnu, selected.width_m, selected.height_m),
+        width_m: selected.width_m,
+        height_m: selected.height_m,
+        n: selected.nEnu,
+        bake: true,
+        bake_cam: (camSel && camSel.value) ? camSel.value : null,
+      };
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sculpt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!data.ok) {
+        alert('sculpt failed: ' + (data.error || resp.status));
+        return;
+      }
+      const note = data.bake_ok ? 'baked' : ('bake soft-fail: ' + (data.bake_error || 'n/a'));
+      hud.innerHTML += `<br>saved ${data.plane_id} (${note})`;
+      try {
+        planesPayload = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/planes.json?t=' + Date.now())).json();
+        buildPickMeshes();
+        const again = planeEntries.find((e) => e.id === data.plane_id);
+        if (again) selectPlane(again);
+      } catch (e) { /* ignore */ }
+      if (facadeRoot && data.bake_ok) {
+        facadeRoot.traverse((ch) => {
+          if (!ch.isMesh || !ch.material) return;
+          const mats = Array.isArray(ch.material) ? ch.material : [ch.material];
+          for (const m of mats) {
+            if (m && m.name === selected.id && m.map) {
+              const url = '/api/runs/' + encodeURIComponent(run) + '/textures/' + selected.id + '.jpg?t=' + Date.now();
+              m.map = new THREE.TextureLoader().load(url);
+              m.map.colorSpace = THREE.SRGBColorSpace;
+              m.map.magFilter = THREE.NearestFilter;
+              m.map.minFilter = THREE.NearestFilter;
+              m.map.generateMipmaps = false;
+              m.needsUpdate = true;
+            }
+          }
+        });
+      }
+    };
+    document.getElementById('btnSculptSave')?.addEventListener('click', () => postSculpt());
+    document.getElementById('btnSculptUndo')?.addEventListener('click', async () => {
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sculpt/undo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const data = await resp.json();
+      if (!data.ok) { alert('undo failed: ' + (data.error || resp.status)); return; }
+      location.reload();
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    renderer.domElement.addEventListener('pointerdown', (ev) => {
+      if (!sculptOn || ev.button !== 0) return;
+      if (tcontrols.dragging) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(pickGroup.children, false);
+      if (hits.length) {
+        const id = hits[0].object.userData.planeId;
+        const entry = planeEntries.find((e) => e.id === id);
+        if (entry) selectPlane(entry);
+      }
+    });
+    addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && sculptOn) clearSelect();
+    });
 
     document.getElementById('togCloud')?.addEventListener('change', (ev) => {
       if (cloudPoints) cloudPoints.visible = ev.target.checked;
