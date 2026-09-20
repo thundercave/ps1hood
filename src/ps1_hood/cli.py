@@ -2081,6 +2081,144 @@ def sculpt_undo_cmd(name: str, stamp: str | None) -> None:
     )
 
 
+
+
+@main.group("sat-offset")
+def sat_offset_group() -> None:
+    """Forced SE(2) from façade edges → Ortho Canny (escape no-op seat)."""
+
+
+@sat_offset_group.command("measure")
+@click.argument("name")
+@click.option(
+    "--out",
+    "out_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output T_force.json (default: <run>/align/T_force.json)",
+)
+@click.option("--search-r-m", default=8.0, show_default=True, type=float)
+@click.option("--min-len-m", default=3.0, show_default=True, type=float)
+@click.option("--max-rms-m", default=1.5, show_default=True, type=float)
+@click.option("--min-pairs", default=4, show_default=True, type=int)
+@click.option("--max-yaw-deg", default=15.0, show_default=True, type=float)
+@click.option("--max-translation-m", default=10.0, show_default=True, type=float)
+@click.option(
+    "--multistart/--no-multistart",
+    default=False,
+    show_default=True,
+    help="Optional Chamfer multi-start polish (escape NCC local min)",
+)
+def sat_offset_measure_cmd(
+    name: str,
+    out_path: Path | None,
+    search_r_m: float,
+    min_len_m: float,
+    max_rms_m: float,
+    min_pairs: int,
+    max_yaw_deg: float,
+    max_translation_m: float,
+    multistart: bool,
+) -> None:
+    """Measure yellow≈R(yaw)@red+(tx,ty) from façade long edges vs Ortho Canny.
+
+    Writes align/T_force.json. One rigid SE(2) only — no free-pose.
+    """
+    from ps1_hood.align.sat_offset import SatOffsetError, measure_facade_sat_se2, write_t_force
+
+    project = open_project(name)
+    dest = Path(out_path) if out_path else (project.align_dir / "T_force.json")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    try:
+        payload = measure_facade_sat_se2(
+            project,
+            search_r_m=float(search_r_m),
+            min_len_m=float(min_len_m),
+            max_rms_m=float(max_rms_m),
+            min_pairs=int(min_pairs),
+            max_yaw_deg=float(max_yaw_deg),
+            max_translation_m=float(max_translation_m),
+            multistart=bool(multistart),
+        )
+    except SatOffsetError as exc:
+        click.echo(f"sat-offset measure failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    write_t_force(dest, payload)
+    click.echo(
+        f"sat-offset measure ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
+        f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
+        f"n_pairs={payload['n_pairs']}  out={dest}"
+    )
+
+
+@sat_offset_group.command("apply")
+@click.argument("name")
+@click.option(
+    "--from",
+    "from_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="T_force.json (default: <run>/align/T_force.json)",
+)
+@click.option(
+    "--targets",
+    default="cams,cloud,facades,planes",
+    show_default=True,
+    help="Comma list: cams,cloud,facades,planes[,roofs,street]",
+)
+@click.option(
+    "--skip",
+    default="roofs,street",
+    show_default=True,
+    help="Comma list to leave alone (sat-native roofs/street by default)",
+)
+@click.option("--bak/--no-bak", default=True, show_default=True)
+def sat_offset_apply_cmd(
+    name: str,
+    from_path: Path | None,
+    targets: str,
+    skip: str,
+    bak: bool,
+) -> None:
+    """Bak then apply one forced SE(2) to cams+cloud+façades/planes.
+
+    Skips roofs/street by default. Undo: restore align.bak_force_* / recon/bak_force_*.
+    """
+    from ps1_hood.align.sat_offset import SatOffsetError, apply_forced_se2, load_t_force
+
+    project = open_project(name)
+    src = Path(from_path) if from_path else (project.align_dir / "T_force.json")
+    if not src.is_absolute():
+        src = project.root / src
+    try:
+        T = load_t_force(src)
+        meta = apply_forced_se2(
+            project,
+            T,
+            targets=targets,
+            skip=skip,
+            bak=bool(bak),
+        )
+    except SatOffsetError as exc:
+        click.echo(f"sat-offset apply failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"sat-offset apply failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    stats = meta.get("stats") or {}
+    bak_meta = meta.get("bak") or {}
+    click.echo(
+        f"sat-offset apply ok  tx={meta['T']['tx_m']:.3f}  ty={meta['T']['ty_m']:.3f}  "
+        f"yaw={meta['T']['yaw_deg']:.3f}  targets={','.join(meta['targets'])}  "
+        f"skip={','.join(meta['skip'])}  "
+        f"poses={stats.get('poses')}  cloud={stats.get('cloud.ply')}  "
+        f"facades={stats.get('facades.obj')}  planes={stats.get('planes.json')}  "
+        f"roofs={stats.get('roofs.obj')}  street={stats.get('street.obj')}  "
+        f"bak={bak_meta.get('stamp')}"
+    )
+
+
 @main.command("studio")
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
