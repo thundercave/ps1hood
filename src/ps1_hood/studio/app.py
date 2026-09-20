@@ -44,6 +44,7 @@ def create_app() -> Flask:
                             "bbox": spec.bbox.as_dict(),
                             "source": spec.source,
                             "has_cloud": (child / "recon" / "cloud.ply").is_file(),
+                            "has_compare": (child / "recon" / "compare" / "summary.json").is_file(),
                             "has_scene": (child / "recon" / "scene.json").is_file(),
                             "has_live": (child / "live.json").is_file(),
                             "has_bag": (child / "bag" / "buildings.json").is_file(),
@@ -169,6 +170,23 @@ def create_app() -> Flask:
         if not path.is_file():
             return jsonify({"error": "no roofs mtl yet"}), 404
         return send_file(path)
+
+
+    @app.get("/api/runs/<name>/compare/summary.json")
+    def api_compare_summary(name: str):
+        path = open_project(name).recon_dir / "compare" / "summary.json"
+        if not path.is_file():
+            return jsonify({"error": "no compare yet — run: ps1hood compare <run>"}), 404
+        return send_file(path, mimetype="application/json")
+
+    @app.get("/api/runs/<name>/compare/<path:filename>")
+    def api_compare_file(name: str, filename: str):
+        folder = open_project(name).recon_dir / "compare"
+        path = (folder / filename).resolve()
+        if not str(path).startswith(str(folder.resolve())) or not path.is_file():
+            return jsonify({"error": "missing"}), 404
+        return send_file(path)
+
 
     @app.get("/api/runs/<name>/textures/<path:filename>")
     def api_facade_texture(name: str, filename: str):

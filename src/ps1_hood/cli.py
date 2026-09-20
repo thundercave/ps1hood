@@ -1020,6 +1020,73 @@ def roofs_cmd(name: str, min_area_m2: float, edge_gate_m: float) -> None:
     )
 
 
+
+@main.command("compare")
+@click.argument("name")
+@click.option(
+    "--max-cams",
+    default=40,
+    show_default=True,
+    type=int,
+    help="Max horizon cameras after (pano,heading≈45°) dedupe",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output dir (default: <run>/recon/compare)",
+)
+@click.option(
+    "--patch",
+    default=64,
+    show_default=True,
+    type=int,
+    help="Ortho patch size for ZNCC",
+)
+def compare_cmd(name: str, max_cams: int, out_dir: Path | None, patch: int) -> None:
+    """Diagnose-only: reproject façades+roofs into SV; ZNCC + edge + sat Chamfer.
+
+    Writes recon/compare/*_hNNN.jpg overlays (photo | mesh | absdiff) and
+    summary.json ranked by worst ZNCC. Does not densify, free-pose, or wipe product.
+    """
+    from ps1_hood.reconstruct.compare import CompareError, run_compare
+
+    project = open_project(name)
+    try:
+        summary = run_compare(
+            project.root,
+            max_cams=int(max_cams),
+            out_dir=out_dir,
+            patch=int(patch),
+        )
+    except CompareError as exc:
+        click.echo(f"compare failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"compare failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    g = summary.get("global") or {}
+    click.echo(
+        f"compare ok  cams={summary.get('n_cams_scored')}/"
+        f"{summary.get('n_cams_considered')}  "
+        f"quads={summary.get('n_quads_product')}  "
+        f"zncc_mean={g.get('zncc_mean')}  "
+        f"edge_mean={g.get('edge_mean')}  "
+        f"sat_edge_m={g.get('sat_edge_mean_m')}  "
+        f"soft_warn={g.get('soft_zncc_warn')}  "
+        f"out={summary.get('out_dir')}"
+    )
+    click.echo("worst cams (lowest zncc):")
+    for w in summary.get("worst") or []:
+        click.echo(
+            f"  {w['id']}  zncc={w['zncc_mean']:.3f}  "
+            f"edge={w['edge_mean']:.3f}  quads={w['n_quads']}  "
+            f"overlay={w['overlay']}"
+        )
+
+
 @main.command("studio")
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)

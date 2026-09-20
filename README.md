@@ -101,6 +101,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Sat-locked roofs/yards (PR-A):** `ps1hood roofs <run>` builds flat Ortho-ENU shells from sat Canny+flood, Z from MA median / façade top, textures from sat crop → `recon/roofs.obj`. Studio **roofs** toggle. See [`docs/sat-roof-yard-shells.md`](docs/sat-roof-yard-shells.md).
 
+**Pano↔mesh compare (diagnose):** `ps1hood compare <run>` reprojects façades+roofs into SV with known ENU poses → ZNCC + edge + sat footprint Chamfer; writes `recon/compare/` overlays + `summary.json` (worst cams). No densify / free-pose / product wipe. See [`docs/pano-mesh-compare.md`](docs/pano-mesh-compare.md).
+
 **Textured façades:** after photo-consistency accept, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.
 
 COLMAP is hardened for SV orbits: if the sparse model is missing/`points3D.bin` empty or <1 KB, reconstruct errors with a clear "use flow/mast3r/known poses" message; a valid model is converted to `recon/cloud_colmap.ply` (and copied to `cloud.ply`).
