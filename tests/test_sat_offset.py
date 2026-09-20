@@ -471,3 +471,104 @@ def test_match_cams_to_centerline_nn():
     T_tx = sum(a["e"] - b["e"] for a, b in zip(after, before)) / 4
     T_ty = sum(a["n"] - b["n"] for a, b in zip(after, before)) / 4
     assert abs(T_tx) < 1e-6 and abs(T_ty + 1.0) < 1e-6
+
+
+def test_continuity_avoids_parallel_branch():
+    """Continuity keeps cams on one road; plain NN can latch a parallel branch."""
+    import numpy as np
+    from ps1_hood.align.sat_offset import (
+        match_cams_to_centerline,
+        match_cams_to_centerline_continuity,
+    )
+
+    cams = np.array([[0.0, 1.0], [5.0, 1.0], [10.0, 8.0], [15.0, 1.0], [20.0, 1.0]])
+    cl_main = np.stack([np.linspace(0, 20, 21), np.zeros(21)], axis=1)
+    cl_park = np.stack([np.linspace(0, 20, 21), np.full(21, 10.0)], axis=1)
+    cl = np.vstack([cl_main, cl_park])
+
+    _, after_nn, _ = match_cams_to_centerline(cams, cl, search_r_m=15.0, min_nn_m=0.1)
+    _, after_c, _ = match_cams_to_centerline_continuity(
+        cams, cl, search_r_m=15.0, min_nn_m=0.1, max_lateral_m=8.0
+    )
+    assert any(abs(a["n"] - 10.0) < 1.0 for a in after_nn), "NN should latch parking branch"
+    assert all(abs(a["n"]) < 1.5 for a in after_c), "continuity must stay on main road"
+
+
+def test_crop_street_mask_to_cam_corridor_drops_far_street():
+    import numpy as np
+    from types import SimpleNamespace
+    from ps1_hood.align.sat_offset import crop_street_mask_to_cam_corridor
+
+    h, w = 100, 100
+    street = np.zeros((h, w), dtype=np.uint8)
+    street[50, :] = 255  # horizontal road through middle
+    street[10, :] = 255  # far parallel road
+
+    class _Ortho:
+        h = 100
+        w = 100
+        def enu_to_px(self, e, n):
+            return e, n  # 1 m/px identity
+
+    # Mock metres: patch cam_xy_mask path by making ortho with metres helpers
+    # crop uses cam_xy_mask from sat_street which needs _metres_per_px(ortho)
+    # Provide minimal Ortho-like with ee/sw/nn/sh
+    ortho = SimpleNamespace(
+        h=100, w=100,
+        ee=100.0, sw=0.0, nn=100.0, sh=0.0,
+        enu_to_px=lambda e, n: (e, 100.0 - n) if False else (e, n),
+    )
+    # Use real method binding
+    def enu_to_px(e, n):
+        return float(e), float(n)
+    ortho.enu_to_px = enu_to_px
+
+    cams = np.array([[20.0, 50.0], [40.0, 50.0], [60.0, 50.0], [80.0, 50.0]])
+    cropped = crop_street_mask_to_cam_corridor(street, ortho, cams, corridor_m=8.0)
+    assert int((cropped[50] > 0).sum()) > 10
+    # Far road at row 10 should be mostly gone
+    assert int((cropped[10] > 0).sum()) < int((street[10] > 0).sum()) * 0.25
+
+
+def test_mad_gate_rejects_disagreeing_pairs(tmp_path: Path, monkeypatch):
+    """MAD gate rejects when residual MAD exceeds max_mad_m (multi-branch symptom)."""
+    from ps1_hood.align.sat_offset import SatOffsetError, measure_cam_road_se2
+    import ps1_hood.align.sat_offset as so
+
+    _patch_street_mask(monkeypatch)
+    project = _mini_project_cam_road(tmp_path, cam_shift_e=0.0, cam_shift_n=2.0)
+
+    # Force a high MAD regardless of matcher geometry
+    monkeypatch.setattr(so, "_residual_mad", lambda errs: (3.0, 2.5))
+    with pytest.raises(SatOffsetError, match=r"mad"):
+        measure_cam_road_se2(
+            project,
+            search_r_m=15.0,
+            max_rms_m=20.0,
+            max_mad_m=1.5,
+            translation_only=True,
+        )
+
+
+def test_residual_mad_reports_spread():
+    from ps1_hood.align.sat_offset import _residual_mad
+
+    med, mad = _residual_mad([0.0, 0.5, 1.0, 8.0, 9.0])
+    assert med >= 0.5
+    assert mad >= 0.5
+
+
+def test_fit_cam_road_from_pairs_preview_only():
+    from ps1_hood.align.sat_offset import SOURCE_CAM_ROAD_PICKS, fit_cam_road_from_pairs
+
+    pairs = [
+        {"red": {"e": 0.0, "n": 0.0}, "yellow": {"e": 0.0, "n": 2.0}},
+        {"red": {"e": 5.0, "n": 0.0}, "yellow": {"e": 5.0, "n": 2.0}},
+        {"red": {"e": 10.0, "n": 0.0}, "yellow": {"e": 10.0, "n": 2.0}},
+        {"red": {"e": 15.0, "n": 0.0}, "yellow": {"e": 15.0, "n": 2.0}},
+    ]
+    payload = fit_cam_road_from_pairs(pairs, translation_only=True)
+    assert payload["source"] == SOURCE_CAM_ROAD_PICKS or "cam_road" in payload["source"]
+    assert payload["applied"] is False
+    assert abs(payload["ty_m"] - 2.0) < 0.2
+    assert payload["rms_m"] <= 2.0
