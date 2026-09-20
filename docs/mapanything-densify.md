@@ -214,3 +214,5 @@ Mocks cover bundle shape, cam2world vs w2c convention, `pts3d_cam`→ENU fuse
 ## Soft Z floaters (opt-in, separate)
 
 After densify + `ps1hood roofs`, run `ps1hood cloud-zclean <run> --margin-m 1.5` to write `recon/cloud_zclean.ply` (drop pts above sat roof shells). Does not change densify defaults or XY-clip the product cloud. See [`roof-floater-zclean.md`](roof-floater-zclean.md).
+
+Off-tile / sky-halo smear (outside roof AABBs) needs the support gate: `ps1hood cloud-offtile <run> --support-dilate-m 10 --far-m 15 --z-out-m 8` → `recon/cloud_offtile.ply`. Not Ortho±2 m. See [`off-tile-floater-gate.md`](off-tile-floater-gate.md).

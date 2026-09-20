@@ -54,6 +54,7 @@
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
       + `<br><label><input type="checkbox" id="togCloud" checked> cloud</label>`
       + ` <label><input type="checkbox" id="togZclean"> zclean</label>`
+      + ` <label><input type="checkbox" id="togOfftile"> offtile</label>`
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
       + ` <label><input type="checkbox" id="togRoofs" checked> roofs</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
@@ -197,6 +198,7 @@
 
     let cloudPoints = null;
     let zcleanPoints = null;
+    let offtilePoints = null;
     try {
       const geom = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud.ply');
       remapEnuGeometry(geom);
@@ -215,6 +217,16 @@
       scene.add(zcleanPoints);
     } catch (err) {
       /* optional sidecar from ps1hood cloud-zclean */
+    }
+    try {
+      const geomO = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud_offtile.ply');
+      remapEnuGeometry(geomO);
+      const matO = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, opacity: 0.55, transparent: true });
+      offtilePoints = new THREE.Points(geomO, matO);
+      offtilePoints.visible = false;
+      scene.add(offtilePoints);
+    } catch (err) {
+      /* optional sidecar from ps1hood cloud-offtile */
     }
 
     let facadeRoot = null;
@@ -319,6 +331,24 @@
         if (ev.target.checked && cloudPoints) cloudPoints.visible = false;
         const tc = document.getElementById('togCloud');
         if (ev.target.checked && tc) tc.checked = false;
+        if (ev.target.checked && offtilePoints) {
+          offtilePoints.visible = false;
+          const to = document.getElementById('togOfftile');
+          if (to) to.checked = false;
+        }
+      }
+    });
+    document.getElementById('togOfftile')?.addEventListener('change', (ev) => {
+      if (offtilePoints) {
+        offtilePoints.visible = ev.target.checked;
+        if (ev.target.checked && cloudPoints) cloudPoints.visible = false;
+        const tc = document.getElementById('togCloud');
+        if (ev.target.checked && tc) tc.checked = false;
+        if (ev.target.checked && zcleanPoints) {
+          zcleanPoints.visible = false;
+          const tz = document.getElementById('togZclean');
+          if (tz) tz.checked = false;
+        }
       }
     });
     document.getElementById('togFacades')?.addEventListener('change', (ev) => {
