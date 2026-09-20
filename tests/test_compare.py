@@ -159,3 +159,109 @@ def test_smoke_dense_compare_writes_summary() -> None:
     # product untouched
     assert (root / "recon" / "planes.json").is_file()
     load_product_quads(root)  # still loadable
+
+
+def test_untextured_quad_zncc_is_nan_not_gray_fake() -> None:
+    """No mesh texture → zncc=nan (do not invent constant-gray mesh patch)."""
+    from ps1_hood.reconstruct.compare import score_quad_in_view
+
+    photo = np.random.randint(20, 220, (240, 320, 3), dtype=np.uint8)
+    frame = {
+        "e": 0.0,
+        "n": 0.0,
+        "u": 2.0,
+        "heading": 0.0,
+        "pitch": 0.0,
+        "fov": 90.0,
+    }
+    quad = {
+        "id": "bare",
+        "kind": "facade",
+        "corners": np.array(
+            [
+                [-2.0, 8.0, 0.5],
+                [2.0, 8.0, 0.5],
+                [2.0, 8.0, 6.0],
+                [-2.0, 8.0, 6.0],
+            ],
+            dtype=np.float64,
+        ),
+        "texture": None,
+    }
+    scored = score_quad_in_view(photo, frame, quad, patch=32)
+    assert scored is not None
+    assert scored["has_texture"] is False
+    assert scored["zncc"] != scored["zncc"]  # NaN
+
+
+def test_worst_excludes_nan_zncc_cams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """worst[:10] is finite-ZNCC only; NaN cams must not monopolize ranking."""
+    from ps1_hood.reconstruct import compare as cmp
+
+    (tmp_path / "align").mkdir()
+    (tmp_path / "recon").mkdir()
+    img = tmp_path / "shot.jpg"
+    cv2.imwrite(str(img), np.full((64, 64, 3), 80, dtype=np.uint8))
+    plane = {
+        "planes": [
+            {
+                "id": "f0",
+                "n": [0.0, -1.0, 0.0],
+                "d": 8.0,
+                "quad": [
+                    [-2.0, 8.0, 0.5],
+                    [2.0, 8.0, 0.5],
+                    [2.0, 8.0, 6.0],
+                    [-2.0, 8.0, 6.0],
+                ],
+            }
+        ]
+    }
+    (tmp_path / "recon" / "planes.json").write_text(json.dumps(plane), encoding="utf-8")
+    cams = [
+        {
+            "pano_id": pid,
+            "shot_path": str(img),
+            "e": 0.0,
+            "n": 0.0,
+            "u": 2.0,
+            "heading": 0.0,
+            "pitch": 0.0,
+            "fov": 90.0,
+        }
+        for pid in ("nan_a", "bad", "ok", "nan_b")
+    ]
+    (tmp_path / "align" / "cameras.json").write_text(json.dumps(cams), encoding="utf-8")
+
+    fake = {
+        "nan_a": {"zncc_mean": float("nan"), "edge_mean": 0.5, "n_quads": 1},
+        "bad": {"zncc_mean": -0.2, "edge_mean": 0.1, "n_quads": 4},
+        "ok": {"zncc_mean": 0.5, "edge_mean": 0.4, "n_quads": 3},
+        "nan_b": {"zncc_mean": float("nan"), "edge_mean": 0.2, "n_quads": 2},
+    }
+
+    def _fake_compare_camera(frame, quads, *, patch=64):
+        pid = str(frame.get("pano_id"))
+        row = fake[pid]
+        strip = np.zeros((32, 96, 3), dtype=np.uint8)
+        return {
+            "id": f"{pid}_h000",
+            "pano_id": pid,
+            "heading": 0.0,
+            "zncc_mean": row["zncc_mean"],
+            "edge_mean": row["edge_mean"],
+            "n_quads": row["n_quads"],
+            "quads": [],
+            "overlay": strip,
+        }
+
+    monkeypatch.setattr(cmp, "compare_camera", _fake_compare_camera)
+    monkeypatch.setattr(
+        cmp, "sat_footprint_edge_mean_m", lambda *a, **k: {"ok": True, "edge_mean_m": 0.3}
+    )
+    summary = cmp.run_compare(tmp_path, max_cams=10, out_dir=tmp_path / "out")
+    worst_ids = [w["id"] for w in summary["worst"]]
+    assert worst_ids == ["bad_h000", "ok_h000"]
+    assert all(w["zncc_mean"] == w["zncc_mean"] for w in summary["worst"])
+    assert summary["global"]["n_cams_nan_zncc"] == 2
+    assert summary["global"]["n_cams_finite_zncc"] == 2

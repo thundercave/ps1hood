@@ -280,7 +280,7 @@ def _ortho_patches(
     tex_bgr: np.ndarray | None,
     *,
     patch: int = DEFAULT_PATCH,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray | None] | None:
     h, w = photo_bgr.shape[:2]
     src = uv.astype(np.float32).copy()
     src[:, 0] = np.clip(src[:, 0], -40.0, w + 40.0)
@@ -297,26 +297,26 @@ def _ortho_patches(
     photo_p = cv2.warpPerspective(photo_gray, H, (patch, patch), flags=cv2.INTER_LINEAR)
     if float((photo_p > 0).mean()) < 0.25:
         return None
-    if tex_bgr is not None and tex_bgr.size > 0:
-        th, tw = tex_bgr.shape[:2]
-        tex_src = np.array(
-            [[0, th - 1], [tw - 1, th - 1], [tw - 1, 0], [0, 0]],
-            dtype=np.float32,
+    if tex_bgr is None or tex_bgr.size == 0:
+        # No texture → no ZNCC (constant gray would always NaN via zero variance).
+        return photo_p, None
+    th, tw = tex_bgr.shape[:2]
+    tex_src = np.array(
+        [[0, th - 1], [tw - 1, th - 1], [tw - 1, 0], [0, 0]],
+        dtype=np.float32,
+    )
+    try:
+        H_tex = cv2.getPerspectiveTransform(tex_src, dst)
+        tex_gray = (
+            cv2.cvtColor(tex_bgr, cv2.COLOR_BGR2GRAY)
+            if tex_bgr.ndim == 3
+            else tex_bgr
         )
-        try:
-            H_tex = cv2.getPerspectiveTransform(tex_src, dst)
-            tex_gray = (
-                cv2.cvtColor(tex_bgr, cv2.COLOR_BGR2GRAY)
-                if tex_bgr.ndim == 3
-                else tex_bgr
-            )
-            mesh_p = cv2.warpPerspective(
-                tex_gray, H_tex, (patch, patch), flags=cv2.INTER_LINEAR
-            )
-        except cv2.error:
-            mesh_p = np.full((patch, patch), 128, dtype=np.uint8)
-    else:
-        mesh_p = np.full((patch, patch), 128, dtype=np.uint8)
+        mesh_p = cv2.warpPerspective(
+            tex_gray, H_tex, (patch, patch), flags=cv2.INTER_LINEAR
+        )
+    except cv2.error:
+        return photo_p, None
     return photo_p, mesh_p
 
 
@@ -373,14 +373,19 @@ def score_quad_in_view(
     if patches is None:
         return None
     photo_p, mesh_p = patches
-    z = zncc(photo_p.astype(np.float64), mesh_p.astype(np.float64))
+    if mesh_p is None:
+        z = float("nan")
+    else:
+        z = zncc(photo_p.astype(np.float64), mesh_p.astype(np.float64))
+        z = float(z) if z == z else float("nan")
     edge = edge_chamfer_agree(photo_bgr, uv)
     return {
         "id": quad["id"],
         "kind": quad.get("kind") or "facade",
-        "zncc": float(z) if z == z else float("nan"),
+        "zncc": z,
         "edge": float(edge) if edge == edge else float("nan"),
         "uv": uv,
+        "has_texture": mesh_p is not None,
     }
 
 
@@ -598,6 +603,7 @@ def compare_camera(
                 "kind": s["kind"],
                 "zncc": s["zncc"],
                 "edge": s["edge"],
+                "has_texture": bool(s.get("has_texture")),
             }
             for s in scored
         ],
@@ -650,11 +656,14 @@ def run_compare(
         )
 
     def _sort_key(r: dict[str, Any]) -> float:
+        # Finite ascending (true worst first). NaN → +inf so unscored/no-tex
+        # cams do not monopolize worst[:10] (gray-mesh ZNCC was always NaN).
         z = r["zncc_mean"]
-        return z if z == z else -2.0
+        return z if z == z else float("inf")
 
     ranked = sorted(cam_rows, key=_sort_key)
-    worst = ranked[:10]
+    finite = [r for r in ranked if r["zncc_mean"] == r["zncc_mean"]]
+    worst = finite[:10]
     znccs = [r["zncc_mean"] for r in cam_rows if r["zncc_mean"] == r["zncc_mean"]]
     edges = [r["edge_mean"] for r in cam_rows if r["edge_mean"] == r["edge_mean"]]
     global_zncc = float(np.mean(znccs)) if znccs else float("nan")
@@ -686,6 +695,8 @@ def run_compare(
             "sat_edge_mean_m": sat.get("edge_mean_m"),
             "soft_zncc_warn": soft_warn,
             "soft_zncc_threshold": SOFT_ZNCC_WARN,
+            "n_cams_finite_zncc": len(znccs),
+            "n_cams_nan_zncc": len(cam_rows) - len(znccs),
         },
         "sat_footprint": sat,
         "diagnose_only": True,
