@@ -14,6 +14,9 @@ MIN_LERP_BASELINE_M = 2.0
 POSED_MATCH_MIDFRAME_BASELINE_M = 4.0
 # Densify/recon: keep every Nth midframe + all real panos (full FILM ≈ near-dupes).
 DENSIFY_MIDFRAME_STRIDE = 4
+# PR-B MapAnything densify: also enforce ENU clearance between densify views
+# (≥4–6 m) so near-dupe FILM neighbors do not flood the locked-pose batch.
+DENSIFY_MIDFRAME_BASELINE_M = 4.0
 
 _POSE_ENU_KEYS = ("e", "n", "u", "heading")
 _POSE_PINHOLE_KEYS = ("fov", "width", "height")
@@ -143,35 +146,49 @@ def assert_interp_frame_poses(frames: list[dict[str, Any]]) -> None:
             )
 
 
+def _enu_xy_dist_m(a: dict[str, Any], b: dict[str, Any]) -> float:
+    de = float(a["e"]) - float(b["e"])
+    dn = float(a["n"]) - float(b["n"])
+    return math.hypot(de, dn)
+
+
 def select_densify_frames(
     frames: list[dict[str, Any]],
     *,
     midframe_stride: int = DENSIFY_MIDFRAME_STRIDE,
+    min_baseline_m: float = DENSIFY_MIDFRAME_BASELINE_M,
 ) -> list[dict[str, Any]]:
     """Keyframes (real panos) + every Nth midframe for densify/recon.
 
     Asserts ENU (+fov/width/height) on **every** input frame first — full FILM
     rate must be posed even when densify only consumes a stride subset.
+
+    After stride, drop midframes closer than ``min_baseline_m`` (default
+    ``DENSIFY_MIDFRAME_BASELINE_M`` ≥4 m) to any already-selected view so
+    MapAnything locked-pose densify is not flooded with near-dupes. Keyframes
+    (real panos) are always kept.
     """
     assert_interp_frame_poses(frames)
     if midframe_stride < 1:
         raise ValueError(f"midframe_stride must be >= 1, got {midframe_stride}")
+    if min_baseline_m < 0:
+        raise ValueError(f"min_baseline_m must be >= 0, got {min_baseline_m}")
     out: list[dict[str, Any]] = []
     mid_i = 0
     for frame in frames:
         if not frame.get("interpolated", False):
             out.append(frame)
             continue
-        if mid_i % midframe_stride == 0:
-            out.append(frame)
+        keep = mid_i % midframe_stride == 0
         mid_i += 1
+        if not keep:
+            continue
+        if min_baseline_m > 0 and any(
+            _enu_xy_dist_m(frame, prev) < min_baseline_m for prev in out
+        ):
+            continue
+        out.append(frame)
     return out
-
-
-def _enu_xy_dist_m(a: dict[str, Any], b: dict[str, Any]) -> float:
-    de = float(a["e"]) - float(b["e"])
-    dn = float(a["n"]) - float(b["n"])
-    return math.hypot(de, dn)
 
 
 def select_posed_sparse_frames(

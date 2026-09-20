@@ -70,7 +70,9 @@ def main() -> int:
         return 1
 
     if args.import_recon is not None:
-        imported = ma.import_dense_ply_to_recon(Path(meta["path"]), args.import_recon)
+        imported = ma.import_dense_ply_to_recon(
+            Path(meta["path"]), args.import_recon, backup=True
+        )
         meta["import"] = imported
 
     print(json.dumps(meta, indent=2))

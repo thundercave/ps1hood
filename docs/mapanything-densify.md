@@ -130,6 +130,46 @@ Fuse → `mapanything/cloud.ply`, copy to `recon/cloud_mapanything.ply` and
 
 ---
 
+
+
+---
+
+## PR-B — FILM midframes + locked densify (street / far-side)
+
+Thicken street coverage with FILM (or flow fallback) midframes whose poses
+come **only** from ``lerp_pose`` ENU, then MapAnything with
+``ignore_pose_inputs=False``. Never free-pose. Soft sat clip remains **opt-in**
+on ``align`` / ``run`` (``--cloud-clip-sat``); densify writes the unclipped
+product cloud and **backs up** ``recon/cloud.ply`` before replace — façades /
+roofs are not modified.
+
+### Pipeline
+
+```text
+align → interpolate (lerp_pose mids) → select_densify_frames (stride + ≥4 m)
+      → export mapanything bundle (pose_lock) → MapAnything.infer (locked ENU)
+      → pts3d_cam ⊕ our cam2world → cloud.ply (+ .bak) ; façades/roofs untouched
+```
+
+### PC one-liner (smoke-dense)
+
+```bash
+uv run ps1hood interpolate smoke-dense
+uv run ps1hood densify smoke-dense --backend mapanything --export-only --stride 2 \
+  --prefer-interp-bundle
+# on CUDA:
+python scripts/run_mapanything_bundle.py \
+  runs/smoke-dense/mapanything/bundle --apache --import-recon runs/smoke-dense
+```
+
+Path B (interp bundle) is preferred whenever midframes are present — Path A
+COLMAP sparse usually has **no** FILM mids. ``--prefer-colmap`` still available
+for sparse-only experiments.
+
+Guards (tests): midframe missing ENU fails loud; bundle ``camera_poses`` must
+match ``enu`` metadata; ``--ignore_pose_inputs`` refused; import backs up
+product cloud and leaves ``facades.obj`` / ``roofs.obj`` untouched.
+
 ## Studio
 
 Studio serves `recon/cloud.ply`. Successful densify copies the MapAnything PLY

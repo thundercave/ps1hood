@@ -51,3 +51,16 @@ If mast3r/curope build or forward fails → report the error and fall back to fl
 - Summarize vertex counts vs previous smoke (~12k flow / ~112 posed).
 - If you improved code/docs: branch, commit (no runs/), `gh pr create`.
 - Tell phone/Chief: what worked, artifacts paths under runs/*/recon/, blockers.
+
+
+## PR-B — denser street cloud (FILM + locked MapAnything)
+```bash
+cd ~/ps1hood && git pull
+uv run ps1hood interpolate smoke-dense
+uv run ps1hood densify smoke-dense --backend mapanything --export-only --stride 2 --prefer-interp-bundle
+# CUDA host (or cloud):
+python scripts/run_mapanything_bundle.py runs/smoke-dense/mapanything/bundle --apache --import-recon runs/smoke-dense
+grep 'element vertex' runs/smoke-dense/recon/cloud*.ply
+# Expect denser street than prior ~580k MA; façades.obj / roofs.obj unchanged; cloud.ply.bak present.
+# Do NOT pass --ignore_pose_inputs. Soft clip stays off (no --cloud-clip-sat).
+```

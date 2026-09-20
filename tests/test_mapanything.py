@@ -447,3 +447,138 @@ def test_default_amp_dtype_cuda_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", fake)
     assert ma.default_amp_dtype() == "bf16"
 
+
+def test_backup_recon_cloud_and_import_preserves_facades_roofs(tmp_path: Path) -> None:
+    recon = tmp_path / "recon"
+    recon.mkdir()
+    old = recon / "cloud.ply"
+    old.write_text("ply\nformat ascii 1.0\nelement vertex 1\nend_header\n0 0 0\n")
+    ma_old = recon / "cloud_mapanything.ply"
+    ma_old.write_bytes(old.read_bytes())
+    fac = recon / "facades.obj"
+    roofs = recon / "roofs.obj"
+    fac.write_text("v 1 2 3\n")
+    roofs.write_text("v 4 5 6\n")
+    fac_mtime = fac.stat().st_mtime_ns
+    roofs_mtime = roofs.stat().st_mtime_ns
+
+    new_ply = tmp_path / "new.ply"
+    new_ply.write_text(
+        "ply\nformat ascii 1.0\nelement vertex 2\nend_header\n0 0 0\n1 1 1\n"
+    )
+    meta = ma.import_dense_ply_to_recon(new_ply, tmp_path, backup=True)
+    assert meta["facades_untouched"] is True
+    assert meta["roofs_untouched"] is True
+    assert "cloud.ply" in meta["backups"]
+    assert Path(meta["backups"]["cloud.ply"]).is_file()
+    assert (recon / "cloud.ply.bak").is_file()
+    assert fac.read_text() == "v 1 2 3\n"
+    assert roofs.read_text() == "v 4 5 6\n"
+    assert fac.stat().st_mtime_ns == fac_mtime
+    assert roofs.stat().st_mtime_ns == roofs_mtime
+    assert meta["points"] == 2
+
+
+def test_should_prefer_interp_bundle_when_midframes() -> None:
+    mids = [{"interpolated": True}, {"interpolated": False}]
+    assert ma.should_prefer_interp_bundle(mids, prefer_colmap=True) is True
+    keys_only = [{"interpolated": False}, {"interpolated": False}]
+    assert ma.should_prefer_interp_bundle(keys_only, prefer_colmap=True) is False
+    assert ma.should_prefer_interp_bundle(keys_only, prefer_colmap=False) is True
+    assert (
+        ma.should_prefer_interp_bundle(mids, prefer_colmap=True, force_colmap=True)
+        is False
+    )
+
+
+def test_export_midframes_pose_lock_from_lerp(tmp_path: Path) -> None:
+    """FILM midframe cam2world must match lerp_pose ENU — never free-pose."""
+    from ps1_hood.interpolate.sequence import lerp_pose
+
+    a = _fake_frame(tmp_path, name="a.jpg", e=0.0, n=0.0, heading=0.0)
+    b = _fake_frame(tmp_path, name="b.jpg", e=12.0, n=0.0, heading=30.0)
+    mid = lerp_pose(a, b, 0.5)
+    mid["path"] = str(tmp_path / "mid.jpg")
+    Image.new("RGB", (64, 48), color=(1, 2, 3)).save(mid["path"])
+    mid["interpolated"] = True
+    mid["pano_id"] = "mid"
+    out = tmp_path / "bundle"
+    meta = ma.export_mapanything_bundle([a, mid, b], out, stride=1, run_name="prb")
+    assert meta["pose_lock"] is True
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["ignore_pose_inputs"] is False
+    assert manifest["infer_flags"]["ignore_pose_inputs"] is False
+    ma.assert_bundle_pose_lock(manifest)
+    mid_view = next(v for v in manifest["views"] if v.get("interpolated"))
+    assert mid_view["enu"]["e"] == pytest.approx(6.0)
+    # Tampering ENU while keeping camera_poses = free-pose drift → fail loud
+    mid_view["enu"]["e"] = 99.0
+    with pytest.raises(RuntimeError, match="drifted from locked ENU"):
+        ma.assert_bundle_pose_lock(manifest)
+
+
+def test_resolve_includes_lerp_midframes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ps1_hood.interpolate.sequence import lerp_pose
+    from ps1_hood import project as project_mod
+
+    create_project(
+        ProjectSpec(name="prbmids", bbox=BBox(52.0, 5.0, 52.001, 5.001)),
+        runs_root=tmp_path,
+    )
+    run = tmp_path / "prbmids"
+    align = run / "align"
+    align.mkdir(parents=True, exist_ok=True)
+    shots = run / "cropped"
+    shots.mkdir(exist_ok=True)
+    interp = run / "interp"
+    frames_dir = interp / "frames"
+    frames_dir.mkdir(parents=True)
+    cams = []
+    for i, e in enumerate((0.0, 20.0)):
+        p = shots / f"k{i}.jpg"
+        Image.new("RGB", (32, 24), color=(10, 20, 30)).save(p)
+        cams.append(
+            {
+                "shot_path": str(p),
+                "e": e,
+                "n": 0.0,
+                "u": 1.7,
+                "heading": 90.0,
+                "pitch": 0.0,
+                "fov": 90.0,
+                "width": 32,
+                "height": 24,
+                "pano_id": f"p{i}",
+            }
+        )
+    (align / "cameras.json").write_text(json.dumps(cams), encoding="utf-8")
+    a = {
+        "index": 0,
+        "path": str(shots / "k0.jpg"),
+        "e": 0.0,
+        "n": 0.0,
+        "u": 1.7,
+        "heading": 90.0,
+        "pitch": 0.0,
+        "fov": 90.0,
+        "width": 32,
+        "height": 24,
+        "interpolated": False,
+    }
+    b = dict(a)
+    b.update({"index": 2, "path": str(shots / "k1.jpg"), "e": 20.0})
+    mid = lerp_pose(a, b, 0.5)
+    mid_path = frames_dir / "00001.jpg"
+    Image.new("RGB", (32, 24), color=(5, 5, 5)).save(mid_path)
+    mid.update({"index": 1, "path": str(mid_path), "interpolated": True})
+    (interp / "frames.json").write_text(json.dumps([a, mid, b]), encoding="utf-8")
+    monkeypatch.setattr(project_mod, "default_runs_root", lambda: tmp_path)
+    project = project_mod.open_project("prbmids")
+    frames = ma.resolve_mapanything_frames(
+        project, stride=1, max_views=None, prefer_interp=True
+    )
+    assert ma.count_interpolated_frames(frames) >= 1
+    for f in frames:
+        ma.assert_frame_pose_lock(f)
