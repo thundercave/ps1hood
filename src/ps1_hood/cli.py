@@ -2239,6 +2239,32 @@ def sat_offset_measure_cmd(
     help="auto: yaw=0 if |yaw|≤yaw-zero-deg; translation: force yaw=0; full: always SE(2)",
 )
 @click.option(
+    "--translation-only/--no-translation-only",
+    default=False,
+    show_default=True,
+    help="Force yaw=0 (overrides --se2-mode when set)",
+)
+@click.option(
+    "--corridor-m",
+    default=15.0,
+    show_default=True,
+    type=float,
+    help="Crop street_mask to cam-track corridor (m) before skeleton; 0=full mask",
+)
+@click.option(
+    "--max-mad-m",
+    default=1.5,
+    show_default=True,
+    type=float,
+    help="Reject if residual MAD exceeds this (multi-branch latch); 0 disables",
+)
+@click.option(
+    "--continuity/--no-continuity",
+    default=True,
+    show_default=True,
+    help="Match along cam path (no NN jump to parallel branches)",
+)
+@click.option(
     "--overlay/--no-overlay",
     default=False,
     show_default=True,
@@ -2255,6 +2281,10 @@ def sat_offset_measure_cams_cmd(
     max_translation_m: float,
     yaw_zero_deg: float,
     se2_mode: str,
+    translation_only: bool,
+    corridor_m: float,
+    max_mad_m: float,
+    continuity: bool,
     overlay: bool,
 ) -> None:
     """Measure SE(2) from unique cam XY → Ortho street_mask centerline.
@@ -2272,7 +2302,10 @@ def sat_offset_measure_cams_cmd(
     project = open_project(name)
     try:
         mode = (se2_mode or "auto").lower()
-        t_only = None if mode == "auto" else (mode == "translation")
+        if translation_only:
+            t_only = True
+        else:
+            t_only = None if mode == "auto" else (mode == "translation")
         payload = measure_cam_road_se2(
             project,
             search_r_m=float(search_r_m),
@@ -2283,6 +2316,9 @@ def sat_offset_measure_cams_cmd(
             max_translation_m=float(max_translation_m),
             yaw_zero_deg=float(yaw_zero_deg),
             translation_only=t_only,
+            corridor_m=float(corridor_m),
+            max_mad_m=float(max_mad_m),
+            continuity=bool(continuity),
         )
         paths = persist_t_cam_road(
             project,
@@ -2294,11 +2330,15 @@ def sat_offset_measure_cams_cmd(
         click.echo(f"sat-offset measure-cams failed: {exc}", err=True)
         raise SystemExit(1) from exc
     t_norm = float(payload.get("t_norm_m", 0.0))
+    mad = float(payload.get("mad_m", float("nan")))
+    med = float(payload.get("median_abs_m", float("nan")))
     click.echo(
         f"sat-offset measure-cams ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
         f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
+        f"median_abs_m={med:.3f}  mad_m={mad:.3f}  "
         f"n_cams={payload['n_cams']}  n_pairs={payload['n_pairs']}  "
         f"mean_nn_m={payload['mean_nn_m']:.3f}  ||t||={t_norm:.3f}  "
+        f"corridor_m={payload.get('corridor_m')}  continuity={payload.get('continuity')}  "
         f"translation_only={payload.get('translation_only')}  "
         f"applied=false  out={paths['T_cam_road']}"
         + (f"  overlay={paths['overlay']}" if paths.get("overlay") else "")

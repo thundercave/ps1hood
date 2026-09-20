@@ -378,6 +378,81 @@ def create_app() -> Flask:
             }
         )
 
+    @app.post("/api/runs/<name>/sat-offset/cam-road-pairs")
+    def api_sat_offset_cam_road_pairs(name: str):
+        """Fit SE(2) from cam↔road-center picks or a drawn centerline polyline.
+
+        Preview only — writes align/T_pick_cam_road.json. No apply.
+        Body: ``{pairs:[...]}`` and/or ``{polyline:[{e,n},...]}``.
+        """
+        from ps1_hood.align.sat_offset import (
+            SatOffsetError,
+            fit_cam_road_from_pairs,
+            fit_cam_road_from_polyline,
+            persist_t_pick_cam_road,
+        )
+
+        body = request.get_json(force=True) or {}
+        project = open_project(name)
+        try:
+            if body.get("polyline"):
+                payload = fit_cam_road_from_polyline(
+                    project,
+                    body["polyline"],
+                    search_r_m=float(body.get("search_r_m") or 15.0),
+                    max_rms_m=float(body.get("max_rms_m") or 2.0),
+                    min_pairs=int(body.get("min_pairs") or 4),
+                    max_yaw_deg=float(body.get("max_yaw_deg") or 10.0),
+                    max_translation_m=float(body.get("max_translation_m") or 12.0),
+                    max_mad_m=float(body.get("max_mad_m") or 1.5),
+                    translation_only=bool(body.get("translation_only", True)),
+                )
+            elif isinstance(body.get("pairs"), list):
+                payload = fit_cam_road_from_pairs(
+                    body["pairs"],
+                    max_rms_m=float(body.get("max_rms_m") or 2.0),
+                    min_pairs=int(body.get("min_pairs") or 4),
+                    max_yaw_deg=float(body.get("max_yaw_deg") or 10.0),
+                    max_translation_m=float(body.get("max_translation_m") or 12.0),
+                    max_mad_m=float(body.get("max_mad_m") or 1.5),
+                    translation_only=bool(body.get("translation_only", False)),
+                )
+            else:
+                return jsonify({"ok": False, "error": "need pairs:[...] or polyline:[{e,n},...]"}), 400
+            paths = persist_t_pick_cam_road(project, payload)
+        except SatOffsetError as exc:
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc), "applied": False}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "applied": False,
+                "tx_m": payload["tx_m"],
+                "ty_m": payload["ty_m"],
+                "yaw_deg": payload["yaw_deg"],
+                "rms_m": payload["rms_m"],
+                "mad_m": payload.get("mad_m"),
+                "median_abs_m": payload.get("median_abs_m"),
+                "n_pairs": payload["n_pairs"],
+                "source": payload["source"],
+                "preview": payload.get("preview") or {},
+                "paths": paths,
+                "T": {
+                    "tx_m": payload["tx_m"],
+                    "ty_m": payload["ty_m"],
+                    "yaw_deg": payload["yaw_deg"],
+                    "s": payload.get("s", 1.0),
+                    "pivot_e": payload.get("pivot_e"),
+                    "pivot_n": payload.get("pivot_n"),
+                    "source": payload["source"],
+                    "rms_m": payload["rms_m"],
+                    "n_pairs": payload["n_pairs"],
+                },
+                "note": "preview only — apply via POST …/sat-offset/apply with from=T_pick_cam_road + confirm:true",
+            }
+        )
+
     @app.post("/api/runs/<name>/sat-offset/apply")
     def api_sat_offset_apply(name: str):
         """Explicit confirm: bak then apply T_pick (or given --from) via sat-offset apply.
@@ -403,6 +478,10 @@ def create_app() -> Flask:
                 src = project.root / src if (project.root / src).is_file() else (project.align_dir / Path(which).name)
         elif which in ("T_pick", "pick", "studio"):
             src = project.align_dir / "T_pick.json"
+        elif which in ("T_pick_cam_road", "cam_road", "cam-road", "camroad"):
+            src = project.align_dir / "T_pick_cam_road.json"
+        elif which in ("T_cam_road", "cams-road", "cams_road"):
+            src = project.align_dir / "T_cam_road.json"
         elif which in ("T_force", "force", "chamfer"):
             # Allowed only with explicit confirm + which — still not auto.
             src = project.align_dir / "T_force.json"

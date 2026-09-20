@@ -6,7 +6,8 @@ Skip roofs/street when already sat-native.
 Sources:
   - façade↔Ortho Canny Chamfer → ``T_force.json`` (do **not** auto-apply)
   - Studio yellow↔red corner picks → ``fit_pairs_se2`` (preview only; apply on confirm)
-  - unique cam XY → Ortho street_mask medial/centerline NN → ``T_cam_road.json``
+  - unique cam XY → corridor-cropped street_mask medial + continuity match → ``T_cam_road.json``
+  - Studio cam↔road-center picks / drawn centerline polyline → ``T_pick_cam_road.json``
 """
 
 from __future__ import annotations
@@ -56,6 +57,12 @@ DEFAULT_CAM_MAX_YAW_DEG = 10.0
 DEFAULT_CAM_MAX_TRANSLATION_M = 12.0
 DEFAULT_CAM_YAW_ZERO_DEG = 2.0
 DEFAULT_CENTERLINE_MAX_POINTS = 12000
+DEFAULT_CAM_CORRIDOR_M = 15.0
+DEFAULT_CAM_MAX_MAD_M = 1.5
+DEFAULT_CONTINUITY_STEP_FACTOR = 2.5
+DEFAULT_CONTINUITY_LATERAL_M = 8.0
+SOURCE_CAM_ROAD_PICKS = "studio_cam_road_picks"
+SOURCE_CAM_ROAD_POLYLINE = "studio_cam_road_polyline"
 
 DEFAULT_MS_DE_M = 6.0
 DEFAULT_MS_DYAW_DEG = 8.0
@@ -198,18 +205,37 @@ def match_facade_to_sat(
     return before, after, dists
 
 
+def _pair_residuals(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    T: dict[str, float],
+) -> list[float]:
+    errs: list[float] = []
+    for b, a in zip(before, after):
+        e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
+        errs.append(math.hypot(e2 - float(a["e"]), n2 - float(a["n"])))
+    return errs
+
+
 def _residual_rms(
     before: list[dict[str, Any]],
     after: list[dict[str, Any]],
     T: dict[str, float],
 ) -> float:
-    if not before:
+    errs = _pair_residuals(before, after, T)
+    if not errs:
         return float("inf")
-    errs = []
-    for b, a in zip(before, after):
-        e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
-        errs.append(math.hypot(e2 - float(a["e"]), n2 - float(a["n"])))
     return float(math.sqrt(sum(x * x for x in errs) / len(errs)))
+
+
+def _residual_mad(errs: list[float]) -> tuple[float, float]:
+    """Return (median(|v|), MAD) for residual magnitudes."""
+    if not errs:
+        return float("inf"), float("inf")
+    arr = np.asarray(errs, dtype=np.float64)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    return med, mad
 
 
 def facade_edge_samples(
@@ -854,6 +880,189 @@ def unique_cam_xy_from_project(project: Project) -> np.ndarray:
     return np.asarray(xy, dtype=np.float64)
 
 
+def crop_street_mask_to_cam_corridor(
+    street_m: np.ndarray,
+    ortho: Any,
+    cam_xy: np.ndarray,
+    *,
+    corridor_m: float = DEFAULT_CAM_CORRIDOR_M,
+) -> np.ndarray:
+    """``street_m &= dilate(cam disks, corridor_m)`` before skeleton/medial.
+
+    Keeps the centerline near the red cam track so parking / side-street branches
+    are not available for NN latch. If the crop empties the mask, returns the
+    original ``street_m`` (fail soft).
+    """
+    if float(corridor_m) <= 0 or cam_xy is None or len(cam_xy) == 0:
+        return street_m
+    from ps1_hood.reconstruct.sat_street import cam_xy_mask
+
+    cam_m = cam_xy_mask(ortho, np.asarray(cam_xy, dtype=np.float64), corridor_m=float(corridor_m))
+    if int((cam_m > 0).sum()) == 0:
+        return street_m
+    base = (street_m > 0).astype(np.uint8) * 255
+    cropped = cv2.bitwise_and(base, cam_m)
+    if int(cv2.countNonZero(cropped)) < 16:
+        log.warning(
+            "cam corridor (%.1fm) left street_mask nearly empty — using full mask",
+            float(corridor_m),
+        )
+        return street_m
+    return cropped
+
+
+def order_cams_along_path(cam_xy: np.ndarray) -> np.ndarray:
+    """Order unique cam XY along a travel path (greedy NN chain from an endpoint).
+
+    ``load_cam_xy_enu`` already preserves first-occurrence order; this re-chains
+    when poses are shuffled so continuity match walks the drive, not random order.
+    """
+    pts = np.asarray(cam_xy, dtype=np.float64)
+    n = len(pts)
+    if n <= 2:
+        return pts.copy()
+    # Endpoint = point with max distance to any other (approx path tip)
+    d2 = ((pts[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2)
+    i0, i1 = divmod(int(np.argmax(d2)), n)
+    start = i0 if float(d2[i0].sum()) >= float(d2[i1].sum()) else i1
+    used = np.zeros(n, dtype=bool)
+    order = [start]
+    used[start] = True
+    for _ in range(n - 1):
+        last = order[-1]
+        # nearest unused
+        best_j, best_d = -1, float("inf")
+        for j in range(n):
+            if used[j]:
+                continue
+            dist = float(d2[last, j])
+            if dist < best_d:
+                best_d = dist
+                best_j = j
+        if best_j < 0:
+            break
+        order.append(best_j)
+        used[best_j] = True
+    return pts[np.asarray(order, dtype=np.int64)]
+
+
+def match_cams_to_centerline_continuity(
+    cam_xy: np.ndarray,
+    centerline_xy: np.ndarray,
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+    min_nn_m: float = DEFAULT_CAM_MIN_NN_M,
+    step_factor: float = DEFAULT_CONTINUITY_STEP_FACTOR,
+    max_lateral_m: float = DEFAULT_CONTINUITY_LATERAL_M,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[float]]:
+    """Match cams to one centerline branch with along-track continuity.
+
+    Orders cams along travel. After the first match, subsequent cams must attach
+    near the previous target extrapolated along the *established road tangent*
+    (not raw NN), so a parallel parking/side branch cannot steal mid-track cams.
+    Falls back to plain NN only when the caller sees too few pairs.
+    """
+    if cam_xy.size == 0 or centerline_xy.size == 0:
+        return [], [], []
+    cams = order_cams_along_path(np.asarray(cam_xy, dtype=np.float64))
+    cl = np.asarray(centerline_xy, dtype=np.float64)
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    dists: list[float] = []
+    prev_tgt: tuple[float, float] | None = None
+    prev_prev_tgt: tuple[float, float] | None = None
+    prev_cam: tuple[float, float] | None = None
+
+    for e, n in cams:
+        d2 = (cl[:, 0] - e) ** 2 + (cl[:, 1] - n) ** 2
+        within = np.where(d2 <= float(search_r_m) ** 2)[0]
+        if within.size == 0:
+            continue
+
+        chosen = -1
+        if prev_tgt is None or prev_cam is None:
+            chosen = int(within[int(np.argmin(d2[within]))])
+        else:
+            cam_step = math.hypot(e - prev_cam[0], n - prev_cam[1])
+            max_jump = max(3.0, float(cam_step) * float(step_factor), 0.5 * float(search_r_m))
+            # Road tangent from prior centerline matches (stable branch); fall back to cam
+            if prev_prev_tgt is not None:
+                re = prev_tgt[0] - prev_prev_tgt[0]
+                rn = prev_tgt[1] - prev_prev_tgt[1]
+            else:
+                re = e - prev_cam[0]
+                rn = n - prev_cam[1]
+            rlen = math.hypot(re, rn)
+            if rlen > 1e-3:
+                ue, un = re / rlen, rn / rlen
+            else:
+                ue, un = 1.0, 0.0
+            # Extrapolate along road by cam_step (keeps branch even if cam drifts)
+            step = cam_step if cam_step > 1e-3 else rlen
+            pred_e = prev_tgt[0] + ue * step
+            pred_n = prev_tgt[1] + un * step
+
+            best_j, best_score = -1, float("inf")
+            for j in within.tolist():
+                pe, pn = float(cl[j, 0]), float(cl[j, 1])
+                jump = math.hypot(pe - prev_tgt[0], pn - prev_tgt[1])
+                if jump > max_jump:
+                    continue
+                # Lateral vs road tangent (reject parallel-branch latch)
+                de, dn = pe - prev_tgt[0], pn - prev_tgt[1]
+                lateral = abs(de * (-un) + dn * ue)
+                if lateral > float(max_lateral_m):
+                    continue
+                dist_pred = math.hypot(pe - pred_e, pn - pred_n)
+                if dist_pred > max(float(max_lateral_m), 0.75 * float(search_r_m)):
+                    continue
+                score = dist_pred + 0.15 * math.sqrt(float(d2[j]))
+                if score < best_score:
+                    best_score = score
+                    best_j = int(j)
+            if best_j >= 0:
+                chosen = best_j
+            else:
+                # Soft: nearest to road prediction with looser jump, still lateral-gated
+                soft = []
+                for j in within.tolist():
+                    pe, pn = float(cl[j, 0]), float(cl[j, 1])
+                    jump = math.hypot(pe - prev_tgt[0], pn - prev_tgt[1])
+                    if jump > max_jump * 1.5:
+                        continue
+                    de, dn = pe - prev_tgt[0], pn - prev_tgt[1]
+                    lateral = abs(de * (-un) + dn * ue)
+                    if lateral > float(max_lateral_m) * 1.5:
+                        continue
+                    dist_pred = math.hypot(pe - pred_e, pn - pred_n)
+                    soft.append((dist_pred, float(d2[j]), int(j)))
+                if soft:
+                    soft.sort()
+                    chosen = soft[0][2]
+
+        if chosen < 0:
+            continue
+        dist = float(math.sqrt(float(d2[chosen])))
+        b = {"e": float(e), "n": float(n)}
+        a = {"e": float(cl[chosen, 0]), "n": float(cl[chosen, 1])}
+        prev_prev_tgt = prev_tgt
+        prev_cam = (float(e), float(n))
+        prev_tgt = (a["e"], a["n"])
+        before.append(b)
+        after.append(a)
+        dists.append(dist)
+
+    primary_b, primary_a, primary_d = [], [], []
+    for b, a, d in zip(before, after, dists):
+        if d > float(min_nn_m):
+            primary_b.append(b)
+            primary_a.append(a)
+            primary_d.append(d)
+    if len(primary_b) >= 2:
+        return primary_b, primary_a, primary_d
+    return before, after, dists
+
+
 def match_cams_to_centerline(
     cam_xy: np.ndarray,
     centerline_xy: np.ndarray,
@@ -924,13 +1133,19 @@ def measure_cam_road_se2(
     max_translation_m: float = DEFAULT_CAM_MAX_TRANSLATION_M,
     yaw_zero_deg: float = DEFAULT_CAM_YAW_ZERO_DEG,
     translation_only: bool | None = None,
+    corridor_m: float = DEFAULT_CAM_CORRIDOR_M,
+    max_mad_m: float = DEFAULT_CAM_MAX_MAD_M,
+    continuity: bool = True,
 ) -> dict[str, Any]:
-    """Measure SE(2): unique cam XY → Ortho street_mask centerline NN.
+    """Measure SE(2): unique cam XY → corridor-cropped street centerline.
 
-    Does not apply. Caller persists ``align/T_cam_road.json``. Gates:
-    n_pairs ≥ min_pairs, rms ≤ max_rms_m, |yaw| ≤ max_yaw_deg, ||t|| ≤ max_translation_m.
-    Prefer translation-dominant: if |yaw| ≤ yaw_zero_deg (or ``translation_only``),
-    fit tx,ty with yaw=0 for stability.
+    Pipeline:
+      1. ``street_m &= dilate(cam_xy, corridor_m)`` then skeleton/medial
+      2. Continuity match along cam path (no NN to random parallel branches)
+      3. Fit SE(2) / translation-only; gate on rms, MAD, |yaw|, ||t||
+
+    Does **not** apply. Caller persists ``align/T_cam_road.json``.
+    Rejects multi-branch latch even when ||t|| is small (MAD / rms gates).
     """
     cam_xy = unique_cam_xy_from_project(project)
     if len(cam_xy) < int(min_pairs):
@@ -940,13 +1155,26 @@ def measure_cam_road_se2(
 
     ortho = load_ortho_for_run(project.root)
     _, _, street_m = segment_roof_yard_mask(ortho.image)
+    street_m = crop_street_mask_to_cam_corridor(
+        street_m, ortho, cam_xy, corridor_m=float(corridor_m)
+    )
     centerline_xy, mpp = street_centerline_enu(ortho, street_m)
-    before, after, dists = match_cams_to_centerline(
+
+    match_fn = match_cams_to_centerline_continuity if continuity else match_cams_to_centerline
+    before, after, dists = match_fn(
         cam_xy,
         centerline_xy,
         search_r_m=search_r_m,
         min_nn_m=min_nn_m,
     )
+    if len(before) < int(min_pairs) and continuity:
+        # Continuity too strict — fall back to plain NN once
+        before, after, dists = match_cams_to_centerline(
+            cam_xy,
+            centerline_xy,
+            search_r_m=search_r_m,
+            min_nn_m=min_nn_m,
+        )
     if len(before) < int(min_pairs):
         raise SatOffsetError(
             f"need ≥{min_pairs} cam↔centerline pairs within {search_r_m}m, got {len(before)}"
@@ -961,7 +1189,9 @@ def measure_cam_road_se2(
         T = _fit_translation_only(before, after)
         yaw = 0.0
 
-    rms = _residual_rms(before, after, T)
+    errs = _pair_residuals(before, after, T)
+    rms = float(math.sqrt(sum(x * x for x in errs) / len(errs))) if errs else float("inf")
+    median_abs, mad = _residual_mad(errs)
     tx = float(T.get("tx_m", 0.0))
     ty = float(T.get("ty_m", 0.0))
     yaw = float(T.get("yaw_deg", 0.0))
@@ -969,6 +1199,10 @@ def measure_cam_road_se2(
 
     if rms > float(max_rms_m):
         raise SatOffsetError(f"rms {rms:.3f}m > gate {max_rms_m}m")
+    if float(max_mad_m) > 0 and mad > float(max_mad_m):
+        raise SatOffsetError(
+            f"mad {mad:.3f}m > gate {max_mad_m}m (multi-branch / disagreeing pairs)"
+        )
     if abs(yaw) > float(max_yaw_deg):
         raise SatOffsetError(f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°")
     if trans > float(max_translation_m):
@@ -988,11 +1222,15 @@ def measure_cam_road_se2(
         "pivot_n": float(T.get("pivot_n", 0.0)),
         "source": SOURCE_CAM_STREET_CENTERLINE,
         "rms_m": float(rms),
+        "median_abs_m": float(median_abs),
+        "mad_m": float(mad),
         "n_pairs": int(len(before)),
         "n_cams": int(len(cam_xy)),
         "n_centerline": int(len(centerline_xy)),
         "search_r_m": float(search_r_m),
         "min_nn_m": float(min_nn_m),
+        "corridor_m": float(corridor_m),
+        "continuity": bool(continuity),
         "m_per_px": float(mpp),
         "mean_nn_m": float(sum(dists) / len(dists)) if dists else float("nan"),
         "translation_only": bool(use_t_only),
@@ -1001,6 +1239,14 @@ def measure_cam_road_se2(
             "cams_before": [{"e": float(b["e"]), "n": float(b["n"])} for b in before],
             "cams_mapped": preview_mapped,
             "centerline_targets": [{"e": float(a["e"]), "n": float(a["n"])} for a in after],
+            "nn_arrows": [
+                {
+                    "from": {"e": float(b["e"]), "n": float(b["n"])},
+                    "to": {"e": float(a["e"]), "n": float(a["n"])},
+                    "dist_m": float(d),
+                }
+                for b, a, d in zip(before, after, dists)
+            ],
         },
         "applied": False,
     }
@@ -1032,15 +1278,28 @@ def write_cam_road_overlay(
         u, v = ortho.enu_to_px(e, n)
         return int(round(u)), int(round(v))
 
+    arrows = preview.get("nn_arrows") or []
     for t in targets:
         u, v = _px(float(t["e"]), float(t["n"]))
-        cv2.circle(img, (u, v), 2, (0, 255, 255), -1)  # yellow-ish
+        cv2.circle(img, (u, v), 2, (0, 255, 255), -1)  # yellow target
     for b in before:
         u, v = _px(float(b["e"]), float(b["n"]))
-        cv2.circle(img, (u, v), 4, (0, 0, 255), -1)  # red
+        cv2.circle(img, (u, v), 4, (0, 0, 255), -1)  # red cam
     for m in mapped:
         u, v = _px(float(m["e"]), float(m["n"]))
-        cv2.circle(img, (u, v), 3, (255, 255, 0), -1)  # cyan
+        cv2.circle(img, (u, v), 3, (255, 255, 0), -1)  # cyan mapped
+    # NN correspondence arrows (cam → centerline target)
+    if arrows:
+        for ar in arrows:
+            fr, to = ar.get("from") or {}, ar.get("to") or {}
+            if "e" in fr and "e" in to:
+                cv2.line(
+                    img,
+                    _px(float(fr["e"]), float(fr["n"])),
+                    _px(float(to["e"]), float(to["n"])),
+                    (0, 165, 255),
+                    1,
+                )
     for b, m in zip(before, mapped):
         cv2.line(img, _px(float(b["e"]), float(b["n"])), _px(float(m["e"]), float(m["n"])), (255, 128, 0), 1)
 
@@ -1073,13 +1332,17 @@ def persist_t_cam_road(
         "pivot_n": float(payload.get("pivot_n", 0.0)),
         "source": payload.get("source", SOURCE_CAM_STREET_CENTERLINE),
         "rms_m": float(payload.get("rms_m", 0.0)),
+        "median_abs_m": float(payload.get("median_abs_m", float("nan"))),
+        "mad_m": float(payload.get("mad_m", float("nan"))),
         "n_pairs": int(payload.get("n_pairs", 0)),
         "n_cams": int(payload.get("n_cams", 0)),
         "mean_nn_m": float(payload.get("mean_nn_m", float("nan"))),
         "t_norm_m": float(payload.get("t_norm_m", math.hypot(float(payload["tx_m"]), float(payload["ty_m"])))),
         "translation_only": bool(payload.get("translation_only", False)),
+        "corridor_m": float(payload.get("corridor_m", DEFAULT_CAM_CORRIDOR_M)),
+        "continuity": bool(payload.get("continuity", True)),
         "applied": False,
-        "note": "preview only — apply via sat-offset apply --from align/T_cam_road.json",
+        "note": "preview only — apply via sat-offset apply --from align/T_cam_road.json (do NOT force-apply a failed gate)",
     }
     write_t_force(dest, t_body)
     out: dict[str, str] = {"T_cam_road": str(dest)}
@@ -1088,3 +1351,218 @@ def persist_t_cam_road(
         if ov is not None:
             out["overlay"] = str(ov)
     return out
+
+
+def snap_cams_to_polyline(
+    cam_xy: np.ndarray,
+    polyline_xy: np.ndarray,
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[float]]:
+    """Each cam → nearest point on a user-drawn centerline polyline only."""
+    cams = order_cams_along_path(np.asarray(cam_xy, dtype=np.float64))
+    poly = np.asarray(polyline_xy, dtype=np.float64)
+    if cams.size == 0 or poly.size == 0 or len(poly) < 2:
+        return [], [], []
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    dists: list[float] = []
+    # Densify polyline segments for NN
+    samples: list[list[float]] = []
+    for i in range(len(poly) - 1):
+        e0, n0 = float(poly[i, 0]), float(poly[i, 1])
+        e1, n1 = float(poly[i + 1, 0]), float(poly[i + 1, 1])
+        seg = math.hypot(e1 - e0, n1 - n0)
+        n_steps = max(1, int(math.ceil(seg / 0.5)))
+        for k in range(n_steps + 1):
+            t = k / n_steps
+            samples.append([e0 + t * (e1 - e0), n0 + t * (n1 - n0)])
+    samp = np.asarray(samples, dtype=np.float64)
+    for e, n in cams:
+        d2 = (samp[:, 0] - e) ** 2 + (samp[:, 1] - n) ** 2
+        j = int(np.argmin(d2))
+        dist = float(math.sqrt(float(d2[j])))
+        if dist > float(search_r_m):
+            continue
+        before.append({"e": float(e), "n": float(n)})
+        after.append({"e": float(samp[j, 0]), "n": float(samp[j, 1])})
+        dists.append(dist)
+    return before, after, dists
+
+
+def normalize_polyline(raw: list[Any]) -> np.ndarray:
+    """Parse Studio polyline ``[{e,n}, ...]`` → (N,2) float64."""
+    pts: list[list[float]] = []
+    for i, p in enumerate(raw or []):
+        if not isinstance(p, dict):
+            raise SatOffsetError(f"polyline[{i}] must be {{e,n}}")
+        try:
+            pts.append([float(p["e"]), float(p["n"])])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SatOffsetError(f"polyline[{i}] bad e/n: {exc}") from exc
+    if len(pts) < 2:
+        raise SatOffsetError("polyline needs ≥2 points")
+    return np.asarray(pts, dtype=np.float64)
+
+
+def fit_cam_road_from_pairs(
+    pairs: list[Any],
+    *,
+    max_rms_m: float = DEFAULT_CAM_MAX_RMS_M,
+    min_pairs: int = DEFAULT_MIN_PAIRS,
+    max_yaw_deg: float = DEFAULT_CAM_MAX_YAW_DEG,
+    max_translation_m: float = DEFAULT_CAM_MAX_TRANSLATION_M,
+    max_mad_m: float = DEFAULT_CAM_MAX_MAD_M,
+    translation_only: bool = False,
+    source: str = SOURCE_CAM_ROAD_PICKS,
+) -> dict[str, Any]:
+    """Fit SE(2) from Studio cam↔road-center picks (red=cam, yellow=road).
+
+    Preview only — no apply. Gates match measure-cams (incl. MAD).
+    """
+    before, after, audit = normalize_corner_pairs(pairs)
+    n = len(before)
+    if n < int(min_pairs):
+        raise SatOffsetError(f"need ≥{min_pairs} cam↔road pairs, got {n}")
+
+    if translation_only:
+        T = _fit_translation_only(before, after)
+    else:
+        T = fit_se2(before, after)
+        if abs(float(T.get("yaw_deg", 0.0))) <= DEFAULT_CAM_YAW_ZERO_DEG:
+            T = _fit_translation_only(before, after)
+
+    errs = _pair_residuals(before, after, T)
+    rms = float(math.sqrt(sum(x * x for x in errs) / len(errs))) if errs else float("inf")
+    median_abs, mad = _residual_mad(errs)
+    tx = float(T.get("tx_m", 0.0))
+    ty = float(T.get("ty_m", 0.0))
+    yaw = float(T.get("yaw_deg", 0.0))
+    trans = math.hypot(tx, ty)
+
+    if rms > float(max_rms_m):
+        raise SatOffsetError(f"rms {rms:.3f}m > gate {max_rms_m}m")
+    if float(max_mad_m) > 0 and mad > float(max_mad_m):
+        raise SatOffsetError(f"mad {mad:.3f}m > gate {max_mad_m}m")
+    if abs(yaw) > float(max_yaw_deg):
+        raise SatOffsetError(f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°")
+    if trans > float(max_translation_m):
+        raise SatOffsetError(f"||t|| {trans:.3f}m > gate {max_translation_m}m")
+
+    preview_red: list[dict[str, float]] = []
+    preview_arrows: list[dict[str, Any]] = []
+    for b, a, row in zip(before, after, audit):
+        e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
+        preview_red.append({"e": float(e2), "n": float(n2)})
+        preview_arrows.append(
+            {
+                "from": {"e": float(b["e"]), "n": float(b["n"])},
+                "to": {"e": float(a["e"]), "n": float(a["n"])},
+                "mapped": {"e": float(e2), "n": float(n2)},
+                "residual_m": float(math.hypot(e2 - float(a["e"]), n2 - float(a["n"]))),
+                "i": row["i"],
+            }
+        )
+
+    return {
+        "tx_m": tx,
+        "ty_m": ty,
+        "yaw_deg": yaw,
+        "s": 1.0,
+        "pivot_e": float(T.get("pivot_e", 0.0)),
+        "pivot_n": float(T.get("pivot_n", 0.0)),
+        "source": source,
+        "rms_m": float(rms),
+        "median_abs_m": float(median_abs),
+        "mad_m": float(mad),
+        "n_pairs": int(n),
+        "pairs": audit,
+        "t_norm_m": float(trans),
+        "translation_only": bool(abs(yaw) < 1e-9),
+        "preview": {"red_mapped": preview_red, "arrows": preview_arrows},
+        "applied": False,
+    }
+
+
+def fit_cam_road_from_polyline(
+    project: Project,
+    polyline: list[Any],
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+    max_rms_m: float = DEFAULT_CAM_MAX_RMS_M,
+    min_pairs: int = DEFAULT_MIN_PAIRS,
+    max_yaw_deg: float = DEFAULT_CAM_MAX_YAW_DEG,
+    max_translation_m: float = DEFAULT_CAM_MAX_TRANSLATION_M,
+    max_mad_m: float = DEFAULT_CAM_MAX_MAD_M,
+    translation_only: bool = True,
+) -> dict[str, Any]:
+    """Snap unique cams to a Studio-drawn centerline polyline → SE(2) preview."""
+    cam_xy = unique_cam_xy_from_project(project)
+    poly = normalize_polyline(polyline)
+    before, after, dists = snap_cams_to_polyline(cam_xy, poly, search_r_m=search_r_m)
+    if len(before) < int(min_pairs):
+        raise SatOffsetError(
+            f"need ≥{min_pairs} cams within {search_r_m}m of polyline, got {len(before)}"
+        )
+    pairs = [
+        {"red": {"e": b["e"], "n": b["n"]}, "yellow": {"e": a["e"], "n": a["n"]}}
+        for b, a in zip(before, after)
+    ]
+    payload = fit_cam_road_from_pairs(
+        pairs,
+        max_rms_m=max_rms_m,
+        min_pairs=min_pairs,
+        max_yaw_deg=max_yaw_deg,
+        max_translation_m=max_translation_m,
+        max_mad_m=max_mad_m,
+        translation_only=translation_only,
+        source=SOURCE_CAM_ROAD_POLYLINE,
+    )
+    payload["mean_nn_m"] = float(sum(dists) / len(dists)) if dists else float("nan")
+    payload["n_cams"] = int(len(cam_xy))
+    payload["n_polyline"] = int(len(poly))
+    return payload
+
+
+def persist_t_pick_cam_road(
+    project: Project,
+    payload: dict[str, Any],
+    *,
+    t_path: Path | None = None,
+    pairs_path: Path | None = None,
+) -> dict[str, str]:
+    """Write ``align/T_pick_cam_road.json`` (+ audit). No apply."""
+    dest = Path(t_path) if t_path else (project.align_dir / "T_pick_cam_road.json")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    pairs_dest = Path(pairs_path) if pairs_path else (project.align_dir / "T_pick_cam_road_pairs.json")
+    if not pairs_dest.is_absolute():
+        pairs_dest = project.root / pairs_dest
+
+    t_body = {
+        "tx_m": float(payload["tx_m"]),
+        "ty_m": float(payload["ty_m"]),
+        "yaw_deg": float(payload["yaw_deg"]),
+        "s": float(payload.get("s", 1.0)),
+        "pivot_e": float(payload.get("pivot_e", 0.0)),
+        "pivot_n": float(payload.get("pivot_n", 0.0)),
+        "source": payload.get("source", SOURCE_CAM_ROAD_PICKS),
+        "rms_m": float(payload.get("rms_m", 0.0)),
+        "median_abs_m": float(payload.get("median_abs_m", float("nan"))),
+        "mad_m": float(payload.get("mad_m", float("nan"))),
+        "n_pairs": int(payload.get("n_pairs", 0)),
+        "t_norm_m": float(payload.get("t_norm_m", math.hypot(float(payload["tx_m"]), float(payload["ty_m"])))),
+        "applied": False,
+        "note": "preview only — apply via sat-offset apply --from align/T_pick_cam_road.json",
+    }
+    write_t_force(dest, t_body)
+    audit = {
+        "source": t_body["source"],
+        "T": t_body,
+        "pairs": payload.get("pairs") or [],
+        "preview": payload.get("preview") or {},
+        "applied": False,
+    }
+    pairs_dest.parent.mkdir(parents=True, exist_ok=True)
+    pairs_dest.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    return {"T_pick_cam_road": str(dest), "T_pick_cam_road_pairs": str(pairs_dest)}
