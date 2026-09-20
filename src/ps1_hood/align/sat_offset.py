@@ -3,6 +3,8 @@
 Sacred: one rigid SE(2) · no free-pose · bak first · prefer sat XY.
 Reuse ``fit_se2`` / ``apply_se2_*`` / ``seat_recon_artefacts`` patterns.
 Skip roofs/street when already sat-native.
+Studio manual backup: yellow↔red corner picks → ``fit_pairs_se2`` (preview only; apply on confirm).
+Do **not** auto-apply Chamfer ``T_force``.
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ DEFAULT_MIN_PAIRS = 4
 DEFAULT_MAX_YAW_DEG = 15.0
 DEFAULT_MAX_TRANSLATION_M = 10.0
 SOURCE_FACADE_SAT_CHAMFER = "facade_sat_chamfer"
+SOURCE_STUDIO_PICKS = "studio_corner_picks"
+DEFAULT_MIN_PAIRS_PICK = 3
 
 DEFAULT_MS_DE_M = 6.0
 DEFAULT_MS_DYAW_DEG = 8.0
@@ -557,6 +561,165 @@ def apply_forced_se2(
     meta["georef"] = str(georef_path)
     return meta
 
+
+
+
+def normalize_corner_pairs(
+    pairs: list[Any],
+) -> tuple[list[dict[str, float]], list[dict[str, float]], list[dict[str, Any]]]:
+    """Parse Studio/CLI pairs → (red_before, yellow_after, audit rows).
+
+    Each pair: ``{yellow:{e,n}, red:{e,n}}`` (aliases: sat/product, after/before).
+    """
+    before: list[dict[str, float]] = []
+    after: list[dict[str, float]] = []
+    audit: list[dict[str, Any]] = []
+    for i, raw in enumerate(pairs or []):
+        if not isinstance(raw, dict):
+            raise SatOffsetError(f"pair[{i}] must be an object")
+        yel = raw.get("yellow") or raw.get("sat") or raw.get("after")
+        red = raw.get("red") or raw.get("product") or raw.get("before")
+        if not isinstance(yel, dict) or not isinstance(red, dict):
+            raise SatOffsetError(f"pair[{i}] needs yellow{{e,n}} and red{{e,n}}")
+        try:
+            ye, yn = float(yel["e"]), float(yel["n"])
+            re, rn = float(red["e"]), float(red["n"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SatOffsetError(f"pair[{i}] bad e/n: {exc}") from exc
+        before.append({"e": re, "n": rn})
+        after.append({"e": ye, "n": yn})
+        audit.append(
+            {
+                "i": i,
+                "red": {"e": re, "n": rn},
+                "yellow": {"e": ye, "n": yn},
+                "delta_e": ye - re,
+                "delta_n": yn - rn,
+                "dist_m": float(math.hypot(ye - re, yn - rn)),
+            }
+        )
+    return before, after, audit
+
+
+def fit_pairs_se2(
+    pairs: list[Any],
+    *,
+    max_rms_m: float = DEFAULT_MAX_RMS_M,
+    min_pairs: int = DEFAULT_MIN_PAIRS_PICK,
+    max_yaw_deg: float = DEFAULT_MAX_YAW_DEG,
+    max_translation_m: float = DEFAULT_MAX_TRANSLATION_M,
+) -> dict[str, Any]:
+    """Fit one rigid SE(2) from ≥3 yellow↔red corner pairs (red → yellow).
+
+    Does **not** apply. Preview payload includes transformed red points and
+    pair segments for Studio overlay. Gates: n≥min_pairs, rms, |yaw|, ||t||.
+    """
+    before, after, audit = normalize_corner_pairs(pairs)
+    n = len(before)
+    if n < int(min_pairs):
+        raise SatOffsetError(f"need ≥{min_pairs} yellow↔red pairs, got {n}")
+
+    T = fit_se2(before, after)
+    rms = _residual_rms(before, after, T)
+    tx = float(T.get("tx_m", 0.0))
+    ty = float(T.get("ty_m", 0.0))
+    yaw = float(T.get("yaw_deg", 0.0))
+    trans = math.hypot(tx, ty)
+
+    if rms > float(max_rms_m):
+        raise SatOffsetError(f"rms {rms:.3f}m > gate {max_rms_m}m")
+    if abs(yaw) > float(max_yaw_deg):
+        raise SatOffsetError(f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°")
+    if trans > float(max_translation_m):
+        raise SatOffsetError(f"||t|| {trans:.3f}m > gate {max_translation_m}m")
+
+    preview_red: list[dict[str, float]] = []
+    preview_arrows: list[dict[str, Any]] = []
+    for b, a, row in zip(before, after, audit):
+        e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
+        preview_red.append({"e": float(e2), "n": float(n2)})
+        preview_arrows.append(
+            {
+                "from": {"e": float(b["e"]), "n": float(b["n"])},
+                "to": {"e": float(a["e"]), "n": float(a["n"])},
+                "mapped": {"e": float(e2), "n": float(n2)},
+                "residual_m": float(math.hypot(e2 - float(a["e"]), n2 - float(a["n"]))),
+                "i": row["i"],
+            }
+        )
+
+    return {
+        "tx_m": tx,
+        "ty_m": ty,
+        "yaw_deg": yaw,
+        "s": 1.0,
+        "pivot_e": float(T.get("pivot_e", 0.0)),
+        "pivot_n": float(T.get("pivot_n", 0.0)),
+        "source": SOURCE_STUDIO_PICKS,
+        "rms_m": float(rms),
+        "n_pairs": int(n),
+        "pairs": audit,
+        "preview": {
+            "red_mapped": preview_red,
+            "arrows": preview_arrows,
+        },
+        "applied": False,
+    }
+
+
+def persist_t_pick(
+    project: Project,
+    payload: dict[str, Any],
+    *,
+    t_path: Path | None = None,
+    pairs_path: Path | None = None,
+) -> dict[str, str]:
+    """Write ``align/T_pick.json`` + ``align/T_pick_pairs.json`` (audit). No apply."""
+    dest = Path(t_path) if t_path else (project.align_dir / "T_pick.json")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    pairs_dest = Path(pairs_path) if pairs_path else (project.align_dir / "T_pick_pairs.json")
+    if not pairs_dest.is_absolute():
+        pairs_dest = project.root / pairs_dest
+
+    t_body = {
+        "tx_m": float(payload["tx_m"]),
+        "ty_m": float(payload["ty_m"]),
+        "yaw_deg": float(payload["yaw_deg"]),
+        "s": float(payload.get("s", 1.0)),
+        "pivot_e": float(payload.get("pivot_e", 0.0)),
+        "pivot_n": float(payload.get("pivot_n", 0.0)),
+        "source": payload.get("source", SOURCE_STUDIO_PICKS),
+        "rms_m": float(payload.get("rms_m", 0.0)),
+        "n_pairs": int(payload.get("n_pairs", 0)),
+    }
+    write_t_force(dest, t_body)
+
+    audit = {
+        "source": SOURCE_STUDIO_PICKS,
+        "T": t_body,
+        "pairs": payload.get("pairs") or [],
+        "preview": payload.get("preview") or {},
+        "applied": False,
+        "note": "preview only — apply via sat-offset apply --from align/T_pick.json",
+    }
+    pairs_dest.parent.mkdir(parents=True, exist_ok=True)
+    pairs_dest.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    return {"T_pick": str(dest), "T_pick_pairs": str(pairs_dest)}
+
+
+def load_pairs_json(path: Path) -> list[Any]:
+    path = Path(path)
+    if not path.is_file():
+        raise SatOffsetError(f"missing pairs json: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        pairs = data.get("pairs")
+    else:
+        pairs = data
+    if not isinstance(pairs, list):
+        raise SatOffsetError(f"pairs json must be a list or {{pairs:[...]}}: {path}")
+    return pairs
 
 def write_t_force(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)

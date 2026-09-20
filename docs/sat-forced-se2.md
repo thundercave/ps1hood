@@ -46,9 +46,45 @@ uv run python scripts/apply_georef.py smoke-dense --which T_applied
 
 Optional multi-start (`multistart_facade_chamfer`, CLI `--multistart`): grid Δe,Δn ∈ ±6 m, Δyaw ∈ ±8° minimizing mean Ortho-Canny DT on façade edge samples — so future auto-align can leave the NCC no-op basin.
 
+
+
+## Studio yellow↔red corner picks (manual backup)
+
+Auto Chamfer NN pairs can latch kerb/asphalt instead of building outline — low RMS ≠ correct wall↔wall. Prefer Studio picks when the visual slip (~2–4 m) does not match auto `T_force`.
+
+**Do not auto-apply Chamfer `T_force`.** Fit is preview-only; apply only after confirm.
+
+### Studio (recommended)
+
+1. Open `http://127.0.0.1:8765/viewer?run=<run>` · enable **facades** · toggle **sat-offset pick**
+2. Top-down: click **yellow** sat corner, then matching **red** façade corner (≥3 pairs)
+3. **fit preview** → shows `tx ty yaw rms` + cyan mapped overlay (writes `align/T_pick.json`, does **not** apply)
+4. If overlay looks wall↔wall (~1 m), **apply T** → confirm → bak then cams+cloud+facades+planes (skips roofs/street)
+
+### CLI / API
+
+```bash
+# pairs.json = [{ "yellow": {"e":…,"n":…}, "red": {"e":…,"n":…} }, ...]
+uv run ps1hood sat-offset fit-pairs smoke-dense --pairs pairs.json
+# preview only → align/T_pick.json + T_pick_pairs.json
+
+# only after visual confirm:
+uv run ps1hood sat-offset apply smoke-dense --from align/T_pick.json   --targets cams,cloud,facades,planes --skip roofs,street
+```
+
+```http
+POST /api/runs/<name>/sat-offset/pairs   { "pairs": [ { "yellow": {e,n}, "red": {e,n} }, ... ] }
+→ T + preview, applied=false
+
+POST /api/runs/<name>/sat-offset/apply   { "confirm": true, "from": "T_pick" }
+→ bak + apply (same as CLI apply)
+```
+
+Gates for picks: n≥3 · rms≤1.5 m · |yaw|≤15° · ||t||≤10 m.
+
 ## Non-goals
 
-Per-cam free-pose · wipe 18 · hungry cloud clip · blaming sat tile (PC: tile OK) · Studio pick (manual backup, later)
+Per-cam free-pose · wipe 18 · hungry cloud clip · blaming sat tile (PC: tile OK) · **auto-applying Chamfer `T_force`** (NN pairs can latch road/tree — preview Studio picks first)
 
 ## Acceptance
 

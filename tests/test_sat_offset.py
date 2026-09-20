@@ -239,3 +239,80 @@ def test_no_free_pose_single_se2_only():
     forbidden = {"R", "t_free", "per_cam", "sim3", "scale_free"}
     assert not (forbidden & set(T))
     assert abs(float(T["s"]) - 1.0) < 1e-12
+
+
+def test_fit_pairs_se2_preview_only_no_apply(tmp_path: Path):
+    """Studio yellow↔red corner picks → SE(2) preview; does not mutate product."""
+    project, corners = _mini_project(tmp_path)
+    roofs_before = (project.recon_dir / "roofs.obj").read_text()
+    poses_before = project.read_json(project.align_dir / "poses.json")
+    pairs = [
+        {
+            "yellow": {"e": float(corners[i][0]), "n": float(corners[i][1])},
+            "red": {"e": float(corners[i][0] - 2.0), "n": float(corners[i][1] + 1.0)},
+        }
+        for i in range(3)
+    ]
+    from ps1_hood.align.sat_offset import fit_pairs_se2, persist_t_pick, load_t_force
+
+    payload = fit_pairs_se2(pairs)
+    assert payload["applied"] is False
+    assert payload["n_pairs"] == 3
+    assert payload["source"] == "studio_corner_picks"
+    assert abs(payload["tx_m"] - 2.0) < 1e-5
+    assert abs(payload["ty_m"] - (-1.0)) < 1e-5
+    assert payload["rms_m"] <= 1.5
+    assert "red_mapped" in payload["preview"]
+    paths = persist_t_pick(project, payload)
+    assert Path(paths["T_pick"]).is_file()
+    assert Path(paths["T_pick_pairs"]).is_file()
+    # preview must not have applied
+    assert (project.recon_dir / "roofs.obj").read_text() == roofs_before
+    assert project.read_json(project.align_dir / "poses.json") == poses_before
+    T = load_t_force(paths["T_pick"])
+    assert T["source"] == "studio_corner_picks"
+    audit = json.loads(Path(paths["T_pick_pairs"]).read_text(encoding="utf-8"))
+    assert audit.get("applied") is False
+
+
+def test_fit_pairs_requires_three():
+    from ps1_hood.align.sat_offset import SatOffsetError, fit_pairs_se2
+
+    pairs = [
+        {"yellow": {"e": 1.0, "n": 0.0}, "red": {"e": 0.0, "n": 0.0}},
+        {"yellow": {"e": 2.0, "n": 0.0}, "red": {"e": 1.0, "n": 0.0}},
+    ]
+    with pytest.raises(SatOffsetError, match="pairs"):
+        fit_pairs_se2(pairs)
+
+
+def test_apply_t_pick_skips_roofs_street(tmp_path: Path):
+    """Confirm path: apply T_pick via existing sat-offset apply (bak + skip roofs/street)."""
+    project, corners = _mini_project(tmp_path)
+    from ps1_hood.align.sat_offset import apply_forced_se2, fit_pairs_se2, persist_t_pick
+
+    pairs = [
+        {
+            "yellow": {"e": float(corners[i][0]), "n": float(corners[i][1])},
+            "red": {"e": float(corners[i][0] - 1.5), "n": float(corners[i][1] - 0.5)},
+        }
+        for i in range(3)
+    ]
+    payload = fit_pairs_se2(pairs)
+    persist_t_pick(project, payload)
+    roofs_before = (project.recon_dir / "roofs.obj").read_text()
+    street_before = (project.recon_dir / "street.obj").read_text()
+    poses_before = project.read_json(project.align_dir / "poses.json")
+    meta = apply_forced_se2(
+        project,
+        payload,
+        targets="cams,cloud,facades,planes",
+        skip="roofs,street",
+        bak=True,
+    )
+    assert meta["stats"]["roofs.obj"] == "skipped"
+    assert meta["stats"]["street.obj"] == "skipped"
+    assert (project.recon_dir / "roofs.obj").read_text() == roofs_before
+    assert (project.recon_dir / "street.obj").read_text() == street_before
+    poses_after = project.read_json(project.align_dir / "poses.json")
+    assert abs(poses_after[0]["e"] - poses_before[0]["e"] - payload["tx_m"]) < 1e-5

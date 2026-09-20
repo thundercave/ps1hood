@@ -2085,7 +2085,7 @@ def sculpt_undo_cmd(name: str, stamp: str | None) -> None:
 
 @main.group("sat-offset")
 def sat_offset_group() -> None:
-    """Forced SE(2) from façade edges → Ortho Canny (escape no-op seat)."""
+    """Forced SE(2): measure Chamfer, Studio corner picks, or apply (bak first)."""
 
 
 @sat_offset_group.command("measure")
@@ -2152,6 +2152,69 @@ def sat_offset_measure_cmd(
     )
 
 
+@sat_offset_group.command("fit-pairs")
+@click.argument("name")
+@click.option(
+    "--pairs",
+    "pairs_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True),
+    help="JSON list of {yellow:{e,n}, red:{e,n}} (or {pairs:[...]})",
+)
+@click.option(
+    "--out",
+    "out_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output T_pick.json (default: <run>/align/T_pick.json)",
+)
+@click.option("--max-rms-m", default=1.5, show_default=True, type=float)
+@click.option("--min-pairs", default=3, show_default=True, type=int)
+@click.option("--max-yaw-deg", default=15.0, show_default=True, type=float)
+@click.option("--max-translation-m", default=10.0, show_default=True, type=float)
+def sat_offset_fit_pairs_cmd(
+    name: str,
+    pairs_path: Path,
+    out_path: Path | None,
+    max_rms_m: float,
+    min_pairs: int,
+    max_yaw_deg: float,
+    max_translation_m: float,
+) -> None:
+    """Fit SE(2) from ≥3 Studio yellow↔red corner pairs (preview only).
+
+    Writes align/T_pick.json + T_pick_pairs.json. Does **not** apply —
+    use `sat-offset apply --from align/T_pick.json` after visual confirm.
+    """
+    from ps1_hood.align.sat_offset import (
+        SatOffsetError,
+        fit_pairs_se2,
+        load_pairs_json,
+        persist_t_pick,
+    )
+
+    project = open_project(name)
+    try:
+        pairs = load_pairs_json(Path(pairs_path))
+        payload = fit_pairs_se2(
+            pairs,
+            max_rms_m=float(max_rms_m),
+            min_pairs=int(min_pairs),
+            max_yaw_deg=float(max_yaw_deg),
+            max_translation_m=float(max_translation_m),
+        )
+        paths = persist_t_pick(project, payload, t_path=out_path)
+    except SatOffsetError as exc:
+        click.echo(f"sat-offset fit-pairs failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(
+        f"sat-offset fit-pairs ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
+        f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
+        f"n_pairs={payload['n_pairs']}  applied=false  "
+        f"T_pick={paths['T_pick']}  pairs={paths['T_pick_pairs']}"
+    )
+
+
 @sat_offset_group.command("apply")
 @click.argument("name")
 @click.option(
@@ -2159,7 +2222,7 @@ def sat_offset_measure_cmd(
     "from_path",
     default=None,
     type=click.Path(path_type=Path),
-    help="T_force.json (default: <run>/align/T_force.json)",
+    help="T json (default: <run>/align/T_force.json; Studio picks: align/T_pick.json)",
 )
 @click.option(
     "--targets",
