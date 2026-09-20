@@ -316,3 +316,158 @@ def test_apply_t_pick_skips_roofs_street(tmp_path: Path):
     assert (project.recon_dir / "street.obj").read_text() == street_before
     poses_after = project.read_json(project.align_dir / "poses.json")
     assert abs(poses_after[0]["e"] - poses_before[0]["e"] - payload["tx_m"]) < 1e-5
+
+
+
+def _handmade_street_mask(h: int = 128, w: int = 128, band: int = 6) -> np.ndarray:
+    """Horizontal street corridor mask (centerline ≈ row h//2)."""
+    m = np.zeros((h, w), dtype=np.uint8)
+    m[h // 2 - band // 2 : h // 2 + band // 2 + 1, :] = 255
+    return m
+
+
+def _mini_project_cam_road(tmp_path: Path, *, cam_shift_e: float = 3.0, cam_shift_n: float = 0.0):
+    """Project with cams offset from a mid-row street; street_mask injected in tests."""
+    project, _corners = _mini_project(tmp_path)
+    from ps1_hood.reconstruct.sat_roofs import load_ortho_for_run, px_to_enu
+
+    ortho = load_ortho_for_run(project.root)
+    h = int(ortho.h)
+    us = [20, 40, 60, 80, 100]
+    poses = []
+    for i, u in enumerate(us):
+        e, n = px_to_enu(ortho, float(u), float(h // 2))
+        poses.append(
+            {
+                "pano_id": f"c{i}",
+                "e": float(e + cam_shift_e),
+                "n": float(n + cam_shift_n),
+                "u": 2.5,
+                "heading": 90.0,
+            }
+        )
+    poses.append({**poses[0], "pano_id": "c0b", "heading": 180.0})
+    project.write_json(project.align_dir / "poses.json", poses)
+    project.write_json(project.align_dir / "cameras.json", list(poses))
+    return project
+
+
+def _patch_street_mask(monkeypatch):
+    """Force segment_roof_yard_mask → clean horizontal street corridor."""
+    import ps1_hood.align.sat_offset as so
+
+    def _fake_segment(ortho_bgr, **kwargs):
+        h, w = ortho_bgr.shape[:2]
+        street = _handmade_street_mask(h, w, band=8)
+        empty = np.zeros((h, w), dtype=np.uint8)
+        return empty, empty, street
+
+    monkeypatch.setattr(so, "segment_roof_yard_mask", _fake_segment)
+
+
+def test_street_mask_centerline_nonempty():
+    from ps1_hood.align.sat_offset import street_mask_centerline
+
+    street = _handmade_street_mask()
+    pix = street_mask_centerline(street)
+    assert len(pix) >= 20
+    # Medial should hug mid row
+    assert abs(float(np.median(pix[:, 1])) - 64.0) <= 2.0
+
+
+def test_measure_cam_road_recovers_translation(tmp_path: Path, monkeypatch):
+    from ps1_hood.align.sat_offset import (
+        SOURCE_CAM_STREET_CENTERLINE,
+        load_t_force,
+        measure_cam_road_se2,
+        persist_t_cam_road,
+    )
+
+    _patch_street_mask(monkeypatch)
+    shift = 3.0
+    # Offset perpendicular to horizontal street corridor (N), not along-track (E)
+    project = _mini_project_cam_road(tmp_path, cam_shift_e=0.0, cam_shift_n=shift)
+    payload = measure_cam_road_se2(project, search_r_m=15.0, min_pairs=4)
+    assert payload["source"] == SOURCE_CAM_STREET_CENTERLINE
+    assert payload["applied"] is False
+    assert payload["n_cams"] >= 4
+    assert payload["n_pairs"] >= 4
+    assert payload["rms_m"] <= 2.0
+    assert abs(payload["yaw_deg"]) <= 10.0
+    assert abs(payload["ty_m"] + shift) < 0.5
+    assert math.hypot(payload["tx_m"], payload["ty_m"]) <= 12.0
+    paths = persist_t_cam_road(project, payload)
+    T = load_t_force(paths["T_cam_road"])
+    assert T["source"] == SOURCE_CAM_STREET_CENTERLINE
+    assert T.get("applied") is False
+
+
+def test_measure_cam_road_gate_too_few(tmp_path: Path, monkeypatch):
+    from ps1_hood.align.sat_offset import SatOffsetError, measure_cam_road_se2
+
+    _patch_street_mask(monkeypatch)
+    project = _mini_project_cam_road(tmp_path, cam_shift_e=0.0, cam_shift_n=50.0)
+    with pytest.raises(SatOffsetError, match="pairs|cams"):
+        measure_cam_road_se2(project, search_r_m=2.0, min_pairs=4)
+
+
+def test_apply_t_cam_road_skips_roofs_street(tmp_path: Path, monkeypatch):
+    from ps1_hood.align.sat_offset import (
+        apply_forced_se2,
+        measure_cam_road_se2,
+        persist_t_cam_road,
+    )
+
+    _patch_street_mask(monkeypatch)
+    project = _mini_project_cam_road(tmp_path, cam_shift_e=0.0, cam_shift_n=2.5)
+    payload = measure_cam_road_se2(project, search_r_m=15.0)
+    persist_t_cam_road(project, payload)
+    roofs_before = (project.recon_dir / "roofs.obj").read_text()
+    street_before = (project.recon_dir / "street.obj").read_text()
+    poses_before = project.read_json(project.align_dir / "poses.json")
+    meta = apply_forced_se2(
+        project,
+        payload,
+        targets="cams,cloud,facades,planes",
+        skip="roofs,street",
+        bak=True,
+    )
+    assert meta["stats"]["roofs.obj"] == "skipped"
+    assert meta["stats"]["street.obj"] == "skipped"
+    assert (project.recon_dir / "roofs.obj").read_text() == roofs_before
+    assert (project.recon_dir / "street.obj").read_text() == street_before
+    poses_after = project.read_json(project.align_dir / "poses.json")
+    assert abs(poses_after[0]["e"] - poses_before[0]["e"]) > 0.5 or abs(
+        poses_after[0]["n"] - poses_before[0]["n"]
+    ) > 0.2
+    assert meta["T"]["source"] == "cam_street_centerline"
+
+
+def test_cam_road_one_rigid_se2_no_free_pose():
+    from ps1_hood.align.sat_offset import SOURCE_CAM_STREET_CENTERLINE
+
+    T = {
+        "tx_m": 1.0,
+        "ty_m": -0.5,
+        "yaw_deg": 0.0,
+        "s": 1.0,
+        "pivot_e": 0.0,
+        "pivot_n": 0.0,
+        "source": SOURCE_CAM_STREET_CENTERLINE,
+    }
+    forbidden = {"R", "t_free", "per_cam", "sim3", "scale_free", "free_pose"}
+    assert not (forbidden & set(T))
+    assert abs(float(T["s"]) - 1.0) < 1e-12
+
+
+def test_match_cams_to_centerline_nn():
+    from ps1_hood.align.sat_offset import match_cams_to_centerline
+
+    cams = np.array([[0.0, 1.0], [5.0, 1.0], [10.0, 1.0], [15.0, 1.0]], dtype=np.float64)
+    cl = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [15.0, 0.0]], dtype=np.float64)
+    before, after, dists = match_cams_to_centerline(cams, cl, search_r_m=15.0, min_nn_m=0.5)
+    assert len(before) == 4
+    assert all(abs(d - 1.0) < 1e-6 for d in dists)
+    T_tx = sum(a["e"] - b["e"] for a, b in zip(after, before)) / 4
+    T_ty = sum(a["n"] - b["n"] for a, b in zip(after, before)) / 4
+    assert abs(T_tx) < 1e-6 and abs(T_ty + 1.0) < 1e-6

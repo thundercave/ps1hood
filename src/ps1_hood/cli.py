@@ -2085,60 +2085,110 @@ def sculpt_undo_cmd(name: str, stamp: str | None) -> None:
 
 @main.group("sat-offset")
 def sat_offset_group() -> None:
-    """Forced SE(2): measure Chamfer, Studio corner picks, or apply (bak first)."""
+    """Forced SE(2): Chamfer, cam→road, Studio picks, or apply (bak first)."""
 
 
 @sat_offset_group.command("measure")
 @click.argument("name")
 @click.option(
+    "--from",
+    "from_mode",
+    default="facades",
+    type=click.Choice(["facades", "cams-road"], case_sensitive=False),
+    show_default=True,
+    help="facades=Chamfer façade↔Canny; cams-road=cam→street centerline (alias measure-cams)",
+)
+@click.option(
     "--out",
     "out_path",
     default=None,
     type=click.Path(path_type=Path),
-    help="Output T_force.json (default: <run>/align/T_force.json)",
+    help="Output json (default: align/T_force.json or align/T_cam_road.json)",
 )
-@click.option("--search-r-m", default=8.0, show_default=True, type=float)
+@click.option("--search-r-m", default=None, type=float, help="Search radius m (facades default 8; cams-road 15)")
 @click.option("--min-len-m", default=3.0, show_default=True, type=float)
-@click.option("--max-rms-m", default=1.5, show_default=True, type=float)
+@click.option("--max-rms-m", default=None, type=float, help="RMS gate m (facades 1.5; cams-road 2.0)")
 @click.option("--min-pairs", default=4, show_default=True, type=int)
-@click.option("--max-yaw-deg", default=15.0, show_default=True, type=float)
-@click.option("--max-translation-m", default=10.0, show_default=True, type=float)
+@click.option("--max-yaw-deg", default=None, type=float)
+@click.option("--max-translation-m", default=None, type=float)
 @click.option(
     "--multistart/--no-multistart",
     default=False,
     show_default=True,
-    help="Optional Chamfer multi-start polish (escape NCC local min)",
+    help="Optional Chamfer multi-start polish (facades only)",
+)
+@click.option(
+    "--overlay/--no-overlay",
+    default=False,
+    show_default=True,
+    help="Write overlay PNG (cams-road only)",
 )
 def sat_offset_measure_cmd(
     name: str,
+    from_mode: str,
     out_path: Path | None,
-    search_r_m: float,
+    search_r_m: float | None,
     min_len_m: float,
-    max_rms_m: float,
+    max_rms_m: float | None,
     min_pairs: int,
-    max_yaw_deg: float,
-    max_translation_m: float,
+    max_yaw_deg: float | None,
+    max_translation_m: float | None,
     multistart: bool,
+    overlay: bool,
 ) -> None:
-    """Measure yellow≈R(yaw)@red+(tx,ty) from façade long edges vs Ortho Canny.
+    """Measure one rigid SE(2). Default: façade↔Ortho Canny → T_force.json.
 
-    Writes align/T_force.json. One rigid SE(2) only — no free-pose.
+    Use ``--from cams-road`` (or ``measure-cams``) for cam track → street
+    centerline → T_cam_road.json. Does **not** apply.
     """
-    from ps1_hood.align.sat_offset import SatOffsetError, measure_facade_sat_se2, write_t_force
+    from ps1_hood.align.sat_offset import (
+        SatOffsetError,
+        measure_cam_road_se2,
+        measure_facade_sat_se2,
+        persist_t_cam_road,
+        write_t_force,
+    )
 
     project = open_project(name)
+    mode = (from_mode or "facades").lower()
+    if mode == "cams-road":
+        try:
+            payload = measure_cam_road_se2(
+                project,
+                search_r_m=float(search_r_m) if search_r_m is not None else 15.0,
+                max_rms_m=float(max_rms_m) if max_rms_m is not None else 2.0,
+                min_pairs=int(min_pairs),
+                max_yaw_deg=float(max_yaw_deg) if max_yaw_deg is not None else 10.0,
+                max_translation_m=float(max_translation_m) if max_translation_m is not None else 12.0,
+            )
+            paths = persist_t_cam_road(
+                project, payload, t_path=out_path, overlay=bool(overlay)
+            )
+        except SatOffsetError as exc:
+            click.echo(f"sat-offset measure failed: {exc}", err=True)
+            raise SystemExit(1) from exc
+        t_norm = float(payload.get("t_norm_m", 0.0))
+        click.echo(
+            f"sat-offset measure ok  source=cam_street_centerline  "
+            f"tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
+            f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
+            f"n_cams={payload['n_cams']}  n_pairs={payload['n_pairs']}  "
+            f"||t||={t_norm:.3f}  applied=false  out={paths['T_cam_road']}"
+        )
+        return
+
     dest = Path(out_path) if out_path else (project.align_dir / "T_force.json")
     if not dest.is_absolute():
         dest = project.root / dest
     try:
         payload = measure_facade_sat_se2(
             project,
-            search_r_m=float(search_r_m),
+            search_r_m=float(search_r_m) if search_r_m is not None else 8.0,
             min_len_m=float(min_len_m),
-            max_rms_m=float(max_rms_m),
+            max_rms_m=float(max_rms_m) if max_rms_m is not None else 1.5,
             min_pairs=int(min_pairs),
-            max_yaw_deg=float(max_yaw_deg),
-            max_translation_m=float(max_translation_m),
+            max_yaw_deg=float(max_yaw_deg) if max_yaw_deg is not None else 15.0,
+            max_translation_m=float(max_translation_m) if max_translation_m is not None else 10.0,
             multistart=bool(multistart),
         )
     except SatOffsetError as exc:
@@ -2149,6 +2199,109 @@ def sat_offset_measure_cmd(
         f"sat-offset measure ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
         f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
         f"n_pairs={payload['n_pairs']}  out={dest}"
+    )
+
+
+@sat_offset_group.command("measure-cams")
+@click.argument("name")
+@click.option(
+    "--out",
+    "out_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output T_cam_road.json (default: <run>/align/T_cam_road.json)",
+)
+@click.option(
+    "--search-r",
+    "search_r_m",
+    default=15.0,
+    show_default=True,
+    type=float,
+    help="Max cam→centerline NN distance (m)",
+)
+@click.option("--min-nn-m", default=0.5, show_default=True, type=float)
+@click.option("--max-rms-m", default=2.0, show_default=True, type=float)
+@click.option("--min-pairs", default=4, show_default=True, type=int)
+@click.option("--max-yaw-deg", default=10.0, show_default=True, type=float)
+@click.option("--max-translation-m", default=12.0, show_default=True, type=float)
+@click.option(
+    "--yaw-zero-deg",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="If |yaw| below this, fit tx,ty only (yaw=0)",
+)
+@click.option(
+    "--se2-mode",
+    default="auto",
+    type=click.Choice(["auto", "translation", "full"], case_sensitive=False),
+    show_default=True,
+    help="auto: yaw=0 if |yaw|≤yaw-zero-deg; translation: force yaw=0; full: always SE(2)",
+)
+@click.option(
+    "--overlay/--no-overlay",
+    default=False,
+    show_default=True,
+    help="Write align/T_cam_road_overlay.png (red cams → cyan mapped)",
+)
+def sat_offset_measure_cams_cmd(
+    name: str,
+    out_path: Path | None,
+    search_r_m: float,
+    min_nn_m: float,
+    max_rms_m: float,
+    min_pairs: int,
+    max_yaw_deg: float,
+    max_translation_m: float,
+    yaw_zero_deg: float,
+    se2_mode: str,
+    overlay: bool,
+) -> None:
+    """Measure SE(2) from unique cam XY → Ortho street_mask centerline.
+
+    Writes align/T_cam_road.json. Does **not** apply — use
+    `sat-offset apply --from align/T_cam_road.json` after Studio preview.
+    One rigid SE(2) only — no free-pose. Skips roofs/street on apply.
+    """
+    from ps1_hood.align.sat_offset import (
+        SatOffsetError,
+        measure_cam_road_se2,
+        persist_t_cam_road,
+    )
+
+    project = open_project(name)
+    try:
+        mode = (se2_mode or "auto").lower()
+        t_only = None if mode == "auto" else (mode == "translation")
+        payload = measure_cam_road_se2(
+            project,
+            search_r_m=float(search_r_m),
+            min_nn_m=float(min_nn_m),
+            max_rms_m=float(max_rms_m),
+            min_pairs=int(min_pairs),
+            max_yaw_deg=float(max_yaw_deg),
+            max_translation_m=float(max_translation_m),
+            yaw_zero_deg=float(yaw_zero_deg),
+            translation_only=t_only,
+        )
+        paths = persist_t_cam_road(
+            project,
+            payload,
+            t_path=out_path,
+            overlay=bool(overlay),
+        )
+    except SatOffsetError as exc:
+        click.echo(f"sat-offset measure-cams failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    t_norm = float(payload.get("t_norm_m", 0.0))
+    click.echo(
+        f"sat-offset measure-cams ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
+        f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
+        f"n_cams={payload['n_cams']}  n_pairs={payload['n_pairs']}  "
+        f"mean_nn_m={payload['mean_nn_m']:.3f}  ||t||={t_norm:.3f}  "
+        f"translation_only={payload.get('translation_only')}  "
+        f"applied=false  out={paths['T_cam_road']}"
+        + (f"  overlay={paths['overlay']}" if paths.get("overlay") else "")
     )
 
 
@@ -2222,7 +2375,7 @@ def sat_offset_fit_pairs_cmd(
     "from_path",
     default=None,
     type=click.Path(path_type=Path),
-    help="T json (default: <run>/align/T_force.json; Studio picks: align/T_pick.json)",
+    help="T json (default: align/T_force.json; also T_pick.json / T_cam_road.json)",
 )
 @click.option(
     "--targets",
