@@ -1602,12 +1602,47 @@ def gap_needs_fetch_cmd(
     show_default=True,
     help="Also rewrite cloud.ply from zclean (default: write cloud_zclean.ply sidecar only).",
 )
+@click.option(
+    "--offtile/--no-offtile",
+    "offtile",
+    default=False,
+    show_default=True,
+    help="Also run soft support offtile gate → recon/cloud_offtile.ply (opt-in).",
+)
+@click.option(
+    "--support-dilate-m",
+    "support_dilate_m",
+    type=float,
+    default=10.0,
+    show_default=True,
+    help="Dilate roof∪yard∪street AABBs (m) for offtile support keep-mask.",
+)
+@click.option(
+    "--far-m",
+    "far_m",
+    type=float,
+    default=15.0,
+    show_default=True,
+    help="Drop pts farther than this (m) from dilated support (offtile).",
+)
+@click.option(
+    "--z-out-m",
+    "z_out_m",
+    type=float,
+    default=8.0,
+    show_default=True,
+    help="Drop off-support pts with z > local_ground + this (m) (offtile).",
+)
 def cloud_zclean_cmd(
     name: str,
     margin_m: float,
     aabb_inset_m: float,
     drop_sinks: bool,
     replace_product: bool,
+    offtile: bool,
+    support_dilate_m: float,
+    far_m: float,
+    z_out_m: float,
 ) -> None:
     """Opt-in soft Z gate vs sat roof shells — drop sky floaters above roofs.
 
@@ -1615,8 +1650,11 @@ def cloud_zclean_cmd(
     z > shell_z + margin. Yards/street outside AABBs unchanged. Writes
     recon/cloud_zclean.ply (+ bak); does NOT change default product to XY-clipped.
     Façades/roofs shells untouched. Mapillary garage fill is a separate non-goal.
+
+    With --offtile: also write recon/cloud_offtile.ply via soft support gate
+    (dilated roof∪yard∪street; not Ortho XY±2 m).
     """
-    from ps1_hood.align.georef import zclean_recon_clouds
+    from ps1_hood.align.georef import offtile_recon_clouds, zclean_recon_clouds
 
     project = open_project(name)
     roofs = project.recon_dir / "roofs.json"
@@ -1647,6 +1685,118 @@ def cloud_zclean_cmd(
         f"cloud-zclean ok  kept={stats.get('kept')}  dropped={stats.get('dropped')}  "
         f"margin_m={stats.get('margin_m')}  n_roofs={stats.get('n_roofs')}  "
         f"sidecar=recon/cloud_zclean.ply  replace_product={replace_product}"
+    )
+
+    if offtile:
+        ot = offtile_recon_clouds(
+            project.recon_dir,
+            dilate_m=float(support_dilate_m),
+            far_m=float(far_m),
+            z_out_m=float(z_out_m),
+            poses_path=project.align_dir / "poses.json",
+            replace_product=False,
+        )
+        georef["cloud_offtile"] = ot
+        project.write_json(georef_path, georef)
+        click.echo(
+            f"cloud-offtile ok  kept={ot.get('kept')}  dropped={ot.get('dropped')}  "
+            f"dropped_far={ot.get('dropped_far')}  dropped_z={ot.get('dropped_z')}  "
+            f"dilate_m={ot.get('dilate_m')}  far_m={ot.get('far_m')}  "
+            f"z_out_m={ot.get('z_out_m')}  sidecar=recon/cloud_offtile.ply"
+        )
+
+
+@main.command("cloud-offtile")
+@click.argument("name")
+@click.option(
+    "--support-dilate-m",
+    "support_dilate_m",
+    type=float,
+    default=10.0,
+    show_default=True,
+    help="Dilate roof∪yard∪street AABBs (m) for the keep-mask (~8–12).",
+)
+@click.option(
+    "--far-m",
+    "far_m",
+    type=float,
+    default=15.0,
+    show_default=True,
+    help="Drop pts farther than this (m) from dilated support.",
+)
+@click.option(
+    "--z-out-m",
+    "z_out_m",
+    type=float,
+    default=8.0,
+    show_default=True,
+    help="Drop off-support pts with z > local_ground + this (m).",
+)
+@click.option(
+    "--cam-corridor-m",
+    "cam_corridor_m",
+    type=float,
+    default=6.0,
+    show_default=True,
+    help="Also keep ±this (m) around cam poses (0 disables).",
+)
+@click.option(
+    "--replace-product/--no-replace-product",
+    "replace_product",
+    default=False,
+    show_default=True,
+    help="Also rewrite cloud.ply from offtile (default: sidecar only).",
+)
+def cloud_offtile_cmd(
+    name: str,
+    support_dilate_m: float,
+    far_m: float,
+    z_out_m: float,
+    cam_corridor_m: float,
+    replace_product: bool,
+) -> None:
+    """Opt-in soft support gate — drop off-tile / sky-halo floaters.
+
+    Dilates sat roof∪yard∪street (~10 m). Outside support: drop if
+    z ≫ local ground (+z-out) OR farther than far-m. Soft fringe kept.
+    Writes recon/cloud_offtile.ply (+ bak/georef). NOT Ortho XY±2 m.
+    Façades untouched. Does not densify.
+    """
+    from ps1_hood.align.georef import offtile_recon_clouds
+
+    project = open_project(name)
+    roofs = project.recon_dir / "roofs.json"
+    if not roofs.is_file():
+        click.echo(
+            f"cloud-offtile: missing {roofs} — run: ps1hood roofs {name}",
+            err=True,
+        )
+        raise SystemExit(1)
+    if not (project.recon_dir / "cloud.ply").is_file():
+        click.echo(f"cloud-offtile: missing recon/cloud.ply in {name}", err=True)
+        raise SystemExit(1)
+
+    stats = offtile_recon_clouds(
+        project.recon_dir,
+        dilate_m=float(support_dilate_m),
+        far_m=float(far_m),
+        z_out_m=float(z_out_m),
+        cam_corridor_m=float(cam_corridor_m),
+        poses_path=project.align_dir / "poses.json",
+        replace_product=bool(replace_product),
+    )
+    georef_path = project.align_dir / "georef.json"
+    georef = project.read_json(georef_path) if georef_path.is_file() else {}
+    georef["cloud_offtile"] = stats
+    project.align_dir.mkdir(parents=True, exist_ok=True)
+    project.write_json(georef_path, georef)
+
+    click.echo(
+        f"cloud-offtile ok  kept={stats.get('kept')}  dropped={stats.get('dropped')}  "
+        f"dropped_far={stats.get('dropped_far')}  dropped_z={stats.get('dropped_z')}  "
+        f"dilate_m={stats.get('dilate_m')}  far_m={stats.get('far_m')}  "
+        f"z_out_m={stats.get('z_out_m')}  local_ground_z={stats.get('local_ground_z')}  "
+        f"sidecar=recon/cloud_offtile.ply  replace_product={replace_product}"
     )
 
 

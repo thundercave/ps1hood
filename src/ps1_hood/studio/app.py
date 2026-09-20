@@ -45,6 +45,7 @@ def create_app() -> Flask:
                             "source": spec.source,
                             "has_cloud": (child / "recon" / "cloud.ply").is_file(),
                             "has_cloud_zclean": (child / "recon" / "cloud_zclean.ply").is_file(),
+                            "has_cloud_offtile": (child / "recon" / "cloud_offtile.ply").is_file(),
                             "has_compare": (child / "recon" / "compare" / "summary.json").is_file(),
                             "has_scene": (child / "recon" / "scene.json").is_file(),
                             "has_live": (child / "live.json").is_file(),
@@ -149,6 +150,13 @@ def create_app() -> Flask:
         path = open_project(name).recon_dir / "cloud_zclean.ply"
         if not path.is_file():
             return jsonify({"error": "no cloud_zclean yet — run: ps1hood cloud-zclean <run>"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/cloud_offtile.ply")
+    def api_cloud_offtile(name: str):
+        path = open_project(name).recon_dir / "cloud_offtile.ply"
+        if not path.is_file():
+            return jsonify({"error": "no cloud_offtile yet — run: ps1hood cloud-offtile <run>"}), 404
         return send_file(path)
 
     @app.get("/api/runs/<name>/facades.obj")

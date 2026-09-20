@@ -107,6 +107,8 @@ Built-in: flow triangulation from **aligned keyframes** (`align/cameras.json`, p
 
 **Soft Z cloud clean (opt-in):** `ps1hood cloud-zclean <run> --margin-m 1.5` drops pts inside sat roof AABBs with `z > shell_z + 1.5 m` → `recon/cloud_zclean.ply` (+ georef stats). Does **not** hungry-XY-clip or replace default `cloud.ply`. Studio **zclean** toggle. Mapillary garage fill is a separate non-goal. See [`docs/roof-floater-zclean.md`](docs/roof-floater-zclean.md).
 
+**Off-tile / sky-halo gate (opt-in):** `ps1hood cloud-offtile <run> --support-dilate-m 10 --far-m 15 --z-out-m 8` dilates roof∪yard∪street, drops far halo / z≫local ground → `recon/cloud_offtile.ply`. Also `cloud-zclean --offtile`. **Not** Ortho XY±2 m. Studio **offtile** toggle. See [`docs/off-tile-floater-gate.md`](docs/off-tile-floater-gate.md).
+
 **Pano↔mesh compare (diagnose):** `ps1hood compare <run>` reprojects façades+roofs into SV with known ENU poses → ZNCC + edge + sat footprint Chamfer; writes `recon/compare/` overlays + `summary.json` (worst cams). No densify / free-pose / product wipe. See [`docs/pano-mesh-compare.md`](docs/pano-mesh-compare.md).
 
 **Textured façades:** after photo-consistency accept, each wall picks the most frontal camera, perspective-warps a JPEG into `recon/textures/`, and writes `recon/facades.obj` + `facades.mtl` with UVs. The ground quad can use a satellite ortho crop. Studio’s Three.js viewer loads the OBJ/MTL so walls read without a GPU reconstructor.

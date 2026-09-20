@@ -579,6 +579,11 @@ DEFAULT_ZCLEAN_MARGIN_M = 1.5
 DEFAULT_ZCLEAN_AABB_INSET_M = 0.5
 SINK_DROP_BELOW_GROUND_M = 1.0
 
+DEFAULT_OFFTILE_DILATE_M = 10.0
+DEFAULT_OFFTILE_FAR_M = 15.0
+DEFAULT_OFFTILE_Z_OUT_M = 8.0
+DEFAULT_OFFTILE_CAM_CORRIDOR_M = 6.0
+
 
 def load_roof_shell_aabbs(
     roofs_json: Path,
@@ -910,6 +915,497 @@ def zclean_recon_clouds(
     summary["kept"] = total_kept
     summary["dropped"] = total_dropped
     return summary
+
+
+def _filter_ply_by_xyz(
+    path: Path,
+    keep_xyz,
+    *,
+    dest: Path | None = None,
+) -> tuple[int, int, Path]:
+    """Rewrite PLY keeping verts where ``keep_xyz(x,y,z)`` is true.
+
+    Returns ``(kept, dropped, out_path)``. Supports ascii + binary_little/big.
+    """
+    raw = path.read_bytes()
+    header_end = raw.find(b"end_header")
+    if header_end < 0:
+        raise RuntimeError(f"not a PLY: {path}")
+    header = raw[:header_end].decode("ascii", errors="replace")
+    body = raw[header_end + len(b"end_header") :]
+    nl = b"\n"
+    if body.startswith(b"\r\n"):
+        body = body[2:]
+        nl = b"\r\n"
+    elif body.startswith(b"\n"):
+        body = body[1:]
+
+    fmt = "ascii"
+    n_verts = 0
+    props: list[tuple[str, str]] = []
+    in_vertex = False
+    header_lines = header.splitlines()
+    for line in header_lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            fmt = parts[1]
+        elif parts[0] == "element" and parts[1] == "vertex":
+            n_verts = int(parts[2])
+            in_vertex = True
+        elif parts[0] == "element":
+            in_vertex = False
+        elif in_vertex and parts[0] == "property":
+            props.append((parts[1], parts[2]))
+
+    out_path = dest if dest is not None else path
+    if n_verts <= 0:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(raw)
+        return 0, 0, out_path
+
+    dropped = 0
+    if fmt == "ascii":
+        text_body = body.decode("ascii", errors="replace")
+        lines = text_body.splitlines(keepends=True)
+        kept_str: list[str] = []
+        for i, line in enumerate(lines):
+            if i >= n_verts:
+                break
+            parts = line.split()
+            if len(parts) < 3:
+                dropped += 1
+                continue
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            if keep_xyz(x, y, z):
+                kept_str.append(line if line.endswith("\n") else line + "\n")
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_str)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + "".join(kept_str).encode("ascii"))
+        kept = len(kept_str)
+    else:
+        type_map = {
+            "char": "b",
+            "uchar": "B",
+            "int8": "b",
+            "uint8": "B",
+            "short": "h",
+            "ushort": "H",
+            "int16": "h",
+            "uint16": "H",
+            "int": "i",
+            "uint": "I",
+            "int32": "i",
+            "uint32": "I",
+            "float": "f",
+            "float32": "f",
+            "double": "d",
+            "float64": "d",
+        }
+        endian = "<" if "little" in fmt else ">"
+        fmt_chars = []
+        for t, _name in props:
+            if t not in type_map:
+                raise RuntimeError(f"unsupported PLY prop type {t} in {path}")
+            fmt_chars.append(type_map[t])
+        if len(fmt_chars) < 3 or fmt_chars[0] not in "fd" or fmt_chars[1] not in "fd":
+            raise RuntimeError(f"PLY {path} does not start with float x/y")
+        if fmt_chars[2] not in "fd":
+            raise RuntimeError(f"PLY {path} z is not float/double")
+        vert_fmt = endian + "".join(fmt_chars)
+        vert_size = struct.calcsize(vert_fmt)
+        if len(body) < n_verts * vert_size:
+            raise RuntimeError(f"PLY body short: {path}")
+        kept_blobs: list[bytes] = []
+        for i in range(n_verts):
+            off = i * vert_size
+            chunk = body[off : off + vert_size]
+            vals = struct.unpack_from(vert_fmt, body, off)
+            x, y, z = float(vals[0]), float(vals[1]), float(vals[2])
+            if keep_xyz(x, y, z):
+                kept_blobs.append(bytes(chunk))
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_blobs)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + b"".join(kept_blobs))
+        kept = len(kept_blobs)
+
+    return int(kept), int(dropped), out_path
+
+
+def load_support_shell_aabbs(
+    roofs_json: Path,
+    *,
+    kinds: tuple[str, ...] = ("roof", "yard", "street"),
+    dilate_m: float = 0.0,
+) -> list[dict[str, float]]:
+    """Load roof∪yard∪street shell AABBs, optionally dilated (soft support).
+
+    Unlike ``load_roof_shell_aabbs``, does **not** inset — dilation expands
+    footprints so yards/street stay inside the keep mask.
+    """
+    if not roofs_json.is_file():
+        return []
+    data = json.loads(roofs_json.read_text(encoding="utf-8"))
+    shells = data.get("shells") if isinstance(data, dict) else data
+    if not isinstance(shells, list):
+        return []
+    kind_set = {str(k) for k in kinds}
+    dilate = float(dilate_m)
+    out: list[dict[str, float]] = []
+    for sh in shells:
+        if not isinstance(sh, dict) or str(sh.get("kind") or "") not in kind_set:
+            continue
+        aabb = sh.get("aabb_enu") or []
+        if len(aabb) < 2:
+            continue
+        try:
+            es = [float(p[0]) for p in aabb]
+            ns = [float(p[1]) for p in aabb]
+        except (TypeError, ValueError, IndexError):
+            continue
+        e_lo, e_hi = min(es) - dilate, max(es) + dilate
+        n_lo, n_hi = min(ns) - dilate, max(ns) + dilate
+        z_raw = sh.get("z")
+        try:
+            z = float(z_raw) if z_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            z = float("nan")
+        g_raw = sh.get("ground_z")
+        try:
+            gz = float(g_raw) if g_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            gz = float("nan")
+        out.append(
+            {
+                "id": str(sh.get("id") or ""),
+                "kind": str(sh.get("kind") or ""),
+                "e_lo": float(e_lo),
+                "e_hi": float(e_hi),
+                "n_lo": float(n_lo),
+                "n_hi": float(n_hi),
+                "shell_z": float(z),
+                "ground_z": float(gz),
+            }
+        )
+    return out
+
+
+def load_cam_corridor_aabbs(
+    poses_path: Path,
+    *,
+    half_m: float = DEFAULT_OFFTILE_CAM_CORRIDOR_M,
+) -> list[dict[str, float]]:
+    """Axis-aligned pads around cam ENU (e,n) so the drive path stays in support."""
+    if half_m <= 0 or not poses_path.is_file():
+        return []
+    raw = json.loads(poses_path.read_text(encoding="utf-8"))
+    poses = raw if isinstance(raw, list) else (raw.get("poses") or raw.get("cameras") or [])
+    if not isinstance(poses, list):
+        return []
+    r = float(half_m)
+    out: list[dict[str, float]] = []
+    for i, p in enumerate(poses):
+        if not isinstance(p, dict):
+            continue
+        try:
+            e = float(p.get("e", p.get("e_gps")))
+            n = float(p.get("n", p.get("n_gps")))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(e) and math.isfinite(n)):
+            continue
+        out.append(
+            {
+                "id": f"cam_{i}",
+                "kind": "cam",
+                "e_lo": e - r,
+                "e_hi": e + r,
+                "n_lo": n - r,
+                "n_hi": n + r,
+                "shell_z": float("nan"),
+                "ground_z": float("nan"),
+            }
+        )
+    return out
+
+
+def dist_xy_to_support(e: float, n: float, aabbs: list[dict[str, float]]) -> float:
+    """Min XY distance to any AABB; 0 if inside at least one."""
+    if not aabbs:
+        return float("inf")
+    best = float("inf")
+    for a in aabbs:
+        dx = 0.0
+        if e < a["e_lo"]:
+            dx = a["e_lo"] - e
+        elif e > a["e_hi"]:
+            dx = e - a["e_hi"]
+        dy = 0.0
+        if n < a["n_lo"]:
+            dy = a["n_lo"] - n
+        elif n > a["n_hi"]:
+            dy = n - a["n_hi"]
+        d = math.hypot(dx, dy)
+        if d < best:
+            best = d
+            if best == 0.0:
+                return 0.0
+    return float(best)
+
+
+def resolve_local_ground_z(
+    roofs_json: Path,
+    *,
+    cloud_zs: list[float] | None = None,
+) -> float:
+    """Ground reference for off-tile z_out gate — not BAG.
+
+    Order: ``cam_u_median - 2.5``, else median yard shell z, else cloud p10, else 0.
+    """
+    cam_u = None
+    yard_zs: list[float] = []
+    if roofs_json.is_file():
+        data = json.loads(roofs_json.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            raw_cam = data.get("cam_u_median")
+            try:
+                if raw_cam is not None and math.isfinite(float(raw_cam)):
+                    cam_u = float(raw_cam)
+            except (TypeError, ValueError):
+                cam_u = None
+            shells = data.get("shells") or []
+            if isinstance(shells, list):
+                for sh in shells:
+                    if not isinstance(sh, dict) or sh.get("kind") != "yard":
+                        continue
+                    try:
+                        z = float(sh["z"])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if math.isfinite(z):
+                        yard_zs.append(z)
+    if cam_u is not None:
+        return float(cam_u) - 2.5
+    if yard_zs:
+        yard_zs.sort()
+        return float(yard_zs[len(yard_zs) // 2])
+    if cloud_zs:
+        zs = sorted(float(z) for z in cloud_zs if math.isfinite(float(z)))
+        if zs:
+            idx = max(0, min(len(zs) - 1, int(0.10 * (len(zs) - 1))))
+            return float(zs[idx])
+    return 0.0
+
+
+def offtile_ply_against_support(
+    path: Path,
+    support: list[dict[str, float]],
+    *,
+    far_m: float = DEFAULT_OFFTILE_FAR_M,
+    z_out_m: float = DEFAULT_OFFTILE_Z_OUT_M,
+    local_ground_z: float = 0.0,
+    dest: Path | None = None,
+) -> dict[str, Any]:
+    """Soft support gate: keep in dilated support; drop far halo / sky smear.
+
+    Sacred: not Ortho XY±2 m; façades untouched; yards inside support kept.
+    """
+    if not path.is_file():
+        return {
+            "kept": 0,
+            "dropped": 0,
+            "dropped_far": 0,
+            "dropped_z": 0,
+            "far_m": float(far_m),
+            "z_out_m": float(z_out_m),
+            "local_ground_z": float(local_ground_z),
+            "skipped": True,
+            "reason": "missing_ply",
+        }
+    if not support:
+        return {
+            "kept": 0,
+            "dropped": 0,
+            "dropped_far": 0,
+            "dropped_z": 0,
+            "far_m": float(far_m),
+            "z_out_m": float(z_out_m),
+            "local_ground_z": float(local_ground_z),
+            "skipped": True,
+            "reason": "no_support",
+        }
+
+    far = float(far_m)
+    z_out = float(z_out_m)
+    gnd = float(local_ground_z)
+    dropped_far = 0
+    dropped_z = 0
+
+    def keep_xyz(x: float, y: float, z: float) -> bool:
+        nonlocal dropped_far, dropped_z
+        d = dist_xy_to_support(x, y, support)
+        if d <= 0.0:
+            return True
+        if z > gnd + z_out:
+            dropped_z += 1
+            return False
+        if d > far:
+            dropped_far += 1
+            return False
+        return True
+
+    kept, dropped, out_path = _filter_ply_by_xyz(path, keep_xyz, dest=dest)
+    log.info(
+        "offtile_ply_against_support %s: kept=%s dropped=%s (far=%s z=%s) "
+        "far_m=%.1f z_out_m=%.1f gnd=%.2f support=%s",
+        out_path.name,
+        kept,
+        dropped,
+        dropped_far,
+        dropped_z,
+        far,
+        z_out,
+        gnd,
+        len(support),
+    )
+    return {
+        "kept": int(kept),
+        "dropped": int(dropped),
+        "dropped_far": int(dropped_far),
+        "dropped_z": int(dropped_z),
+        "far_m": float(far),
+        "z_out_m": float(z_out),
+        "local_ground_z": float(gnd),
+        "n_support": len(support),
+        "path": str(out_path),
+        "source": str(path),
+    }
+
+
+def offtile_recon_clouds(
+    recon_dir: Path,
+    *,
+    dilate_m: float = DEFAULT_OFFTILE_DILATE_M,
+    far_m: float = DEFAULT_OFFTILE_FAR_M,
+    z_out_m: float = DEFAULT_OFFTILE_Z_OUT_M,
+    cam_corridor_m: float = DEFAULT_OFFTILE_CAM_CORRIDOR_M,
+    poses_path: Path | None = None,
+    ply_names: tuple[str, ...] = ("cloud.ply",),
+    replace_product: bool = False,
+) -> dict[str, Any]:
+    """Opt-in soft support gate: write ``cloud_offtile.ply`` (+ bak).
+
+    Dilates roof∪yard∪street (~10 m); drops pts farther than ``far_m`` from
+    support or with z ≫ local ground (+``z_out_m``). Never Ortho±2 m XY clip;
+    façades/roofs shells untouched; default product stays ``cloud.ply``.
+    """
+    roofs_path = Path(recon_dir) / "roofs.json"
+    support = load_support_shell_aabbs(
+        roofs_path, kinds=("roof", "yard", "street"), dilate_m=dilate_m
+    )
+    n_shell = len(support)
+    if poses_path is None:
+        # recon/ -> run root -> align/poses.json
+        guess = Path(recon_dir).parent / "align" / "poses.json"
+        poses_path = guess if guess.is_file() else None
+    n_cam = 0
+    if poses_path is not None and float(cam_corridor_m) > 0:
+        cams = load_cam_corridor_aabbs(Path(poses_path), half_m=float(cam_corridor_m))
+        n_cam = len(cams)
+        support = support + cams
+
+    local_gnd = resolve_local_ground_z(roofs_path)
+    summary: dict[str, Any] = {
+        "dilate_m": float(dilate_m),
+        "far_m": float(far_m),
+        "z_out_m": float(z_out_m),
+        "cam_corridor_m": float(cam_corridor_m),
+        "local_ground_z": float(local_gnd),
+        "n_support_shells": int(n_shell),
+        "n_cam_pads": int(n_cam),
+        "n_support": len(support),
+        "replace_product": bool(replace_product),
+        "clouds": {},
+    }
+    if not support:
+        summary["skipped"] = True
+        summary["reason"] = "no_support"
+        summary["kept"] = 0
+        summary["dropped"] = 0
+        summary["dropped_far"] = 0
+        summary["dropped_z"] = 0
+        return summary
+
+    total_kept = 0
+    total_dropped = 0
+    total_far = 0
+    total_z = 0
+    for name in ply_names:
+        src = Path(recon_dir) / name
+        if not src.is_file():
+            continue
+        if name == "cloud.ply":
+            dest_name = "cloud_offtile.ply"
+        elif name.endswith(".ply"):
+            dest_name = name[:-4] + "_offtile.ply"
+        else:
+            dest_name = name + "_offtile"
+        dest = Path(recon_dir) / dest_name
+        if dest.is_file():
+            bak = Path(str(dest) + ".bak")
+            bak.write_bytes(dest.read_bytes())
+        src_bak = Path(str(src) + ".bak")
+        if replace_product and src.is_file() and not src_bak.is_file():
+            src_bak.write_bytes(src.read_bytes())
+
+        try:
+            stats = offtile_ply_against_support(
+                src,
+                support,
+                far_m=far_m,
+                z_out_m=z_out_m,
+                local_ground_z=local_gnd,
+                dest=dest,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("offtile: skip %s (%s)", src, exc)
+            summary["clouds"][name] = {"error": str(exc)}
+            continue
+
+        if replace_product and dest.is_file():
+            src.write_bytes(dest.read_bytes())
+
+        summary["clouds"][name] = stats
+        total_kept += int(stats.get("kept", 0))
+        total_dropped += int(stats.get("dropped", 0))
+        total_far += int(stats.get("dropped_far", 0))
+        total_z += int(stats.get("dropped_z", 0))
+
+    summary["kept"] = total_kept
+    summary["dropped"] = total_dropped
+    summary["dropped_far"] = total_far
+    summary["dropped_z"] = total_z
+    return summary
+
 
 
 def seat_recon_artefacts(
