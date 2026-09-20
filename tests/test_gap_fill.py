@@ -12,6 +12,9 @@ import pytest
 
 from ps1_hood.reconstruct.facades import _is_strictly_better, extract_facades
 from ps1_hood.reconstruct.gap_fill import (
+    GAP_ADD_MAX_ADDS,
+    GAP_ADD_MIN_VIEWS,
+    GAP_ADD_SAT_EDGE_M,
     GAP_FILL_MAX_KEEP,
     GAP_FILL_PEEL_CAP,
     WORST_CAM_DISTANCES_M,
@@ -20,14 +23,17 @@ from ps1_hood.reconstruct.gap_fill import (
     corner_seeds_from_roof_aabbs,
     count_untextured_product,
     estimate_travel_heading_deg,
+    filter_gap_adds,
     filter_hyps_visible_in_cams,
     filter_ma_peels_for_gaps,
     find_frame_for_cam_id,
+    gap_add_multiview_ok,
     load_worst_cam_ids_from_compare,
     manhattan_side_seeds,
     parse_cam_id,
     prefer_side_wall_order,
     reject_road_center_hyps,
+    sat_aabb_edge_ok,
     worst_cam_seeds,
 )
 from ps1_hood.reconstruct.planarize import is_a_source, is_ma_source
@@ -471,3 +477,144 @@ def test_cli_worst_cams_options() -> None:
     assert "--worst-cams" in result.output
     assert "--worst-from-compare" in result.output
     assert "--gap-fill" in result.output
+    assert "--max-gap-adds" in result.output
+    assert "--sat-aabb-gate" in result.output
+    assert "--ma-peel-cap" in result.output
+    assert "--gap-min-views" in result.output
+    assert "--gap-seeds" in result.output
+
+
+def test_gap_fill_peel_cap_default_3() -> None:
+    assert GAP_FILL_PEEL_CAP == 3
+    assert GAP_ADD_MAX_ADDS == 3
+    assert GAP_ADD_MIN_VIEWS == 2
+    assert GAP_ADD_SAT_EDGE_M == 2.0
+
+
+def test_sat_aabb_edge_gate_on_boundary() -> None:
+    regions = [
+        {
+            "kind": "roof",
+            "aabb_enu": [(10.0, 10.0), (20.0, 10.0), (20.0, 18.0), (10.0, 18.0)],
+        }
+    ]
+    # Center on south edge (n=10), normal +N → aligns with south-edge outward (-N)? 
+    # South edge tangent = +E; outward from interior = -N = (0,-1).
+    # Plane facing south (normal 0,-1) → |n·n_edge|=1.
+    center = np.array([15.0, 10.0, 4.0])
+    n_out = np.array([0.0, -1.0, 0.0])
+    ok, why = sat_aabb_edge_ok(center, n_out, regions, max_edge_m=2.0)
+    assert ok, why
+    # Far from any roof
+    far = np.array([50.0, 50.0, 4.0])
+    ok2, why2 = sat_aabb_edge_ok(far, n_out, regions, max_edge_m=2.0)
+    assert not ok2
+    assert "sat_aabb_edge" in why2
+    # Soft-pass with no roofs
+    ok3, why3 = sat_aabb_edge_ok(far, n_out, [], max_edge_m=2.0)
+    assert ok3
+    assert "soft_pass" in why3
+
+
+def test_sat_aabb_rejects_misaligned_normal() -> None:
+    regions = [
+        {
+            "kind": "roof",
+            "aabb_enu": [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        }
+    ]
+    center = np.array([5.0, 0.0, 4.0])  # on south edge
+    n_parallel_to_edge = np.array([1.0, 0.0, 0.0])  # along +E = tangent, not outward
+    ok, why = sat_aabb_edge_ok(center, n_parallel_to_edge, regions)
+    assert not ok
+    assert "align" in why
+
+
+def test_gap_add_multiview_requires_two_cams() -> None:
+    frames = [
+        _frame(0.0, 0.0, 90.0, travel=0.0, i=0),
+        _frame(0.0, 5.0, 90.0, travel=0.0, i=1),
+        _frame(0.0, 10.0, 90.0, travel=0.0, i=2),
+    ]
+    # Plane facing -E (toward cams looking +E): n=(-1,0), cam_fwd=(1,0) → |n·fwd|=1
+    good = {
+        "n": np.array([-1.0, 0.0, 0.0]),
+        "center": np.array([10.0, 5.0, 4.0]),
+        "zncc": 0.42,
+        "scores": [0.45, 0.38],
+        "view_indices": [0, 1, 2],
+        "source": "ma_segment",
+    }
+    ok, why = gap_add_multiview_ok(good, frames)
+    assert ok, why
+    # Only one weak source score + low mean → fail
+    weak = {
+        **good,
+        "zncc": 0.20,
+        "scores": [0.20],
+    }
+    ok2, why2 = gap_add_multiview_ok(weak, frames)
+    assert not ok2
+    # Grazing: plane normal nearly ⟂ cam forward (n=+N, cams look +E)
+    grazing = {
+        "n": np.array([0.0, 1.0, 0.0]),
+        "center": np.array([10.0, 5.0, 4.0]),
+        "zncc": 0.50,
+        "scores": [0.50, 0.48],
+        "view_indices": [0, 1],
+        "source": "manhattan",
+    }
+    ok3, why3 = gap_add_multiview_ok(grazing, frames)
+    assert not ok3
+    assert "grazing" in why3
+    # Low median
+    low_med = {
+        **good,
+        "zncc": 0.36,
+        "scores": [0.70, -0.40, -0.35],  # median < 0.10
+    }
+    ok4, why4 = gap_add_multiview_ok(low_med, frames)
+    assert not ok4
+    assert "median" in why4
+
+
+def test_filter_gap_adds_cap_and_prefer_non_ma() -> None:
+    frames = [
+        _frame(0.0, 0.0, 90.0, travel=0.0, i=0),
+        _frame(0.0, 5.0, 90.0, travel=0.0, i=1),
+        _frame(0.0, 10.0, 90.0, travel=0.0, i=2),
+    ]
+    regions = [
+        {
+            "kind": "roof",
+            "aabb_enu": [(8.0, 0.0), (12.0, 0.0), (12.0, 20.0), (8.0, 20.0)],
+        }
+    ]
+    def _pl(src: str, z: float, n_y: float = 0.0) -> dict:
+        return {
+            "n": np.array([-1.0, n_y, 0.0]),
+            "center": np.array([8.0, 5.0 + z, 4.0]),  # on west roof edge
+            "zncc": z,
+            "scores": [z, z - 0.02],
+            "view_indices": [0, 1, 2],
+            "source": src,
+        }
+    planes = [
+        _pl("ma_segment", 0.50),
+        _pl("ma_gap_manhattan", 0.45),
+        _pl("ma_gap_worst_cam", 0.40),
+        _pl("ma_segment", 0.55),
+    ]
+    kept = filter_gap_adds(
+        planes,
+        frames,
+        roof_regions=regions,
+        sat_aabb_gate_m=2.0,
+        max_gap_adds=3,
+    )
+    assert len(kept) <= 3
+    # Non-ma_segment preferred in ranking — first slots should not all be ma_segment
+    # With cap 3 and 2 non-ma + 2 ma, expect both non-ma kept
+    srcs = [p["source"] for p in kept]
+    assert "ma_gap_manhattan" in srcs
+    assert "ma_gap_worst_cam" in srcs

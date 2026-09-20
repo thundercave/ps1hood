@@ -56,6 +56,9 @@ rg -n "worst_cam|gap_fill|candidate NOT promoted|prefer_frames|union_kept" \
 
 ---
 
+
+See also [`gap-fill-stricter-multiview.md`](gap-fill-stricter-multiview.md) (gap-add multi-view + sat AABB + peel/add caps).
+
 ## Non-goals
 
 Densify · free-pose · roof Z / floater fix · global `peel_max` inflate

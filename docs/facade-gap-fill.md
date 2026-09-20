@@ -68,6 +68,9 @@ See also [`worst-cam-gap-fill.md`](worst-cam-gap-fill.md) for targeted seeds tow
 
 ---
 
+
+Stricter gap-add gates: [`gap-fill-stricter-multiview.md`](gap-fill-stricter-multiview.md).
+
 ## Non-goals
 
 BAG/OSM shells · free-pose · peel-as-hero (peel_max >32) · PS1 polish before gaps closed · hungry cloud clip

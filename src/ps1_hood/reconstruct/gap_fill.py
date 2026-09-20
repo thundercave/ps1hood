@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 # Recipe knobs
 GAP_FILL_DISTANCES_M = (6.0, 10.0, 14.0, 18.0)
-GAP_FILL_PEEL_CAP = 32
+GAP_FILL_PEEL_CAP = 3  # rethink: cap MA peels; was 32 (spam → clutter)
 GAP_FILL_MAX_KEEP = 24
 GAP_FILL_MIN_FRONTAL = 0.20  # far-side only (default Path α = 0.25)
 GAP_FILL_CAM_MARGIN_M = 3.0
@@ -34,6 +34,17 @@ WORST_CAM_DISTANCES_M = (8.0, 12.0, 16.0, 20.0)
 WORST_CAM_YAWS_DEG = (0.0, 45.0, -45.0, 90.0, -90.0)
 WORST_CAM_MIN_FRONTAL = 0.25
 WORST_CAM_HYP_CAP = 40
+
+# Stricter multi-view + sat AABB for *gap adds only* (not product_lock)
+GAP_ADD_MIN_ZNCC = 0.35
+GAP_ADD_MIN_VIEWS = 2  # ZNCC ≥ min on ≥ this many pair scores / cams
+GAP_ADD_MEDIAN_MIN = 0.10  # reject if median ZNCC over scoring views < this
+GAP_ADD_MIN_MAX_FRONTAL = 0.4  # reject if max |n·cam_fwd| over scoring cams < this
+GAP_ADD_SAT_EDGE_M = 2.0  # center within this of a roof AABB *boundary* edge
+GAP_ADD_SAT_EDGE_ALIGN = 0.7  # |n · edge_tangent| ≥ this (plane ∥ edge)
+GAP_ADD_MAX_ADDS = 3  # hard cap on new planes after gates
+GAP_SEEDS_MODES = ("legacy", "sat-edge")
+DEFAULT_GAP_SEEDS = "legacy"  # sat-edge seeds land in follow-up; gate ships now
 
 
 def estimate_travel_heading_deg(frames: list[dict[str, Any]]) -> float | None:
@@ -716,3 +727,309 @@ def filter_ma_peels_for_gaps(
         )
         filtered = filtered[:peel_cap]
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Stricter multi-view + sat AABB gates (gap adds only — never product_lock)
+# ---------------------------------------------------------------------------
+
+
+def _aabb_edges_xy(
+    aabb_enu: list | tuple,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Return (p0, p1, tangent_unit) for each AABB boundary edge (XY)."""
+    pts = [(float(p[0]), float(p[1])) for p in aabb_enu]
+    if len(pts) < 2:
+        return []
+    # Close ring if needed
+    if pts[0] != pts[-1]:
+        pts = list(pts) + [pts[0]]
+    edges: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for i in range(len(pts) - 1):
+        a = np.array(pts[i], dtype=np.float64)
+        b = np.array(pts[i + 1], dtype=np.float64)
+        t = b - a
+        tn = float(np.linalg.norm(t))
+        if tn < 1e-6:
+            continue
+        edges.append((a, b, t / tn))
+    return edges
+
+
+def dist_point_to_segment_xy(
+    p: np.ndarray, a: np.ndarray, b: np.ndarray
+) -> float:
+    """Euclidean distance from XY point to segment a→b."""
+    p = np.asarray(p, dtype=np.float64)[:2]
+    a = np.asarray(a, dtype=np.float64)[:2]
+    b = np.asarray(b, dtype=np.float64)[:2]
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.clip(((p - a) @ ab) / L2, 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def nearest_roof_boundary(
+    center_xy: np.ndarray,
+    regions: list[dict[str, Any]],
+) -> tuple[float, np.ndarray | None, dict[str, Any] | None]:
+    """Nearest sat roof AABB boundary edge to center.
+
+    Returns (dist_m, edge_tangent_xy or None, region or None).
+    Skips yards. Soft-empty when no roofs.
+    """
+    c = np.asarray(center_xy, dtype=np.float64)[:2]
+    best_d = float("inf")
+    best_t: np.ndarray | None = None
+    best_reg: dict[str, Any] | None = None
+    for reg in regions:
+        kind = reg.get("kind")
+        if kind == "yard":
+            continue
+        aabb = reg.get("aabb_enu")
+        if not aabb or len(aabb) < 2:
+            continue
+        for a, b, tang in _aabb_edges_xy(aabb):
+            d = dist_point_to_segment_xy(c, a, b)
+            if d < best_d:
+                best_d = d
+                best_t = tang
+                best_reg = reg
+    if best_t is None:
+        return float("inf"), None, None
+    return float(best_d), best_t, best_reg
+
+
+def sat_aabb_edge_ok(
+    center: np.ndarray,
+    n: np.ndarray,
+    regions: list[dict[str, Any]] | None,
+    *,
+    max_edge_m: float = GAP_ADD_SAT_EDGE_M,
+    min_align: float = GAP_ADD_SAT_EDGE_ALIGN,
+) -> tuple[bool, str]:
+    """Hard gate: center ≤ max_edge_m of a roof boundary + n ∥ edge.
+
+    Soft-pass when no roof regions (can't gate without sat footprints).
+    """
+    if not regions:
+        return True, "no_roofs_soft_pass"
+    d, tang, _reg = nearest_roof_boundary(center, regions)
+    if not math.isfinite(d) or tang is None:
+        return True, "no_roofs_soft_pass"
+    if d > float(max_edge_m):
+        return False, f"sat_aabb_edge dist={d:.2f}>{max_edge_m}"
+    n_xy = np.asarray(n, dtype=np.float64)[:2]
+    nn = float(np.linalg.norm(n_xy))
+    if nn < 1e-9:
+        return False, "sat_aabb_edge degenerate_n"
+    n_xy = n_xy / nn
+    # Plane ≈ parallel to edge ⇒ normal ⟂ tangent ⇒ |n · tang| small;
+    # pack asks |n · edge_tangent| ≥ 0.7 meaning plane normal aligns with…
+    # Re-read: "|n · edge_tangent| ≥ 0.7  # plane ≈ parallel to that roof edge"
+    # If n is plane normal and edge_tangent is along the wall, parallel plane
+    # means n ⟂ tangent → |n·t| ≈ 0. That's the opposite of ≥0.7.
+    # They likely meant |n · edge_outward_normal| ≥ 0.7, OR
+    # |n × k · tangent| / alignment of plane with edge.
+    # For a vertical wall along edge tangent t=(tx,ty), plane normal should be
+    # perpendicular to t: |n·t| small. Pack text says ≥0.7 with comment
+    # "plane ≈ parallel to that roof edge" — that's inconsistent with ·tangent.
+    # Interpret as: rotate tangent 90° → edge outward in XY; |n · n_edge| ≥ 0.7.
+    n_edge = np.array([-float(tang[1]), float(tang[0])], dtype=np.float64)
+    align = abs(float(n_xy @ n_edge))
+    if align < float(min_align):
+        return False, f"sat_aabb_align |n·n_edge|={align:.2f}<{min_align}"
+    return True, f"sat_aabb_ok d={d:.2f} align={align:.2f}"
+
+
+def cam_forward_xy(frame: dict[str, Any]) -> np.ndarray:
+    h = math.radians(float(frame.get("heading") or 0.0))
+    return np.array([math.sin(h), math.cos(h)], dtype=np.float64)
+
+
+def max_abs_n_dot_cam_fwd(
+    n: np.ndarray,
+    frames: list[dict[str, Any]],
+    view_indices: list[int] | None,
+) -> float:
+    """Max |n_xy · cam_fwd| over scoring cams (grazing if this is small)."""
+    n_xy = np.asarray(n, dtype=np.float64)[:2]
+    nn = float(np.linalg.norm(n_xy))
+    if nn < 1e-9:
+        return 0.0
+    n_xy = n_xy / nn
+    idxs = list(view_indices) if view_indices else list(range(len(frames)))
+    best = 0.0
+    for i in idxs:
+        if i < 0 or i >= len(frames):
+            continue
+        fwd = cam_forward_xy(frames[i])
+        best = max(best, abs(float(n_xy @ fwd)))
+    return float(best)
+
+
+def gap_add_multiview_ok(
+    plane: dict[str, Any],
+    frames: list[dict[str, Any]],
+    *,
+    min_zncc: float = GAP_ADD_MIN_ZNCC,
+    min_views: int = GAP_ADD_MIN_VIEWS,
+    median_min: float = GAP_ADD_MEDIAN_MIN,
+    min_max_frontal: float = GAP_ADD_MIN_MAX_FRONTAL,
+) -> tuple[bool, str]:
+    """Stricter multi-view accept for gap adds (not locked product).
+
+    - ≥ min_views pairwise/source scores with ZNCC ≥ min_zncc
+    - median of finite scores ≥ median_min
+    - max |n·cam_fwd| over scoring cams ≥ min_max_frontal (else grazing)
+    """
+    scores_raw = plane.get("scores")
+    scores: list[float] = []
+    if isinstance(scores_raw, (list, tuple)):
+        for s in scores_raw:
+            try:
+                v = float(s)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                scores.append(v)
+    # Fallback: single aggregate zncc counts as one cam score
+    if not scores:
+        z = plane.get("zncc")
+        try:
+            zv = float(z) if z is not None else float("nan")
+        except (TypeError, ValueError):
+            zv = float("nan")
+        if math.isfinite(zv):
+            scores = [zv]
+
+    n_good = sum(1 for s in scores if s >= float(min_zncc))
+    # Pairwise scores are ref↔source; count ref too when aggregate mean ≥ min
+    # so a single strong pair with mean≥min yields 2 cams (ref+source).
+    z_mean = float("nan")
+    try:
+        if plane.get("zncc") is not None:
+            z_mean = float(plane["zncc"])
+    except (TypeError, ValueError):
+        z_mean = float("nan")
+    n_cams = int(n_good)
+    if math.isfinite(z_mean) and z_mean >= float(min_zncc):
+        n_cams = int(n_good) + 1
+    if n_cams < int(min_views):
+        return (
+            False,
+            f"multiview n_cams={n_cams}<{min_views} "
+            f"(n_good_src={n_good}, need ZNCC≥{min_zncc})",
+        )
+    med = float(np.median(scores)) if scores else float("nan")
+    if not math.isfinite(med) or med < float(median_min):
+        return False, f"multiview median={med:.3f}<{median_min}"
+
+    n = np.asarray(plane.get("n"), dtype=np.float64)
+    view_idx = plane.get("view_indices")
+    idxs = list(view_idx) if isinstance(view_idx, (list, tuple)) else None
+    max_fr = max_abs_n_dot_cam_fwd(n, frames, idxs)
+    if max_fr < float(min_max_frontal):
+        return False, f"grazing max|n·fwd|={max_fr:.3f}<{min_max_frontal}"
+    return True, (
+        f"multiview ok n_cams={n_cams} n_good_src={n_good} "
+        f"med={med:.3f} max_fr={max_fr:.3f}"
+    )
+
+
+def filter_gap_adds(
+    planes: list[dict[str, Any]],
+    frames: list[dict[str, Any]],
+    *,
+    roof_regions: list[dict[str, Any]] | None = None,
+    sat_aabb_gate_m: float | None = GAP_ADD_SAT_EDGE_M,
+    sat_align: float = GAP_ADD_SAT_EDGE_ALIGN,
+    min_zncc: float = GAP_ADD_MIN_ZNCC,
+    min_views: int = GAP_ADD_MIN_VIEWS,
+    median_min: float = GAP_ADD_MEDIAN_MIN,
+    min_max_frontal: float = GAP_ADD_MIN_MAX_FRONTAL,
+    max_gap_adds: int = GAP_ADD_MAX_ADDS,
+) -> list[dict[str, Any]]:
+    """Apply sat AABB + multi-view gates to gap-add candidates; cap count.
+
+    Does **not** filter ``product_lock`` (caller should only pass new adds).
+    Soft-passes sat AABB when ``sat_aabb_gate_m`` is None/≤0 or no roofs.
+    """
+    if not planes:
+        return []
+    regions = list(roof_regions or [])
+    kept: list[dict[str, Any]] = []
+    n_mv = n_sat = 0
+    for p in planes:
+        src = str(p.get("source") or "")
+        if src == "product_lock":
+            kept.append(p)
+            continue
+        ok_mv, why_mv = gap_add_multiview_ok(
+            p,
+            frames,
+            min_zncc=min_zncc,
+            min_views=min_views,
+            median_min=median_min,
+            min_max_frontal=min_max_frontal,
+        )
+        if not ok_mv:
+            n_mv += 1
+            log.info("gap_fill reject multiview [%s]: %s", src, why_mv)
+            continue
+        if sat_aabb_gate_m is not None and float(sat_aabb_gate_m) > 0:
+            center = np.asarray(
+                p.get("center") if p.get("center") is not None else p.get("quad_center"),
+                dtype=np.float64,
+            )
+            if center.size < 2 and p.get("corners") is not None:
+                center = np.asarray(p["corners"], dtype=np.float64).reshape(-1, 3).mean(
+                    axis=0
+                )
+            n = np.asarray(p.get("n"), dtype=np.float64)
+            ok_sat, why_sat = sat_aabb_edge_ok(
+                center,
+                n,
+                regions,
+                max_edge_m=float(sat_aabb_gate_m),
+                min_align=float(sat_align),
+            )
+            if not ok_sat:
+                n_sat += 1
+                log.info("gap_fill reject sat_aabb [%s]: %s", src, why_sat)
+                continue
+            p = dict(p)
+            p["gap_sat_gate"] = why_sat
+        p = dict(p)
+        p["gap_multiview"] = why_mv
+        kept.append(p)
+
+    # Prefer non-ma_segment, then higher ZNCC; cap
+    def _rank(pl: dict[str, Any]) -> tuple[int, float]:
+        src = str(pl.get("source") or "")
+        ma_pen = 1 if ("ma_segment" in src or src == "ma_segment") else 0
+        z = float(pl.get("zncc") or 0.0)
+        return (ma_pen, -z)
+
+    kept.sort(key=_rank)
+    if len(kept) > int(max_gap_adds):
+        log.info(
+            "gap_fill: capping gap adds %s → %s (max_gap_adds)",
+            len(kept),
+            max_gap_adds,
+        )
+        kept = kept[: int(max_gap_adds)]
+    log.info(
+        "gap_fill filter_gap_adds: in=%s out=%s reject_mv=%s reject_sat=%s "
+        "sat_gate_m=%s min_views=%s max_adds=%s",
+        len(planes),
+        len(kept),
+        n_mv,
+        n_sat,
+        sat_aabb_gate_m,
+        min_views,
+        max_gap_adds,
+    )
+    return kept

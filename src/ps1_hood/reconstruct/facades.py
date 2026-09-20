@@ -806,6 +806,11 @@ def extract_facades(
     project_root: Path | None = None,
     worst_cam_ids: list[str] | None = None,
     worst_from_compare: int | None = None,
+    max_gap_adds: int | None = None,
+    sat_aabb_gate_m: float | None = None,
+    ma_peel_cap: int | None = None,
+    gap_min_views: int | None = None,
+    gap_seeds_mode: str | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -849,7 +854,13 @@ def extract_facades(
 
     PR-C ``gap_fill``: keep product / A core; add ZNCC-gated manhattan + sat
     corner seeds and road-rejected MA peels for side/return walls; ``a_priority``
-    union; quality-keep vs existing product. Cap peels ≤32. No BAG, no peel-as-hero.
+    union; quality-keep vs existing product. Cap MA peels (default ≤3). No BAG.
+
+    Gap-*adds* only (not product_lock) also pass stricter multi-view + sat AABB:
+    ZNCC≥0.35 on ≥``gap_min_views`` cams, median ZNCC≥0.10, max |n·cam_fwd|≥0.4,
+    center ≤``sat_aabb_gate_m`` of a roof boundary with n∥edge; cap with
+    ``max_gap_adds``. Soft-pass sat gate when no roofs. ``gap_seeds_mode=sat-edge``
+    is reserved (legacy manhattan/worst-cam seeds remain default).
 
     Worst-cam targeted gap-fill: ``worst_cam_ids`` / ``worst_from_compare`` seed
     planes in front of those cams (dist×yaw); filter manhattan/corner to visible
@@ -1089,7 +1100,7 @@ def extract_facades(
                 keep_cap = max(int(n_planes), int(GAP_FILL_MAX_KEEP))
                 peel_cap = min(
                     int(peel_n),
-                    int(GAP_FILL_PEEL_CAP),
+                    int(ma_peel_cap) if ma_peel_cap is not None else int(GAP_FILL_PEEL_CAP),
                 )
                 root = Path(project_root) if project_root is not None else dest_obj.parent.parent
                 # Resolve worst-cam ids (CLI list and/or compare top-N)
@@ -1139,14 +1150,22 @@ def extract_facades(
                     worst_cam_ids=worst_ids or None,
                 )
                 min_frontal_ma = float(GAP_FILL_MIN_FRONTAL)
+                if gap_seeds_mode and str(gap_seeds_mode) not in {"legacy", "", "None"}:
+                    log.info(
+                        "facades gap_fill: gap_seeds_mode=%r reserved "
+                        "(sat-edge seeds = follow-up; using legacy manhattan/worst-cam)",
+                        gap_seeds_mode,
+                    )
                 log.info(
                     "facades gap_fill: ma_peels=%s→%s gap_seeds=%s "
-                    "min_frontal=%.2f keep_cap=%s worst_cams=%s prefer_frames=%s",
+                    "min_frontal=%.2f keep_cap=%s peel_cap=%s worst_cams=%s "
+                    "prefer_frames=%s",
                     len(hyps),
                     len(ma_hyps),
                     len(gap_seeds),
                     min_frontal_ma,
                     keep_cap,
+                    peel_cap,
                     worst_ids or None,
                     prefer_frame_idxs,
                 )
@@ -1187,6 +1206,49 @@ def extract_facades(
             accepted_new = (
                 [_tag_gap_addable(p) for p in accepted_ma] if gap_fill else list(accepted_ma)
             )
+            if gap_fill and accepted_new:
+                from ps1_hood.reconstruct.gap_fill import (
+                    GAP_ADD_MAX_ADDS,
+                    GAP_ADD_MIN_VIEWS,
+                    GAP_ADD_SAT_EDGE_M,
+                    filter_gap_adds,
+                    load_sat_roof_regions,
+                )
+
+                _sat_m = (
+                    float(GAP_ADD_SAT_EDGE_M)
+                    if sat_aabb_gate_m is None
+                    else float(sat_aabb_gate_m)
+                )
+                _min_views = (
+                    int(GAP_ADD_MIN_VIEWS)
+                    if gap_min_views is None
+                    else int(gap_min_views)
+                )
+                _max_adds = (
+                    int(GAP_ADD_MAX_ADDS)
+                    if max_gap_adds is None
+                    else int(max_gap_adds)
+                )
+                roof_regs = load_sat_roof_regions(root)
+                before_gate = len(accepted_new)
+                accepted_new = filter_gap_adds(
+                    accepted_new,
+                    frames,
+                    roof_regions=roof_regs,
+                    sat_aabb_gate_m=_sat_m,
+                    min_views=_min_views,
+                    max_gap_adds=_max_adds,
+                )
+                log.info(
+                    "facades gap_fill stricter gate: %s → %s "
+                    "(sat_aabb=%.2f min_views=%s max_adds=%s)",
+                    before_gate,
+                    len(accepted_new),
+                    _sat_m,
+                    _min_views,
+                    _max_adds,
+                )
             accepted = union_keep_planes(
                 list(accepted_a) + accepted_new,
                 strategy=strategy,
