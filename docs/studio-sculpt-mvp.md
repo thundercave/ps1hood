@@ -1,7 +1,7 @@
 # Studio ENU sculpt MVP
 
 **Date:** 2026-09-20 · Product façades (e.g. 18/18) · complete-scene rank 3  
-**Sacred:** sat absolute XY · **no free-pose** · **don’t wipe product without bak** · cloud stays debug-toggle  
+**Sacred:** sat absolute XY · **no free-pose** · **don’t wipe product without bak** · cloud-first hero (façades overlay; sculpt auto-enables)  
 **Non-goal:** Mapillary garage (`roof_099_e0`) — separate
 
 ## What shipped
@@ -26,6 +26,7 @@ On **save+bake**:
 ## Wire
 
 - Viewer `viewer.html`: sculpt toggle · raycast pick · TransformControls · bake-cam dropdown · save/undo
+- Entering sculpt **auto-enables** `#togFacades` / `facadeRoot` if currently off (cloud left as-is)
 - API: `GET …/planes.json` · `GET …/sculpt/cameras` · `POST …/sculpt` · `POST …/sculpt/undo`
 - Python: `reconstruct/sculpt.py`
 - CLI: `ps1hood sculpt-apply <run> --plane facade_03 --delta-d 0.4` · `sculpt-undo`

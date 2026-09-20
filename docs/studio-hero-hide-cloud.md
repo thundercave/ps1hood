@@ -1,37 +1,37 @@
-# Studio hero — default-hide raw MA cloud
+# Studio hero — cloud-first (raw MA ON)
 
-**Date:** 2026-09-20 · **STOP** further cloud-gate peels (offtile killed high-z; long arms remain in soft fringe)  
-**Sacred:** **don’t delete** product `cloud.ply` / zclean / offtile · façades + sat roofs + street stay · sat XY · no free-pose
+**Date:** 2026-09-20 · User: **cloud-first** (overrides prior default-hide-cloud / PR #48)  
+**Sacred:** sat XY · **don’t delete** `planes.json` / façades / roofs / street on disk · no free-pose
 
 ---
 
 ## Goal
 
-Product Studio view = **complete-looking scene** without MA halo arms:
+Product Studio cold-open = **dense photo / MapAnything point cloud**. Planar façades, sat roofs, and street shells are optional overlays (debug / sculpt / compare) — they read as non-constructive cardboard next to the cloud.
 
 | Layer | Default |
 |---|---|
-| Façades (`facades.obj`) | **ON** |
-| Sat roofs/yards (`roofs.obj`) | **ON** |
-| Sat street/ground (`street.obj`) | **ON** |
-| BAG | **OFF** (already) |
-| Raw MA / recon `cloud.ply` | **OFF** |
+| Raw MA / recon `cloud.ply` | **ON** |
+| Façades (`facades.obj`) | **OFF** (overlay toggle; sculpt auto-enables) |
+| Sat roofs/yards (`roofs.obj`) | **OFF** (overlay) |
+| Sat street/ground (`street.obj`) | **OFF** (overlay) |
+| BAG | **OFF** |
 | `cloud_zclean.ply` | OFF (debug) |
-| `cloud_offtile.ply` | OFF (debug toggle) |
+| `cloud_offtile.ply` | OFF (debug) |
 | SV cams | ON (debug ok) |
-
-User turns **cloud (raw MA)** on when diagnosing densify — not for the hero product look.
 
 ## Wire
 
-`viewer.html`: `#togCloud` unchecked; after `loadAsync(cloud.ply)` set `cloudPoints.visible = false`. Façades + roofs + street stay checked; BAG / zclean / offtile stay off. No server delete; API paths unchanged; `cloud.ply` remains on disk for Path α / densify.
+`viewer.html`: `#togCloud` **checked**; after `loadAsync(cloud.ply)` set `cloudPoints.visible = true`. Façades / roofs / street unchecked + `*.visible = false` after load. BAG / zclean / offtile stay off. Entering **sculpt** auto-checks `#togFacades` and shows `facadeRoot` if currently off (cloud left as user left it).
+
+No server delete; API paths unchanged; `planes.json` / `facades.*` / `roofs.*` / `street.*` remain on disk.
 
 ## Acceptance
 
-- Cold open Studio smoke-dense: façades + sat roofs + street, **no** point-cloud arms
-- Toggle cloud → raw PLY appears; untoggle → gone
-- Files on disk unchanged
+- Cold open Studio: point cloud visible; no façade/roof/street slabs until toggled
+- Toggle façades/roofs/street → overlays appear; files on disk unchanged
+- Sculpt on → façades become visible for pick; BAG still default-off
 
 ## One-liner
 
-*Studio default-hide raw MA cloud; hero = façades + sat roofs/yards + street ground; cloud stays on disk for a debug toggle — stop peeling the fringe.*
+*Studio default: raw MA cloud ON; façades/roofs/street OFF as toggle overlays; product planes stay on disk — stop treating cardboard shells as the hero.*
