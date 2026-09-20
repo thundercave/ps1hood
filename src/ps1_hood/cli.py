@@ -772,10 +772,11 @@ def export_mapanything_bundle_cmd(
 )
 @click.option(
     "--gap-seeds",
-    default="legacy",
+    default="sat-edge",
     show_default=True,
-    type=click.Choice(["legacy", "sat-edge"]),
-    help="Gap seed source: legacy manhattan/worst-cam; sat-edge = follow-up",
+    type=click.Choice(["legacy", "sat-edge", "both"]),
+    help="Gap seeds: sat-edge (uncovered roof AABB + facing cams), "
+    "legacy (manhattan/corner/worst-cam), or both",
 )
 def facades_cmd(
     name: str,
@@ -829,7 +830,8 @@ def facades_cmd(
 
     Gap-add hygiene: ``--sat-aabb-gate`` / ``--gap-min-views`` / ``--max-gap-adds``
     / ``--ma-peel-cap`` tighten multi-view + sat footprint for *new* planes only
-    (product_lock untouched). ``--gap-seeds sat-edge`` reserved for follow-up.
+    (product_lock untouched). ``--gap-seeds sat-edge`` (default) invents
+    uncovered roof-edge hyps; zero facing cams → ``recon/gap_needs.json``.
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades

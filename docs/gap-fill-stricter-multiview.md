@@ -3,7 +3,8 @@
 **Date:** 2026-09-20 · After PR #40 (18→23 promote; compare façade mean ↓)  
 **Goal:** stop clause-2 from promoting volume that hurts global compare  
 **Sacred:** sat XY · no free-pose · don’t auto-revert live 23 (PC triage of +5 is separate)  
-**Out:** densify · free-pose · compare-aware keep (pack §3 C — next) · sat-edge seed invent (follow-up)
+**Out:** densify · free-pose · compare-aware keep (pack §3 C — next)
+**Follow-up shipped:** [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md) (`--gap-seeds sat-edge`)
 
 Packs: `/workspace/gap-fill-compare-regress-rd.md` §3 B · `/workspace/gap-fill-seed-rethink-rd.md` §2 A.
 
@@ -18,7 +19,7 @@ For **gap adds only** (not `product_lock`):
 3. **Cap MA peels** — `--ma-peel-cap` default **3** (was 32).
 4. **Cap gap adds** — `--max-gap-adds` default **3**; prefer non-`ma_segment` when ranking.
 
-Quality-keep / product lock unchanged. `--gap-seeds sat-edge` is reserved (legacy manhattan / worst-cam seeds remain); far-side `gap_needs.json` is follow-up.
+Quality-keep / product lock unchanged. `--gap-seeds sat-edge` (default) invents uncovered roof-edge hyps; zero facing cams → `recon/gap_needs.json` — see [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md).
 
 ---
 
@@ -26,6 +27,7 @@ Quality-keep / product lock unchanged. `--gap-seeds sat-edge` is reserved (legac
 
 ```bash
 uv run ps1hood facades smoke-dense --gap-fill --a-source product \
+  --gap-seeds sat-edge \
   --sat-aabb-gate 2.0 --ma-peel-cap 3 --gap-min-views 2 --max-gap-adds 3 \
   --zncc-accept 0.35 --max-planes 24
 ```
@@ -36,7 +38,7 @@ uv run ps1hood facades smoke-dense --gap-fill --a-source product \
 
 ## Non-goals
 
-Densify · free-pose · wipe / auto-revert the live 23 · sat-edge seed invent · compare-aware promote (§3 C)
+Densify · free-pose · wipe / auto-revert live product · compare-aware promote (§3 C)
 
 ---
 

@@ -662,11 +662,11 @@ def is_a_source(src: str | None) -> bool:
     """Milestone A family: heading×distance / manhattan / sparse / photo_* / product lock.
 
     ``corner_sat`` = PR-C gap-fill corner wraps from sat roof AABB (hypotheses only).
-    ``worst_cam`` / ``ma_gap_*`` are *addable* (not locked A) so a_priority keeps
-    product_lock first and NMS-adds new only.
+    ``worst_cam`` / ``sat_edge`` / ``ma_gap_*`` are *addable* (not locked A) so
+    a_priority keeps product_lock first and NMS-adds new only.
     """
     s = (src or "").lower()
-    if s == "worst_cam" or s.startswith("ma_gap_"):
+    if s in {"worst_cam", "sat_edge"} or s.startswith("ma_gap_"):
         return False
     return (
         s in {"heading_distance", "manhattan", "sparse", "product_lock", "corner_sat"}

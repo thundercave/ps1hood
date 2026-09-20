@@ -43,8 +43,8 @@ GAP_ADD_MIN_MAX_FRONTAL = 0.4  # reject if max |n·cam_fwd| over scoring cams < 
 GAP_ADD_SAT_EDGE_M = 2.0  # center within this of a roof AABB *boundary* edge
 GAP_ADD_SAT_EDGE_ALIGN = 0.7  # |n · edge_tangent| ≥ this (plane ∥ edge)
 GAP_ADD_MAX_ADDS = 3  # hard cap on new planes after gates
-GAP_SEEDS_MODES = ("legacy", "sat-edge")
-DEFAULT_GAP_SEEDS = "legacy"  # sat-edge seeds land in follow-up; gate ships now
+GAP_SEEDS_MODES = ("legacy", "sat-edge", "both")
+DEFAULT_GAP_SEEDS = "sat-edge"  # uncovered roof AABB edges → same-side facing cams
 
 
 def estimate_travel_heading_deg(frames: list[dict[str, Any]]) -> float | None:
@@ -583,6 +583,295 @@ def frame_indices_for_cam_ids(
     return idxs
 
 
+# ---------------------------------------------------------------------------
+# sat_edge seeds — uncovered roof AABB edges + same-side facing cams
+# ---------------------------------------------------------------------------
+
+SAT_EDGE_COVER_ALIGN = 0.7  # |n · n_out| for product plane covering an edge
+SAT_EDGE_COVER_DIST_M = 2.0  # |d + n·M| plane-to-midpoint
+SAT_EDGE_COVER_CENTER_M = 4.0  # product center within this of segment
+SAT_EDGE_CAM_DIST = (6.0, 35.0)
+SAT_EDGE_LOOK_AT = 0.5  # (v/dist)·fwd
+SAT_EDGE_GRAZE = 0.35  # |n_out · fwd| below this = grazing past wall
+SAT_EDGE_WALL_Z = 3.5  # center height above ground
+SAT_EDGE_MAX_EDGES = 8
+
+
+def _roof_aabb_xy(aabb_enu: list | tuple) -> tuple[float, float, float, float] | None:
+    pts = [(float(p[0]), float(p[1])) for p in aabb_enu]
+    if len(pts) < 2:
+        return None
+    es = [p[0] for p in pts]
+    ns = [p[1] for p in pts]
+    return min(es), max(es), min(ns), max(ns)
+
+
+def aabb_boundary_edges(
+    aabb_enu: list | tuple,
+    *,
+    roof_id: str = "",
+) -> list[dict[str, Any]]:
+    """Four AABB sides with midpoint, tangent, outward normal (away from center)."""
+    box = _roof_aabb_xy(aabb_enu)
+    if box is None:
+        return []
+    e0, e1, n0, n1 = box
+    roof_c = np.array([(e0 + e1) * 0.5, (n0 + n1) * 0.5], dtype=np.float64)
+    # SW, SE, NE, NW ring
+    corners = [
+        np.array([e0, n0], dtype=np.float64),
+        np.array([e1, n0], dtype=np.float64),
+        np.array([e1, n1], dtype=np.float64),
+        np.array([e0, n1], dtype=np.float64),
+    ]
+    edges: list[dict[str, Any]] = []
+    for i in range(4):
+        p0 = corners[i]
+        p1 = corners[(i + 1) % 4]
+        t = p1 - p0
+        tn = float(np.linalg.norm(t))
+        if tn < 1e-6:
+            continue
+        tang = t / tn
+        mid = 0.5 * (p0 + p1)
+        # rotate90 CCW / CW; pick outward (away from roof center)
+        n_ccw = np.array([-float(tang[1]), float(tang[0])], dtype=np.float64)
+        n_cw = np.array([float(tang[1]), -float(tang[0])], dtype=np.float64)
+        away = mid - roof_c
+        n_out = n_ccw if float(n_ccw @ away) >= float(n_cw @ away) else n_cw
+        edges.append(
+            {
+                "id": f"{roof_id or 'roof'}_e{i}",
+                "roof_id": roof_id or "roof",
+                "p0": p0,
+                "p1": p1,
+                "mid": mid,
+                "tangent": tang,
+                "n_out": n_out,
+                "roof_c": roof_c.copy(),
+            }
+        )
+    return edges
+
+
+def product_plane_covers_edge(
+    plane: dict[str, Any],
+    edge: dict[str, Any],
+    *,
+    align_min: float = SAT_EDGE_COVER_ALIGN,
+    plane_dist_m: float = SAT_EDGE_COVER_DIST_M,
+    center_m: float = SAT_EDGE_COVER_CENTER_M,
+) -> bool:
+    """True if product plane faces this edge outward and sits on the wall."""
+    n = np.asarray(plane.get("n"), dtype=np.float64).reshape(-1)
+    if n.size < 2:
+        return False
+    n_xy = n[:2]
+    nn = float(np.linalg.norm(n_xy))
+    if nn < 1e-9:
+        return False
+    n_xy = n_xy / nn
+    n_out = np.asarray(edge["n_out"], dtype=np.float64)[:2]
+    if abs(float(n_xy @ n_out)) < float(align_min):
+        return False
+    M = np.asarray(edge["mid"], dtype=np.float64)[:2]
+    # |d + n·M| for plane n·X + d = 0 (vertical → z term ~0)
+    d = plane.get("d")
+    try:
+        d_f = float(d) if d is not None else float("nan")
+    except (TypeError, ValueError):
+        d_f = float("nan")
+    if math.isfinite(d_f):
+        n3 = np.array(
+            [float(n_xy[0]), float(n_xy[1]), float(n[2]) if n.size >= 3 else 0.0],
+            dtype=np.float64,
+        )
+        M3 = np.array([float(M[0]), float(M[1]), 0.0], dtype=np.float64)
+        dist = abs(float(d_f) + float(n3 @ M3))
+    else:
+        c = plane.get("center")
+        if c is None:
+            return False
+        c = np.asarray(c, dtype=np.float64)[:2]
+        dist = abs(float(n_xy @ (c - M)))
+    if dist > float(plane_dist_m):
+        return False
+    center = plane.get("center")
+    if center is None:
+        return False
+    cxy = np.asarray(center, dtype=np.float64)[:2]
+    if dist_point_to_segment_xy(cxy, edge["p0"], edge["p1"]) > float(center_m):
+        return False
+    return True
+
+
+def uncovered_roof_edges(
+    regions: list[dict[str, Any]],
+    product_planes: list[dict[str, Any]] | None,
+    *,
+    max_edges: int = SAT_EDGE_MAX_EDGES,
+) -> list[dict[str, Any]]:
+    """AABB roof/building edges with no covering product plane."""
+    planes = list(product_planes or [])
+    uncovered: list[dict[str, Any]] = []
+    for ri, reg in enumerate(regions):
+        kind = reg.get("kind")
+        if kind not in {None, "roof", "building"}:
+            continue
+        aabb = reg.get("aabb_enu")
+        if not aabb or len(aabb) < 4:
+            continue
+        roof_id = str(reg.get("id") or f"roof_{ri}")
+        for edge in aabb_boundary_edges(aabb, roof_id=roof_id):
+            covered = any(product_plane_covers_edge(pl, edge) for pl in planes)
+            if not covered:
+                uncovered.append(edge)
+            if len(uncovered) >= int(max_edges) * 4:
+                # collect generously; caller slices
+                pass
+    return uncovered[: int(max_edges)] if max_edges else uncovered
+
+
+def write_gap_needs_json(
+    path: Path,
+    needs: list[dict[str, Any]],
+    *,
+    run: str = "smoke-dense",
+    product_planes: int = 18,
+) -> Path:
+    """Append/write recon/gap_needs.json for edges with zero facing cams."""
+    import json
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run": str(run),
+        "product_planes": int(product_planes),
+        "needs": list(needs),
+        "hint": (
+            "fetch far-side SV panos looking at these ENU points; fixed poses only"
+        ),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def sat_edge_seeds(
+    frames: list[dict[str, Any]],
+    regions: list[dict[str, Any]],
+    product_planes: list[dict[str, Any]] | None,
+    *,
+    ground_z: float = 0.0,
+    max_edges: int = SAT_EDGE_MAX_EDGES,
+    width_m: float = GAP_FILL_WIDTH_M,
+    height_m: float = GAP_FILL_HEIGHT_M,
+    travel_heading_deg: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Uncovered sat roof edges → sat_edge hyps from same-side facing cams.
+
+    Returns ``(hyps, needs)``. ``needs`` entries get no MA peels invented —
+    caller writes ``gap_needs.json``.
+    """
+    hyps: list[dict[str, Any]] = []
+    needs: list[dict[str, Any]] = []
+    if not regions:
+        return hyps, needs
+    edges = uncovered_roof_edges(
+        regions, product_planes, max_edges=int(max_edges)
+    )
+    wall_u = float(ground_z) + float(SAT_EDGE_WALL_Z)
+    travel = travel_heading_deg
+    if travel is None:
+        travel = estimate_travel_heading_deg(frames)
+    d_lo, d_hi = SAT_EDGE_CAM_DIST
+
+    for edge in edges:
+        M = np.asarray(edge["mid"], dtype=np.float64)[:2]
+        n_out = np.asarray(edge["n_out"], dtype=np.float64)[:2]
+        nn = float(np.linalg.norm(n_out))
+        if nn < 1e-9:
+            continue
+        n_out = n_out / nn
+        roof_c = np.asarray(edge["roof_c"], dtype=np.float64)[:2]
+        heading = wrap_heading(
+            math.degrees(math.atan2(float(n_out[0]), float(n_out[1])))
+        )
+        cams: list[dict[str, Any]] = []
+        for fr in frames:
+            C = np.array([float(fr["e"]), float(fr["n"])], dtype=np.float64)
+            h = math.radians(float(fr.get("heading") or 0.0))
+            fwd = np.array([math.sin(h), math.cos(h)], dtype=np.float64)
+            v = M - C
+            dist = float(np.linalg.norm(v))
+            if dist < d_lo or dist > d_hi:
+                continue
+            v_hat = v / dist
+            if float(v_hat @ fwd) < float(SAT_EDGE_LOOK_AT):
+                continue
+            if abs(float(n_out @ fwd)) < float(SAT_EDGE_GRAZE):
+                continue
+            # same side of street as roof: cam outside the building
+            if float((C - roof_c) @ n_out) < 0.0:
+                continue
+            cams.append(fr)
+        if not cams:
+            needs.append(
+                {
+                    "e": float(M[0]),
+                    "n": float(M[1]),
+                    "heading": float(heading),
+                    "reason": "no_facing_cam",
+                    "roof_id": str(edge.get("roof_id") or ""),
+                    "edge_id": str(edge.get("id") or ""),
+                }
+            )
+            continue
+        # prefer return walls: |heading − travel| ≈ 90°
+        ret_score = 0.0
+        if travel is not None:
+            from ps1_hood.geo import heading_diff
+
+            sep = abs(heading_diff(float(heading), float(travel)))
+            ret_score = 1.0 - abs(sep - 90.0) / 90.0
+        n_out_3d = np.array(
+            [float(n_out[0]), float(n_out[1]), 0.0], dtype=np.float64
+        )
+        center = np.array(
+            [float(M[0]), float(M[1]), wall_u], dtype=np.float64
+        )
+        d_plane = -float(n_out_3d @ center)
+        seed_cams = [make_frame_cam_id(c) for c in cams[:4]]
+        hyps.append(
+            {
+                "n": n_out_3d,
+                "d": d_plane,
+                "center": center,
+                "width_m": float(width_m),
+                "height_m": float(height_m),
+                "source": "sat_edge",
+                "edge_id": str(edge.get("id") or ""),
+                "roof_id": str(edge.get("roof_id") or ""),
+                "seed_cams": seed_cams,
+                "return_score": float(ret_score),
+            }
+        )
+
+    # Prefer return walls first
+    hyps.sort(key=lambda h: float(h.get("return_score") or 0.0), reverse=True)
+    log.info(
+        "gap_fill: %s sat_edge seeds from %s uncovered edges (%s needs)",
+        len(hyps),
+        len(edges),
+        len(needs),
+    )
+    if needs:
+        log.info(
+            "gap_fill: %s sat_edge needs (no facing cam)",
+            len(needs),
+        )
+    return hyps, needs
+
+
 def build_gap_fill_seeds(
     frames: list[dict[str, Any]],
     project_root: Path,
@@ -591,29 +880,32 @@ def build_gap_fill_seeds(
     cam_xy: np.ndarray | None = None,
     worst_cam_ids: list[str] | None = None,
     hyp_cap: int = WORST_CAM_HYP_CAP,
+    gap_seeds_mode: str = DEFAULT_GAP_SEEDS,
+    product_planes: list[dict[str, Any]] | None = None,
+    write_needs: bool = True,
+    run_name: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Manhattan side + sat corner (+ optional worst-cam) seeds.
+    """Gap seeds by ``gap_seeds_mode``.
 
-    When ``worst_cam_ids`` is set: emit ``worst_cam`` rings first; filter
-    manhattan/corner to hyps visible (frontal≥0.25) in those cams; cap total.
+    - ``legacy`` — manhattan + corner_sat (+ optional worst-cam)
+    - ``sat-edge`` — uncovered roof AABB edges → same-side facing cams only
+    - ``both`` — sat_edge first, then AABB-gated legacy
+
+    When sat-edge/both leave edges with zero facing cams, write
+    ``recon/gap_needs.json`` (no invented MA peels).
     """
-    worst_ids = [str(c).strip() for c in (worst_cam_ids or []) if str(c).strip()]
-    worst_frames = [
-        fr
-        for cid in worst_ids
-        if (fr := find_frame_for_cam_id(frames, cid)) is not None
-    ]
+    mode = str(gap_seeds_mode or DEFAULT_GAP_SEEDS).strip().lower()
+    if mode not in GAP_SEEDS_MODES:
+        log.warning(
+            "gap_fill: unknown gap_seeds_mode=%r — using %s",
+            gap_seeds_mode,
+            DEFAULT_GAP_SEEDS,
+        )
+        mode = DEFAULT_GAP_SEEDS
 
-    worst = (
-        worst_cam_seeds(frames, worst_ids, ground_z=ground_z, hyp_cap=hyp_cap)
-        if worst_ids
-        else []
-    )
-
-    man = manhattan_side_seeds(frames, ground_z=ground_z)
-    regions = load_sat_roof_regions(project_root)
-    corners = corner_seeds_from_roof_aabbs(regions, ground_z=ground_z) if regions else []
-    side_corner = man + corners
+    root = Path(project_root)
+    regions = load_sat_roof_regions(root)
+    travel = estimate_travel_heading_deg(frames)
 
     street_mask = None
     ortho = None
@@ -624,7 +916,7 @@ def build_gap_fill_seeds(
                 segment_roof_yard_mask,
             )
 
-            ortho = load_ortho_for_run(Path(project_root))
+            ortho = load_ortho_for_run(root)
             street_mask = getattr(ortho, "_street_mask", None)
             if street_mask is None:
                 _, _, street_mask = segment_roof_yard_mask(ortho.image)
@@ -640,43 +932,106 @@ def build_gap_fill_seeds(
         _, idx = np.unique(rounded, axis=0, return_index=True)
         cam_xy = xy[np.sort(idx)]
 
-    side_corner = reject_road_center_hyps(
-        side_corner, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
-    )
-    worst = reject_road_center_hyps(
-        worst, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
-    )
-
-    if worst_frames:
-        before = len(side_corner)
-        side_corner = filter_hyps_visible_in_cams(
-            side_corner, worst_frames, min_frontal=WORST_CAM_MIN_FRONTAL
+    sat_hyps: list[dict[str, Any]] = []
+    needs: list[dict[str, Any]] = []
+    if mode in {"sat-edge", "both"}:
+        sat_hyps, needs = sat_edge_seeds(
+            frames,
+            regions,
+            product_planes,
+            ground_z=ground_z,
+            travel_heading_deg=travel,
         )
-        log.info(
-            "gap_fill: filtered manhattan/corner to worst-cam visible "
-            "%s → %s (min_frontal=%.2f)",
-            before,
-            len(side_corner),
-            WORST_CAM_MIN_FRONTAL,
+        sat_hyps = reject_road_center_hyps(
+            sat_hyps, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
         )
+        if needs and write_needs:
+            n_prod = len(product_planes or [])
+            write_gap_needs_json(
+                root / "recon" / "gap_needs.json",
+                needs,
+                run=run_name or root.name or "smoke-dense",
+                product_planes=n_prod if n_prod > 0 else 18,
+            )
 
-    travel = estimate_travel_heading_deg(frames)
-    side_corner = prefer_side_wall_order(side_corner, travel)
+    legacy: list[dict[str, Any]] = []
+    if mode in {"legacy", "both"}:
+        worst_ids = [
+            str(c).strip() for c in (worst_cam_ids or []) if str(c).strip()
+        ]
+        worst_frames = [
+            fr
+            for cid in worst_ids
+            if (fr := find_frame_for_cam_id(frames, cid)) is not None
+        ]
+        worst = (
+            worst_cam_seeds(frames, worst_ids, ground_z=ground_z, hyp_cap=hyp_cap)
+            if worst_ids
+            else []
+        )
+        man = manhattan_side_seeds(frames, ground_z=ground_z)
+        corners = (
+            corner_seeds_from_roof_aabbs(regions, ground_z=ground_z)
+            if regions
+            else []
+        )
+        side_corner = man + corners
+        side_corner = reject_road_center_hyps(
+            side_corner, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
+        )
+        worst = reject_road_center_hyps(
+            worst, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
+        )
+        if worst_frames:
+            before = len(side_corner)
+            side_corner = filter_hyps_visible_in_cams(
+                side_corner, worst_frames, min_frontal=WORST_CAM_MIN_FRONTAL
+            )
+            log.info(
+                "gap_fill: filtered manhattan/corner to worst-cam visible "
+                "%s → %s (min_frontal=%.2f)",
+                before,
+                len(side_corner),
+                WORST_CAM_MIN_FRONTAL,
+            )
+        side_corner = prefer_side_wall_order(side_corner, travel)
+        # both: AABB-gate legacy so they don't spam off-footprint
+        if mode == "both" and regions:
+            gated: list[dict[str, Any]] = []
+            for h in worst + side_corner:
+                ok, _why = sat_aabb_edge_ok(
+                    np.asarray(h["center"], dtype=np.float64),
+                    np.asarray(h["n"], dtype=np.float64),
+                    regions,
+                )
+                if ok:
+                    gated.append(h)
+            legacy = gated
+            log.info(
+                "gap_fill: AABB-gated legacy %s → %s (both mode)",
+                len(worst) + len(side_corner),
+                len(legacy),
+            )
+        else:
+            legacy = list(worst)
+            for h in side_corner:
+                legacy.append(h)
 
-    # Prefer worst_cam seeds first; fill remaining cap with filtered side/corner
-    seeds = list(worst)
-    for h in side_corner:
+    # Order: sat_edge first, then legacy; cap
+    seeds: list[dict[str, Any]] = []
+    for h in sat_hyps + legacy:
         if len(seeds) >= int(hyp_cap):
             break
         seeds.append(h)
 
     log.info(
-        "gap_fill: built %s seeds (worst_cam=%s manhattan+corner=%s; "
-        "worst_ids=%s travel=%s)",
+        "gap_fill: built %s seeds (mode=%s sat_edge=%s legacy=%s needs=%s "
+        "travel=%s)",
         len(seeds),
-        len(worst),
-        len(side_corner),
-        worst_ids or None,
+        mode,
+        len(sat_hyps),
+        len(legacy),
+        len(needs),
         f"{travel:.1f}" if travel is not None else "None",
     )
     return seeds
@@ -1006,12 +1361,17 @@ def filter_gap_adds(
         p["gap_multiview"] = why_mv
         kept.append(p)
 
-    # Prefer non-ma_segment, then higher ZNCC; cap
+    # Prefer sat_edge > manhattan/worst/corner > ma_segment; then higher ZNCC
     def _rank(pl: dict[str, Any]) -> tuple[int, float]:
         src = str(pl.get("source") or "")
-        ma_pen = 1 if ("ma_segment" in src or src == "ma_segment") else 0
+        if "sat_edge" in src:
+            tier = 0
+        elif "ma_segment" in src or src == "ma_segment":
+            tier = 2
+        else:
+            tier = 1
         z = float(pl.get("zncc") or 0.0)
-        return (ma_pen, -z)
+        return (tier, -z)
 
     kept.sort(key=_rank)
     if len(kept) > int(max_gap_adds):
