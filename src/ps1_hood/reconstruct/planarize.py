@@ -57,6 +57,11 @@ DEFAULT_NMS_XY_SPLIT_M = 4.0
 DEFAULT_MAX_KEEP = 16
 UNION_STRATEGIES = ("nms", "a_priority")
 DEFAULT_UNION_STRATEGY = "a_priority"
+# sat_edge / ma_gap_sat_edge vs product_lock (a_priority only) — tighter, no
+# opposite-d shortcut. Does NOT loosen global NMS for other MA sources.
+DEFAULT_GAP_NMS_XY_M = 3.0
+DEFAULT_GAP_NMS_D_TOL_M = 1.0
+DEFAULT_GAP_NMS_N_DOT_MIN = 0.95
 
 try:
     import open3d as o3d
@@ -693,6 +698,11 @@ def plane_family(src: str | None) -> str:
     return "a" if is_a_source(src) else "ma"
 
 
+def is_sat_edge_union_source(src: str | None) -> bool:
+    """True for ``sat_edge`` / ``ma_gap_sat_edge`` (edge-aware union vs A)."""
+    return "sat_edge" in str(src or "").lower()
+
+
 def _is_plane_dup(
     pl: dict[str, Any],
     k: dict[str, Any],
@@ -702,18 +712,129 @@ def _is_plane_dup(
     n_dot_min: float = 0.85,
     d_tol_m: float = 2.5,
     use_split_xy: bool = True,
+    allow_opposite_d: bool = True,
 ) -> bool:
-    """Same n-family + Δd + XY test used by hybrid NMS."""
+    """Same n-family + Δd + XY test used by hybrid NMS.
+
+    When ``allow_opposite_d`` is False, only ``|d − d_k| < d_tol`` counts
+    (no ``|d + d_k|`` opposite-normal shortcut). Used for sat_edge vs A.
+    """
     n = pl["n"]
     d = pl["d"]
     if abs(float(n @ k["n"])) < n_dot_min:
         return False
-    if not (abs(float(d - k["d"])) < d_tol_m or abs(float(d + k["d"])) < d_tol_m):
+    d_ok = abs(float(d - k["d"])) < d_tol_m
+    if allow_opposite_d:
+        d_ok = d_ok or abs(float(d + k["d"])) < d_tol_m
+    if not d_ok:
         return False
     xy_thresh = float(nms_xy_m)
     if use_split_xy and (bool(pl.get("split_parent")) or bool(k.get("split_parent"))):
         xy_thresh = float(nms_xy_split_m)
     return float(np.linalg.norm(pl["center"][:2] - k["center"][:2])) < xy_thresh
+
+
+def _sat_edge_dict_from_plane(pl: dict[str, Any]) -> dict[str, Any] | None:
+    """Build cover-edge dict from stashed ``edge_p0``/``edge_p1``/``edge_n_out``."""
+    p0 = pl.get("edge_p0")
+    p1 = pl.get("edge_p1")
+    if p0 is None or p1 is None:
+        return None
+    p0a = np.asarray(p0, dtype=np.float64).reshape(-1)[:2]
+    p1a = np.asarray(p1, dtype=np.float64).reshape(-1)[:2]
+    n_out = pl.get("edge_n_out")
+    if n_out is None:
+        n = np.asarray(pl.get("n"), dtype=np.float64).reshape(-1)
+        if n.size < 2:
+            return None
+        n_out_a = n[:2].copy()
+    else:
+        n_out_a = np.asarray(n_out, dtype=np.float64).reshape(-1)[:2].copy()
+    nn = float(np.linalg.norm(n_out_a))
+    if nn < 1e-9:
+        return None
+    n_out_a = n_out_a / nn
+    mid = 0.5 * (p0a + p1a)
+    return {
+        "id": str(pl.get("edge_id") or ""),
+        "p0": p0a,
+        "p1": p1a,
+        "n_out": n_out_a,
+        "mid": mid,
+    }
+
+
+def _product_plane_label(k: dict[str, Any], index: int) -> str:
+    pid = k.get("id")
+    if pid is not None and str(pid).strip():
+        return str(pid)
+    src = str(k.get("source") or "product_lock")
+    return f"{src}[{index}]"
+
+
+def sat_edge_dup_vs_a(
+    pl: dict[str, Any],
+    k: dict[str, Any],
+    *,
+    nms_xy_m: float = DEFAULT_GAP_NMS_XY_M,
+    d_tol_m: float = DEFAULT_GAP_NMS_D_TOL_M,
+    n_dot_min: float = DEFAULT_GAP_NMS_N_DOT_MIN,
+    allow_opposite_d: bool = False,
+    k_index: int = 0,
+) -> tuple[bool, dict[str, Any]]:
+    """Edge-aware dup of sat_edge vs one product/A plane.
+
+    1) If product covers this seed edge → real same-wall dup.
+    2) Else geometric: ``|n·n|≥0.95``, ``|Δd|<1`` (no opposite-d by default),
+       ``dxy<3``. Does not use the global 6 m / opposite-d NMS.
+    """
+    n = np.asarray(pl["n"], dtype=np.float64).reshape(-1)
+    nk = np.asarray(k["n"], dtype=np.float64).reshape(-1)
+    d = float(pl["d"])
+    dk = float(k["d"])
+    n_dot = float(n @ nk) if n.size >= 3 and nk.size >= 3 else float(n[:2] @ nk[:2])
+    delta_d = abs(d - dk)
+    sum_d = abs(d + dk)
+    c = np.asarray(pl["center"], dtype=np.float64).reshape(-1)[:2]
+    ck = np.asarray(k["center"], dtype=np.float64).reshape(-1)[:2]
+    dxy = float(np.linalg.norm(c - ck))
+
+    cover = False
+    edge = _sat_edge_dict_from_plane(pl)
+    if edge is not None:
+        from ps1_hood.reconstruct.gap_fill import product_plane_covers_edge
+
+        cover = bool(product_plane_covers_edge(k, edge))
+
+    detail: dict[str, Any] = {
+        "edge_id": str(pl.get("edge_id") or ""),
+        "vs": _product_plane_label(k, k_index),
+        "n_dot": n_dot,
+        "delta_d": delta_d,
+        "sum_d": sum_d,
+        "dxy": dxy,
+        "cover": "yes" if cover else "no",
+    }
+
+    if cover:
+        detail["reason"] = "cover"
+        return True, detail
+
+    geom = _is_plane_dup(
+        pl,
+        k,
+        nms_xy_m=float(nms_xy_m),
+        nms_xy_split_m=float(nms_xy_m),
+        n_dot_min=float(n_dot_min),
+        d_tol_m=float(d_tol_m),
+        use_split_xy=False,
+        allow_opposite_d=bool(allow_opposite_d),
+    )
+    if geom:
+        detail["reason"] = "geom"
+        return True, detail
+    detail["reason"] = "none"
+    return False, detail
 
 
 def nms_keep_planes(
@@ -761,6 +882,9 @@ def union_keep_planes(
     nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
     n_dot_min: float = 0.85,
     d_tol_m: float = 2.5,
+    gap_nms_xy_m: float | None = None,
+    gap_nms_d_tol_m: float | None = None,
+    gap_nms_no_opposite: bool = True,
     telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Union accepted planes after ZNCC.
@@ -773,6 +897,12 @@ def union_keep_planes(
     general ``nms_xy_m`` radius (never the 4 m split-sibling exception) so
     a slightly better MA on the same wall cannot evict A. MA-vs-MA still
     uses sibling NMS.
+
+    For ``sat_edge`` / ``ma_gap_sat_edge`` vs kept A only: edge-aware dup —
+    real dup if ``product_plane_covers_edge``; else ``|n·n|≥0.95``,
+    ``|Δd|<gap_nms_d_tol`` (default 1 m, **no** opposite-d when
+    ``gap_nms_no_opposite``), ``dxy<gap_nms_xy`` (default 3 m). Other MA
+    sources keep global 6 m / 2.5 m / opposite-d NMS (no clutter flood).
     """
     strat = (strategy or DEFAULT_UNION_STRATEGY).lower().strip()
     if strat not in UNION_STRATEGIES:
@@ -786,6 +916,14 @@ def union_keep_planes(
     ma_pre_nms = len(ma_acc)
     pre_nms = len(accepted)
 
+    sat_xy = float(
+        DEFAULT_GAP_NMS_XY_M if gap_nms_xy_m is None else gap_nms_xy_m
+    )
+    sat_d_tol = float(
+        DEFAULT_GAP_NMS_D_TOL_M if gap_nms_d_tol_m is None else gap_nms_d_tol_m
+    )
+    sat_no_opp = bool(gap_nms_no_opposite)
+
     nms_kw = dict(
         max_keep=max_keep,
         nms_xy_m=float(nms_xy_m),
@@ -793,6 +931,9 @@ def union_keep_planes(
         n_dot_min=n_dot_min,
         d_tol_m=d_tol_m,
     )
+
+    n_dup_vs_a = 0
+    remaining_end = 0
 
     if strat == "nms":
         ranked = sorted(accepted, key=lambda p: -float(p.get("zncc") or 0.0))
@@ -809,18 +950,49 @@ def union_keep_planes(
             if remaining <= 0:
                 break
             # Stricter than sibling NMS: no 4 m split exception vs kept A.
-            if any(
-                _is_plane_dup(
-                    pl,
-                    k,
-                    nms_xy_m=float(nms_xy_m),
-                    nms_xy_split_m=float(nms_xy_split_m),
-                    n_dot_min=n_dot_min,
-                    d_tol_m=d_tol_m,
-                    use_split_xy=False,
-                )
-                for k in a_kept_list
-            ):
+            # sat_edge: edge-aware (cover / tighter / no opposite-d).
+            dup_a = False
+            if is_sat_edge_union_source(pl.get("source")):
+                for ki, k in enumerate(a_kept_list):
+                    is_dup, det = sat_edge_dup_vs_a(
+                        pl,
+                        k,
+                        nms_xy_m=sat_xy,
+                        d_tol_m=sat_d_tol,
+                        n_dot_min=DEFAULT_GAP_NMS_N_DOT_MIN,
+                        allow_opposite_d=not sat_no_opp,
+                        k_index=ki,
+                    )
+                    if is_dup:
+                        dup_a = True
+                        n_dup_vs_a += 1
+                        log.info(
+                            "union reject sat_edge edge_id=%s vs %s "
+                            "n·n=%.3f Δd=%.3f d+d=%.3f dxy=%.2f cover=%s",
+                            det.get("edge_id") or "?",
+                            det.get("vs"),
+                            float(det.get("n_dot") or 0.0),
+                            float(det.get("delta_d") or 0.0),
+                            float(det.get("sum_d") or 0.0),
+                            float(det.get("dxy") or 0.0),
+                            det.get("cover"),
+                        )
+                        break
+            else:
+                for k in a_kept_list:
+                    if _is_plane_dup(
+                        pl,
+                        k,
+                        nms_xy_m=float(nms_xy_m),
+                        nms_xy_split_m=float(nms_xy_split_m),
+                        n_dot_min=n_dot_min,
+                        d_tol_m=d_tol_m,
+                        use_split_xy=False,
+                    ):
+                        dup_a = True
+                        n_dup_vs_a += 1
+                        break
+            if dup_a:
                 continue
             if any(
                 _is_plane_dup(
@@ -837,6 +1009,7 @@ def union_keep_planes(
                 continue
             ma_added_list.append(pl)
             remaining -= 1
+        remaining_end = remaining
         kept = a_kept_list + ma_added_list
         kept.sort(key=lambda p: -float(p.get("zncc") or 0.0))
         a_kept = len(a_kept_list)
@@ -853,6 +1026,11 @@ def union_keep_planes(
                 "ma_added": ma_added,
                 "pre_nms": pre_nms,
                 "union_kept": len(kept),
+                "n_dup_vs_a": int(n_dup_vs_a),
+                "remaining": int(remaining_end),
+                "gap_nms_xy_m": float(sat_xy),
+                "gap_nms_d_tol_m": float(sat_d_tol),
+                "gap_nms_no_opposite": bool(sat_no_opp),
             }
         )
     return kept
@@ -1290,18 +1468,21 @@ def planes_from_product_json(path: Path) -> list[dict[str, Any]]:
                 center = np.array([center[0], center[1] if center.size > 1 else 0.0, 4.0])
         if len(center) < 3:
             center = np.array([float(center[0]), float(center[1] if len(center) > 1 else 0.0), 4.0])
-        out.append(
-            {
-                "n": n,
-                "d": d_plane,
-                "center": np.asarray(center, dtype=np.float64),
-                "width_m": float(pl.get("width_m") or 8.0),
-                "height_m": float(pl.get("height_m") or 9.0),
-                "zncc": pl.get("zncc"),
-                "ok": True,
-                "source": "product_lock",
-                "quad": quad,
-                "count": int(pl.get("inliers") or pl.get("count") or 0),
-            }
-        )
+        entry: dict[str, Any] = {
+            "n": n,
+            "d": d_plane,
+            "center": np.asarray(center, dtype=np.float64),
+            "width_m": float(pl.get("width_m") or 8.0),
+            "height_m": float(pl.get("height_m") or 9.0),
+            "zncc": pl.get("zncc"),
+            "ok": True,
+            "source": "product_lock",
+            "quad": quad,
+            "count": int(pl.get("inliers") or pl.get("count") or 0),
+        }
+        if pl.get("id") is not None:
+            entry["id"] = pl.get("id")
+        else:
+            entry["id"] = f"product_lock[{len(out)}]"
+        out.append(entry)
     return out

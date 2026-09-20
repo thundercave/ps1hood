@@ -26,6 +26,10 @@ from ps1_hood.reconstruct.planarize import (
     split_long_hyp,
     union_keep_planes,
     write_planes_json,
+    sat_edge_dup_vs_a,
+    is_sat_edge_union_source,
+    DEFAULT_GAP_NMS_XY_M,
+    DEFAULT_GAP_NMS_D_TOL_M,
 )
 
 
@@ -2118,3 +2122,255 @@ def test_planes_from_product_json_is_a_family(tmp_path: Path) -> None:
     assert len(locked) == 1
     assert locked[0]["source"] == "product_lock"
     assert is_a_source(locked[0]["source"])
+
+
+def _sat_edge_plane(
+    center_xy,
+    *,
+    n=(1.0, 0.0, 0.0),
+    d=None,
+    zncc=0.40,
+    edge_id="roof_0_e0",
+    edge_len=8.0,
+    source="ma_gap_sat_edge",
+):
+    """sat_edge / ma_gap_sat_edge with stashed edge geom for cover checks."""
+    x, y = center_xy
+    n_arr = np.asarray(n, dtype=np.float64)
+    n_arr = n_arr / (np.linalg.norm(n_arr) + 1e-12)
+    if d is None:
+        d = -float(n_arr @ np.array([float(x), float(y), 4.0]))
+    # Edge along tangent ⟂ n_xy through center
+    tang = np.array([-n_arr[1], n_arr[0]], dtype=np.float64)
+    mid = np.array([float(x), float(y)], dtype=np.float64)
+    half = float(edge_len) * 0.5
+    p0 = mid - tang * half
+    p1 = mid + tang * half
+    return {
+        "n": n_arr,
+        "d": float(d),
+        "center": np.array([float(x), float(y), 4.0]),
+        "width_m": 8.0,
+        "height_m": 8.0,
+        "zncc": float(zncc),
+        "source": source,
+        "edge_id": edge_id,
+        "edge_p0": p0,
+        "edge_p1": p1,
+        "edge_n_out": n_arr[:2].copy(),
+    }
+
+
+def test_is_sat_edge_union_source() -> None:
+    assert is_sat_edge_union_source("sat_edge")
+    assert is_sat_edge_union_source("ma_gap_sat_edge")
+    assert not is_sat_edge_union_source("ma_segment")
+    assert not is_sat_edge_union_source("ma_gap_manhattan")
+    assert DEFAULT_GAP_NMS_XY_M == 3.0
+    assert DEFAULT_GAP_NMS_D_TOL_M == 1.0
+
+
+def test_sat_edge_opposite_wall_not_false_dup() -> None:
+    """Opposite façade: n≈−n_k, |d+d_k| small, dxy<6 — old NMS false-dup; edge-aware keeps."""
+    # Street façade at x=+4 facing +X; back wall at x=−4 facing −X (building ~8 m deep).
+    # Centers 8 m apart in X… use Y offset so dxy<6 while walls are opposite.
+    product = _a_plane((4.0, 0.0), zncc=0.45, d=-4.0, source="product_lock")
+    product["id"] = "facade_00"
+    # Back wall: n=−X, d=+4 (plane x=−4). Center ( −4, 2 ): dxy to product ≈ 6.32 —
+    # tighten Y so dxy < 6 for legacy trap: (−4, 1) → dxy = sqrt(8^2+1^2)≈8.06 > 6.
+    # Need dxy < 6 with opposite n: place both on a small garage — product (3,0),
+    # sat (−2, 2): dxy≈5.39; |d+d_k|=|−3+2|=1 < 2.5; abs(n·n)=1.
+    product = _a_plane((3.0, 0.0), zncc=0.45, d=-3.0, source="product_lock")
+    product["id"] = "facade_00"
+    sat = _sat_edge_plane(
+        (-2.0, 2.0),
+        n=(-1.0, 0.0, 0.0),
+        d=2.0,  # plane x=−2; |d + d_product|=|2-3|=1 < 2.5
+        zncc=0.40,
+        edge_id="roof_garage_e1",
+    )
+    # Legacy: abs(n·n)=1 ≥ 0.85, |d+d|=1 < 2.5, dxy≈5.39 < 6 → false dup
+    assert _is_plane_dup_legacy_style(sat, product)
+
+    is_dup, det = sat_edge_dup_vs_a(sat, product, k_index=0)
+    assert not is_dup, det
+    assert det["cover"] == "no"
+    assert det["n_dot"] < 0  # opposite
+
+    tel: dict = {}
+    kept = union_keep_planes(
+        [product, sat], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    srcs = [str(p.get("source")) for p in kept]
+    assert "product_lock" in srcs
+    assert "ma_gap_sat_edge" in srcs
+    assert tel["ma_added"] == 1
+    assert tel["a_kept"] == 1
+    assert tel["n_dup_vs_a"] == 0
+
+
+def _is_plane_dup_legacy_style(pl, k) -> bool:
+    """Mirror pre-fix global NMS (0.85 / 2.5 / 6 + opposite-d)."""
+    from ps1_hood.reconstruct.planarize import _is_plane_dup
+
+    return _is_plane_dup(
+        pl, k, nms_xy_m=6.0, nms_xy_split_m=4.0, n_dot_min=0.85, d_tol_m=2.5,
+        use_split_xy=False, allow_opposite_d=True,
+    )
+
+
+def test_sat_edge_cover_still_dup() -> None:
+    """Product that covers the seed edge is a real same-wall dup."""
+    product = _a_plane((8.0, 0.0), zncc=0.45, d=-8.0, source="product_lock")
+    product["id"] = "facade_street"
+    # Same wall / same edge mid — product covers edge
+    sat = _sat_edge_plane(
+        (8.0, 0.5),
+        n=(1.0, 0.0, 0.0),
+        d=-8.0,
+        zncc=0.40,
+        edge_id="roof_0_e0",
+    )
+    is_dup, det = sat_edge_dup_vs_a(sat, product)
+    assert is_dup
+    assert det["cover"] == "yes"
+    assert det["reason"] == "cover"
+    assert "facade_street" in det["vs"]
+
+    tel: dict = {}
+    kept = union_keep_planes(
+        [product, sat], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    assert all(p["source"] != "ma_gap_sat_edge" for p in kept)
+    assert tel["ma_added"] == 0
+    assert tel["n_dup_vs_a"] == 1
+
+
+def test_sat_edge_geom_tight_dup_no_cover() -> None:
+    """cover=no but |n·n|≥0.95, |Δd|<1, dxy<3 → geometric dup."""
+    product = _a_plane((8.0, 0.0), zncc=0.45, d=-8.0, source="product_lock")
+    product["id"] = "facade_01"
+    # Parallel same-facing wall slightly offset — cover fails (center far from
+    # *sat*'s edge if we place edge elsewhere); use edge far from product center.
+    sat = _sat_edge_plane(
+        (8.2, 2.0),  # dxy≈2.01 < 3
+        n=(1.0, 0.0, 0.0),
+        d=-8.2,  # |Δd|=0.2 < 1
+        zncc=0.38,
+        edge_id="roof_1_e2",
+        edge_len=4.0,
+    )
+    # Move edge segment away so product does not cover it (center_m=2)
+    sat["edge_p0"] = np.array([8.2, 20.0])
+    sat["edge_p1"] = np.array([8.2, 24.0])
+    sat["edge_n_out"] = np.array([1.0, 0.0])
+
+    is_dup, det = sat_edge_dup_vs_a(sat, product)
+    assert det["cover"] == "no"
+    assert is_dup
+    assert det["reason"] == "geom"
+
+    tel: dict = {}
+    kept = union_keep_planes(
+        [product, sat], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    assert tel["ma_added"] == 0
+    assert tel["n_dup_vs_a"] == 1
+
+
+def test_sat_edge_adjacent_return_survives_6m_trap() -> None:
+    """Return wall near street façade: n nearly orthogonal → not dup; would
+    sometimes false-fire under AABB wiggle + 6 m XY on small footprints."""
+    product = _a_plane((8.0, 0.0), zncc=0.45, d=-8.0, source="product_lock")
+    product["id"] = "facade_street"
+    # Return facing +Y, center 4 m from street plane center
+    sat = _sat_edge_plane(
+        (10.0, 4.0),
+        n=(0.0, 1.0, 0.0),
+        zncc=0.39,
+        edge_id="roof_garage_return",
+    )
+    is_dup, det = sat_edge_dup_vs_a(sat, product)
+    assert not is_dup
+    assert abs(det["n_dot"]) < 0.2
+
+    tel: dict = {}
+    kept = union_keep_planes(
+        [product, sat], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    assert any(p["source"] == "ma_gap_sat_edge" for p in kept)
+    assert tel["ma_added"] == 1
+
+
+def test_ma_segment_still_uses_global_nms_with_opposite() -> None:
+    """Do NOT loosen global NMS: ma_segment still false-dups on opposite-d + 6 m."""
+    product = _a_plane((8.0, 0.0), zncc=0.45, d=-8.0, source="product_lock")
+    # Opposite normal, |d+d|=0, dxy=4 < 6 → classic global dup
+    ma = _plane((8.0, 4.0), zncc=0.50, d=8.0)
+    ma["n"] = np.array([-1.0, 0.0, 0.0])
+
+    tel: dict = {}
+    kept = union_keep_planes(
+        [product, ma], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    assert all(p["source"] != "ma_segment" for p in kept)
+    assert tel["ma_added"] == 0
+    assert tel["n_dup_vs_a"] == 1
+
+
+def test_union_telemetry_gap_nms_knobs() -> None:
+    product = _a_plane((3.0, 0.0), zncc=0.45, d=-3.0, source="product_lock")
+    sat = _sat_edge_plane((-2.0, 2.0), n=(-1.0, 0.0, 0.0), d=2.0, zncc=0.40)
+    tel: dict = {}
+    union_keep_planes(
+        [product, sat],
+        strategy="a_priority",
+        max_keep=24,
+        gap_nms_xy_m=3.0,
+        gap_nms_d_tol_m=1.0,
+        gap_nms_no_opposite=True,
+        telemetry=tel,
+    )
+    assert tel["gap_nms_xy_m"] == 3.0
+    assert tel["gap_nms_d_tol_m"] == 1.0
+    assert tel["gap_nms_no_opposite"] is True
+    assert "remaining" in tel
+    assert tel["ma_pre_nms"] == 1
+    assert tel["ma_added"] == 1
+
+
+def test_lock18_capacity_sat_edge_add() -> None:
+    """Filter survivor with cover=no appears under lock-18 keep_cap=24."""
+    products = [
+        _a_plane((8.0, float(i * 15)), zncc=0.42, d=-8.0, source="product_lock")
+        for i in range(18)
+    ]
+    for i, p in enumerate(products):
+        p["id"] = f"facade_{i:02d}"
+    # Opposite-facing back wall near first product — false-dup under old NMS
+    # (dxy<6, |d+d|<2.5) but cover=no and geometric thresholds fail.
+    sat = _sat_edge_plane(
+        (3.0, 3.5),
+        n=(-1.0, 0.0, 0.0),
+        d=3.0,  # |d + d_k|=|3-8|=5 ≥ 2.5… need |d+d|<2.5 for legacy trap
+        zncc=0.40,
+        edge_id="roof_099_e1",
+    )
+    # First product at (8,0) d=-8. For |d+d|<2.5 with sat d>0: sat d≈8, center
+    # near product in XY but on opposite side — use (5, 2) n=-X d=5 → |5-8|=3
+    # still ≥2.5. Use d=7, center (5,2): |7-8|=1, dxy=sqrt(3^2+2^2)≈3.6<6.
+    sat = _sat_edge_plane(
+        (5.0, 2.0),
+        n=(-1.0, 0.0, 0.0),
+        d=7.0,
+        zncc=0.40,
+        edge_id="roof_099_e1",
+    )
+    tel: dict = {}
+    kept = union_keep_planes(
+        products + [sat], strategy="a_priority", max_keep=24, telemetry=tel
+    )
+    assert tel["a_kept"] == 18
+    assert tel["ma_added"] >= 1
+    assert any(p.get("source") == "ma_gap_sat_edge" for p in kept)
+    assert len([p for p in kept if p.get("source") == "product_lock"]) == 18

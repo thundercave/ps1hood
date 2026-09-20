@@ -814,6 +814,9 @@ def extract_facades(
     sat_edge_reanchor: bool = True,
     sat_edge_max_drift_m: float | None = None,
     sat_aabb_gate_sat_edge_m: float | None = None,
+    gap_nms_xy_m: float | None = None,
+    gap_nms_d_tol_m: float | None = None,
+    gap_nms_no_opposite: bool = True,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -868,7 +871,9 @@ def extract_facades(
     ``sat_edge_reanchor`` snaps accepted sat_edge centers back onto the seed
     segment (reject refine_drift beyond ``sat_edge_max_drift_m``); AABB uses
     that edge_id. ``sat_aabb_gate_sat_edge_m`` optionally softens AABB for
-    sat_edge only (never MA peels).
+    sat_edge only (never MA peels). ``gap_nms_*`` tighten a_priority dup of
+    ``ma_gap_sat_edge`` vs product_lock only (cover check, no opposite-d,
+    default XY 3 m / Δd 1 m) — global NMS for other sources stays 6/2.5.
 
     Worst-cam targeted gap-fill: ``worst_cam_ids`` / ``worst_from_compare`` seed
     planes in front of those cams (dist×yaw); filter manhattan/corner to visible
@@ -1292,6 +1297,9 @@ def extract_facades(
                 max_keep=keep_cap,
                 nms_xy_m=nms_xy,
                 nms_xy_split_m=nms_xy_split,
+                gap_nms_xy_m=gap_nms_xy_m,
+                gap_nms_d_tol_m=gap_nms_d_tol_m,
+                gap_nms_no_opposite=bool(gap_nms_no_opposite),
                 telemetry=union_tel,
             )
             if gap_fill:
@@ -1319,7 +1327,8 @@ def extract_facades(
             ma_added_n = ma_added
             log.info(
                 "facades Path α dual_arm%s: a_arm=%s kept=%s; ma_arm=%s; "
-                "strategy=%s a_pre_nms=%s a_kept=%s ma_added=%s union_kept=%s; "
+                "strategy=%s a_pre_nms=%s a_kept=%s ma_pre_nms=%s ma_added=%s "
+                "n_dup_vs_a=%s remaining=%s union_kept=%s; "
                 "a_ply=%s ma_ply=%s a_pts=%s ma_pts=%s; source=%s; "
                 "promote vs product 10/8/0.418",
                 " gap_fill" if gap_fill else "",
@@ -1329,7 +1338,10 @@ def extract_facades(
                 strategy,
                 a_pre,
                 a_n,
+                int(union_tel.get("ma_pre_nms") or len(accepted_new)),
                 ma_added,
+                int(union_tel.get("n_dup_vs_a") or 0),
+                int(union_tel.get("remaining") or 0),
                 len(accepted),
                 a_ply_str,
                 ma_ply_str,

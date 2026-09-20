@@ -801,6 +801,32 @@ def export_mapanything_bundle_cmd(
     help="Optional softer AABB gate (m) for sat_edge only (e.g. 5.0). "
     "Does NOT widen gate for MA peels / manhattan. Default: use --sat-aabb-gate",
 )
+@click.option(
+    "--gap-nms-xy",
+    "gap_nms_xy_m",
+    default=3.0,
+    show_default=True,
+    type=float,
+    help="a_priority dup XY (m) for sat_edge/ma_gap_sat_edge vs product_lock only. "
+    "Other MA sources keep --nms-xy (default 6).",
+)
+@click.option(
+    "--gap-nms-d-tol",
+    "gap_nms_d_tol_m",
+    default=1.0,
+    show_default=True,
+    type=float,
+    help="a_priority |Δd| tol (m) for sat_edge vs product_lock only "
+    "(global NMS keeps 2.5).",
+)
+@click.option(
+    "--gap-nms-no-opposite/--gap-nms-opposite",
+    "gap_nms_no_opposite",
+    default=True,
+    show_default=True,
+    help="Drop |d+d_k| opposite-normal clause for sat_edge vs product_lock "
+    "(default on). Other sources keep opposite-d.",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -840,6 +866,9 @@ def facades_cmd(
     sat_edge_reanchor: bool,
     sat_edge_max_drift_m: float,
     sat_aabb_gate_sat_edge_m: float | None,
+    gap_nms_xy_m: float,
+    gap_nms_d_tol_m: float,
+    gap_nms_no_opposite: bool,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -863,6 +892,11 @@ def facades_cmd(
     onto its seed edge; reject ``refine_drift`` if |Δd| > ``--sat-edge-max-drift``.
     AABB distance is to that ``edge_id`` segment. Optional
     ``--sat-aabb-gate-sat-edge`` softens the gate for sat_edge only (not MA peels).
+
+    ``--gap-nms-xy`` / ``--gap-nms-d-tol`` / ``--gap-nms-no-opposite``: edge-aware
+    a_priority dup for ``ma_gap_sat_edge`` vs product_lock only (cover check,
+    tighter XY/Δd, no opposite-d). Does **not** loosen global NMS for other
+    sources.
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
@@ -974,6 +1008,9 @@ def facades_cmd(
                 if sat_aabb_gate_sat_edge_m is None
                 else float(sat_aabb_gate_sat_edge_m)
             ),
+            gap_nms_xy_m=float(gap_nms_xy_m),
+            gap_nms_d_tol_m=float(gap_nms_d_tol_m),
+            gap_nms_no_opposite=bool(gap_nms_no_opposite),
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
