@@ -91,4 +91,18 @@ Per-cam free-pose · wipe 18 · hungry cloud clip · blaming sat tile (PC: tile 
 - After apply: Studio yellow≈red within ~1 m on long walls  
 - Relative photo structure unchanged (one SE(2))  
 - roofs stay put if already on sat; façades/cams/cloud moved together  
-- bak restores prior  
+- bak restores prior
+
+## Cam track → street centerline (`measure-cams`)
+
+When panos sit **off** the sat road, fit from unique cam XY → Ortho `street_mask` medial (not full Canny):
+
+```bash
+uv run ps1hood sat-offset measure-cams smoke-dense --out align/T_cam_road.json --search-r 15
+uv run ps1hood sat-offset apply smoke-dense --from align/T_cam_road.json \
+  --targets cams,cloud,facades,planes --skip roofs,street
+```
+
+Gates: n≥4 · rms≤2 m · |yaw|≤10° · ||t||≤12 m · `source=cam_street_centerline`. Measure does **not** apply.
+
+Full notes: [`sat-offset-cam-road.md`](sat-offset-cam-road.md).

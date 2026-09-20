@@ -215,10 +215,16 @@ uv run pytest
 
 When edge re-seat no-ops but product (red) is stuck vs Ortho edges (yellow):
 
-1. **Prefer Studio yellow↔red corner picks** (≥3 pairs) → fit preview → apply only on confirm.
-2. Auto Chamfer measure is available but **do not auto-apply** — NN pairs can latch road/tree.
+1. **Prefer cam→street centerline** when panos sit off the sat road (hard constraint).
+2. **Studio yellow↔red corner picks** (≥3 pairs) → fit preview → apply only on confirm.
+3. Auto Chamfer measure is available but **do not auto-apply** — NN pairs can latch road/tree.
 
 ```bash
+# Cam track → Ortho street_mask medial (measure only → T_cam_road.json):
+uv run ps1hood sat-offset measure-cams smoke-dense --out align/T_cam_road.json --search-r 15
+# after Studio preview OK:
+uv run ps1hood sat-offset apply smoke-dense --from align/T_cam_road.json   --targets cams,cloud,facades,planes --skip roofs,street
+
 # Studio picks (CLI):
 uv run ps1hood sat-offset fit-pairs smoke-dense --pairs pairs.json   # preview → align/T_pick.json
 uv run ps1hood sat-offset apply smoke-dense --from align/T_pick.json # bak + apply after confirm
@@ -230,4 +236,4 @@ uv run ps1hood sat-offset measure smoke-dense --out align/T_force.json
 
 Studio: viewer → **sat-offset pick** → yellow then red corners → **fit preview** → **apply T**.
 
-See [`docs/sat-forced-se2.md`](docs/sat-forced-se2.md).
+See [`docs/sat-forced-se2.md`](docs/sat-forced-se2.md) and [`docs/sat-offset-cam-road.md`](docs/sat-offset-cam-road.md).

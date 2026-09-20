@@ -1,10 +1,12 @@
-"""Forced SE(2) from red façade edges → yellow Ortho Canny (escape no-op seat).
+"""Forced SE(2) sat-offset: façade Chamfer, Studio picks, or cam→street centerline.
 
 Sacred: one rigid SE(2) · no free-pose · bak first · prefer sat XY.
 Reuse ``fit_se2`` / ``apply_se2_*`` / ``seat_recon_artefacts`` patterns.
 Skip roofs/street when already sat-native.
-Studio manual backup: yellow↔red corner picks → ``fit_pairs_se2`` (preview only; apply on confirm).
-Do **not** auto-apply Chamfer ``T_force``.
+Sources:
+  - façade↔Ortho Canny Chamfer → ``T_force.json`` (do **not** auto-apply)
+  - Studio yellow↔red corner picks → ``fit_pairs_se2`` (preview only; apply on confirm)
+  - unique cam XY → Ortho street_mask medial/centerline NN → ``T_cam_road.json``
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from ps1_hood.align.georef import (
 )
 from ps1_hood.align.sat_edges import ortho_canny
 from ps1_hood.project import Project
-from ps1_hood.reconstruct.sat_roofs import load_ortho_for_run, px_to_enu
+from ps1_hood.reconstruct.sat_roofs import load_cam_xy_enu, load_ortho_for_run, px_to_enu, segment_roof_yard_mask
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +45,17 @@ DEFAULT_MAX_YAW_DEG = 15.0
 DEFAULT_MAX_TRANSLATION_M = 10.0
 SOURCE_FACADE_SAT_CHAMFER = "facade_sat_chamfer"
 SOURCE_STUDIO_PICKS = "studio_corner_picks"
+SOURCE_CAM_STREET_CENTERLINE = "cam_street_centerline"
 DEFAULT_MIN_PAIRS_PICK = 3
+
+# Cam → street centerline measure gates (pack: n≥4, rms≤2m, |yaw|≤10°, ||t||≤12m)
+DEFAULT_CAM_SEARCH_R_M = 15.0
+DEFAULT_CAM_MIN_NN_M = 0.5
+DEFAULT_CAM_MAX_RMS_M = 2.0
+DEFAULT_CAM_MAX_YAW_DEG = 10.0
+DEFAULT_CAM_MAX_TRANSLATION_M = 12.0
+DEFAULT_CAM_YAW_ZERO_DEG = 2.0
+DEFAULT_CENTERLINE_MAX_POINTS = 12000
 
 DEFAULT_MS_DE_M = 6.0
 DEFAULT_MS_DYAW_DEG = 8.0
@@ -735,3 +747,344 @@ def load_t_force(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise SatOffsetError(f"invalid T_force json: {path}")
     return data
+
+
+
+def morph_skeleton(mask_u8: np.ndarray) -> np.ndarray:
+    """Binary morphological skeleton (OpenCV; no ximgproc required)."""
+    img = (mask_u8 > 0).astype(np.uint8) * 255
+    if int(cv2.countNonZero(img)) == 0:
+        return img
+    skel = np.zeros_like(img)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    while True:
+        opened = cv2.morphologyEx(img, cv2.MORPH_OPEN, element)
+        temp = cv2.subtract(img, opened)
+        eroded = cv2.erode(img, element)
+        skel = cv2.bitwise_or(skel, temp)
+        img = eroded
+        if cv2.countNonZero(img) == 0:
+            break
+    return skel
+
+
+def dt_ridge_skeleton(mask_u8: np.ndarray) -> np.ndarray:
+    """Distance-transform ridge: keep street pixels that are local DT maxima.
+
+    Fallback when morphological skeleton is too thin/empty. For each street
+    pixel, keep if DT ≥ neighbours along approximate gradient (3×3 local max
+    with DT > 0.5 px so edges are dropped).
+    """
+    bin_m = (mask_u8 > 0).astype(np.uint8)
+    if int(bin_m.sum()) < 8:
+        return bin_m.astype(np.uint8) * 255
+    dt = cv2.distanceTransform(bin_m, cv2.DIST_L2, 5)
+    # Local max in 3×3
+    k = np.ones((3, 3), dtype=np.uint8)
+    local_max = cv2.dilate(dt, k)
+    ridge = (dt >= local_max - 1e-6) & (dt > 0.75) & (bin_m > 0)
+    # Thin slightly: also require DT greater than mean of 4-neighbours
+    out = ridge.astype(np.uint8) * 255
+    if int((out > 0).sum()) < 8:
+        # Relax: top-percentile DT within street
+        vals = dt[bin_m > 0]
+        thr = float(np.percentile(vals, 85)) if vals.size else 0.5
+        out = ((dt >= thr) & (bin_m > 0)).astype(np.uint8) * 255
+    return out
+
+
+def street_mask_centerline(
+    street_m: np.ndarray,
+    *,
+    max_points: int = DEFAULT_CENTERLINE_MAX_POINTS,
+) -> np.ndarray:
+    """Street mask → skeleton pixel coordinates as (N,2) int (u=x, v=y).
+
+    Prefers ``cv2.ximgproc.thinning`` when available; else morphological
+    skeleton, with DT-ridge fallback if too sparse.
+    """
+    mask = (street_m > 0).astype(np.uint8) * 255
+    if int(cv2.countNonZero(mask)) < 16:
+        raise SatOffsetError("street_mask too empty for centerline")
+
+    skel: np.ndarray | None = None
+    ximgproc = getattr(cv2, "ximgproc", None)
+    if ximgproc is not None and hasattr(ximgproc, "thinning"):
+        try:
+            skel = ximgproc.thinning(mask)
+        except Exception:  # noqa: BLE001
+            skel = None
+    if skel is None or int(cv2.countNonZero(skel)) < 8:
+        skel = morph_skeleton(mask)
+    if int(cv2.countNonZero(skel)) < 8:
+        skel = dt_ridge_skeleton(mask)
+    if int(cv2.countNonZero(skel)) < 8:
+        raise SatOffsetError("could not extract street centerline skeleton")
+
+    ys, xs = np.where(skel > 0)
+    if len(ys) > int(max_points):
+        idx = np.linspace(0, len(ys) - 1, int(max_points)).astype(np.int64)
+        ys, xs = ys[idx], xs[idx]
+    return np.column_stack([xs, ys]).astype(np.int32)
+
+
+def street_centerline_enu(
+    ortho: Any,
+    street_m: np.ndarray | None = None,
+    *,
+    max_points: int = DEFAULT_CENTERLINE_MAX_POINTS,
+) -> tuple[np.ndarray, float]:
+    """Ortho street_mask medial → dense ENU XY samples + metres/pixel."""
+    if street_m is None:
+        _, _, street_m = segment_roof_yard_mask(ortho.image)
+    pix = street_mask_centerline(street_m, max_points=max_points)
+    pts = np.empty((len(pix), 2), dtype=np.float64)
+    for i, (u, v) in enumerate(pix):
+        e, n = px_to_enu(ortho, float(u), float(v))
+        pts[i, 0] = e
+        pts[i, 1] = n
+    return pts, _metres_per_px(ortho)
+
+
+def unique_cam_xy_from_project(project: Project) -> np.ndarray:
+    """Unique pano XY from align/poses.json (or cameras.json)."""
+    xy, _ = load_cam_xy_enu(project.root)
+    if xy is None or len(xy) == 0:
+        raise SatOffsetError("no camera XY in align/poses.json or cameras.json")
+    return np.asarray(xy, dtype=np.float64)
+
+
+def match_cams_to_centerline(
+    cam_xy: np.ndarray,
+    centerline_xy: np.ndarray,
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+    min_nn_m: float = DEFAULT_CAM_MIN_NN_M,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[float]]:
+    """Each cam → nearest centerline point (optional dist band).
+
+    Keep pairs with ``min_nn_m < dist ≤ search_r_m``. If that yields nothing,
+    fall back to all pairs with ``dist ≤ search_r_m`` (already-on-road cams).
+    """
+    if cam_xy.size == 0 or centerline_xy.size == 0:
+        return [], [], []
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    dists: list[float] = []
+    fallback_b: list[dict[str, Any]] = []
+    fallback_a: list[dict[str, Any]] = []
+    fallback_d: list[float] = []
+    for e, n in cam_xy:
+        d2 = (centerline_xy[:, 0] - e) ** 2 + (centerline_xy[:, 1] - n) ** 2
+        j = int(np.argmin(d2))
+        dist = float(math.sqrt(float(d2[j])))
+        if dist > float(search_r_m):
+            continue
+        b = {"e": float(e), "n": float(n)}
+        a = {"e": float(centerline_xy[j, 0]), "n": float(centerline_xy[j, 1])}
+        fallback_b.append(b)
+        fallback_a.append(a)
+        fallback_d.append(dist)
+        if dist > float(min_nn_m):
+            before.append(b)
+            after.append(a)
+            dists.append(dist)
+    if len(before) >= 2:
+        return before, after, dists
+    return fallback_b, fallback_a, fallback_d
+
+
+def _fit_translation_only(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Pure translation SE(2) (yaw=0) from mean displacement."""
+    be = float(sum(p["e"] for p in before) / len(before))
+    bn = float(sum(p["n"] for p in before) / len(before))
+    ae = float(sum(p["e"] for p in after) / len(after))
+    an = float(sum(p["n"] for p in after) / len(after))
+    return {
+        "tx_m": ae - be,
+        "ty_m": an - bn,
+        "yaw_deg": 0.0,
+        "s": 1.0,
+        "pivot_e": be,
+        "pivot_n": bn,
+    }
+
+
+def measure_cam_road_se2(
+    project: Project,
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+    min_nn_m: float = DEFAULT_CAM_MIN_NN_M,
+    max_rms_m: float = DEFAULT_CAM_MAX_RMS_M,
+    min_pairs: int = DEFAULT_MIN_PAIRS,
+    max_yaw_deg: float = DEFAULT_CAM_MAX_YAW_DEG,
+    max_translation_m: float = DEFAULT_CAM_MAX_TRANSLATION_M,
+    yaw_zero_deg: float = DEFAULT_CAM_YAW_ZERO_DEG,
+    translation_only: bool | None = None,
+) -> dict[str, Any]:
+    """Measure SE(2): unique cam XY → Ortho street_mask centerline NN.
+
+    Does not apply. Caller persists ``align/T_cam_road.json``. Gates:
+    n_pairs ≥ min_pairs, rms ≤ max_rms_m, |yaw| ≤ max_yaw_deg, ||t|| ≤ max_translation_m.
+    Prefer translation-dominant: if |yaw| ≤ yaw_zero_deg (or ``translation_only``),
+    fit tx,ty with yaw=0 for stability.
+    """
+    cam_xy = unique_cam_xy_from_project(project)
+    if len(cam_xy) < int(min_pairs):
+        raise SatOffsetError(
+            f"need ≥{min_pairs} unique cams, got {len(cam_xy)}"
+        )
+
+    ortho = load_ortho_for_run(project.root)
+    _, _, street_m = segment_roof_yard_mask(ortho.image)
+    centerline_xy, mpp = street_centerline_enu(ortho, street_m)
+    before, after, dists = match_cams_to_centerline(
+        cam_xy,
+        centerline_xy,
+        search_r_m=search_r_m,
+        min_nn_m=min_nn_m,
+    )
+    if len(before) < int(min_pairs):
+        raise SatOffsetError(
+            f"need ≥{min_pairs} cam↔centerline pairs within {search_r_m}m, got {len(before)}"
+        )
+
+    T = fit_se2(before, after)
+    yaw = float(T.get("yaw_deg", 0.0))
+    use_t_only = bool(translation_only) if translation_only is not None else (
+        abs(yaw) <= float(yaw_zero_deg)
+    )
+    if use_t_only:
+        T = _fit_translation_only(before, after)
+        yaw = 0.0
+
+    rms = _residual_rms(before, after, T)
+    tx = float(T.get("tx_m", 0.0))
+    ty = float(T.get("ty_m", 0.0))
+    yaw = float(T.get("yaw_deg", 0.0))
+    trans = math.hypot(tx, ty)
+
+    if rms > float(max_rms_m):
+        raise SatOffsetError(f"rms {rms:.3f}m > gate {max_rms_m}m")
+    if abs(yaw) > float(max_yaw_deg):
+        raise SatOffsetError(f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°")
+    if trans > float(max_translation_m):
+        raise SatOffsetError(f"||t|| {trans:.3f}m > gate {max_translation_m}m")
+
+    preview_mapped: list[dict[str, float]] = []
+    for b in before:
+        e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
+        preview_mapped.append({"e": float(e2), "n": float(n2)})
+
+    return {
+        "tx_m": tx,
+        "ty_m": ty,
+        "yaw_deg": yaw,
+        "s": 1.0,
+        "pivot_e": float(T.get("pivot_e", 0.0)),
+        "pivot_n": float(T.get("pivot_n", 0.0)),
+        "source": SOURCE_CAM_STREET_CENTERLINE,
+        "rms_m": float(rms),
+        "n_pairs": int(len(before)),
+        "n_cams": int(len(cam_xy)),
+        "n_centerline": int(len(centerline_xy)),
+        "search_r_m": float(search_r_m),
+        "min_nn_m": float(min_nn_m),
+        "m_per_px": float(mpp),
+        "mean_nn_m": float(sum(dists) / len(dists)) if dists else float("nan"),
+        "translation_only": bool(use_t_only),
+        "t_norm_m": float(trans),
+        "preview": {
+            "cams_before": [{"e": float(b["e"]), "n": float(b["n"])} for b in before],
+            "cams_mapped": preview_mapped,
+            "centerline_targets": [{"e": float(a["e"]), "n": float(a["n"])} for a in after],
+        },
+        "applied": False,
+    }
+
+
+def write_cam_road_overlay(
+    project: Project,
+    payload: dict[str, Any],
+    *,
+    out_path: Path | None = None,
+) -> Path | None:
+    """Optional top-down PNG: red cams, yellow centerline targets, cyan mapped."""
+    preview = payload.get("preview") or {}
+    before = preview.get("cams_before") or []
+    mapped = preview.get("cams_mapped") or []
+    targets = preview.get("centerline_targets") or []
+    if not before:
+        return None
+    try:
+        ortho = load_ortho_for_run(project.root)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cam-road overlay: no ortho (%s)", exc)
+        return None
+    img = ortho.image.copy()
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    def _px(e: float, n: float) -> tuple[int, int]:
+        u, v = ortho.enu_to_px(e, n)
+        return int(round(u)), int(round(v))
+
+    for t in targets:
+        u, v = _px(float(t["e"]), float(t["n"]))
+        cv2.circle(img, (u, v), 2, (0, 255, 255), -1)  # yellow-ish
+    for b in before:
+        u, v = _px(float(b["e"]), float(b["n"]))
+        cv2.circle(img, (u, v), 4, (0, 0, 255), -1)  # red
+    for m in mapped:
+        u, v = _px(float(m["e"]), float(m["n"]))
+        cv2.circle(img, (u, v), 3, (255, 255, 0), -1)  # cyan
+    for b, m in zip(before, mapped):
+        cv2.line(img, _px(float(b["e"]), float(b["n"])), _px(float(m["e"]), float(m["n"])), (255, 128, 0), 1)
+
+    dest = Path(out_path) if out_path else (project.align_dir / "T_cam_road_overlay.png")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dest), img)
+    return dest
+
+
+def persist_t_cam_road(
+    project: Project,
+    payload: dict[str, Any],
+    *,
+    t_path: Path | None = None,
+    overlay: bool = False,
+    overlay_path: Path | None = None,
+) -> dict[str, str]:
+    """Write ``align/T_cam_road.json`` (measure only — no apply)."""
+    dest = Path(t_path) if t_path else (project.align_dir / "T_cam_road.json")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    t_body = {
+        "tx_m": float(payload["tx_m"]),
+        "ty_m": float(payload["ty_m"]),
+        "yaw_deg": float(payload["yaw_deg"]),
+        "s": float(payload.get("s", 1.0)),
+        "pivot_e": float(payload.get("pivot_e", 0.0)),
+        "pivot_n": float(payload.get("pivot_n", 0.0)),
+        "source": payload.get("source", SOURCE_CAM_STREET_CENTERLINE),
+        "rms_m": float(payload.get("rms_m", 0.0)),
+        "n_pairs": int(payload.get("n_pairs", 0)),
+        "n_cams": int(payload.get("n_cams", 0)),
+        "mean_nn_m": float(payload.get("mean_nn_m", float("nan"))),
+        "t_norm_m": float(payload.get("t_norm_m", math.hypot(float(payload["tx_m"]), float(payload["ty_m"])))),
+        "translation_only": bool(payload.get("translation_only", False)),
+        "applied": False,
+        "note": "preview only — apply via sat-offset apply --from align/T_cam_road.json",
+    }
+    write_t_force(dest, t_body)
+    out: dict[str, str] = {"T_cam_road": str(dest)}
+    if overlay:
+        ov = write_cam_road_overlay(project, payload, out_path=overlay_path)
+        if ov is not None:
+            out["overlay"] = str(ov)
+    return out
