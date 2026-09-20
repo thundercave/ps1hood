@@ -53,12 +53,12 @@
 
     const sceneJson = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/scene')).json();
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
-      + `<br><label><input type="checkbox" id="togCloud"> cloud (raw MA)</label>`
+      + `<br><label><input type="checkbox" id="togCloud" checked> cloud (raw MA)</label>`
       + ` <label><input type="checkbox" id="togZclean"> zclean</label>`
       + ` <label><input type="checkbox" id="togOfftile"> offtile</label>`
-      + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
-      + ` <label><input type="checkbox" id="togRoofs" checked> roofs</label>`
-      + ` <label><input type="checkbox" id="togStreet" checked> street</label>`
+      + ` <label><input type="checkbox" id="togFacades"> facades (overlay)</label>`
+      + ` <label><input type="checkbox" id="togRoofs"> roofs (overlay)</label>`
+      + ` <label><input type="checkbox" id="togStreet"> street (overlay)</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
       + `<br><label><input type="checkbox" id="togSculpt"> sculpt</label>`
       + ` <button type="button" id="btnSculptTranslate" disabled>nudge n</button>`
@@ -213,7 +213,7 @@
       remapEnuGeometry(geom);
       const mat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, opacity: 0.45, transparent: true });
       cloudPoints = new THREE.Points(geom, mat);
-      cloudPoints.visible = false;  // hero default: façades + sat roofs; cloud = debug toggle
+      cloudPoints.visible = true;  // hero default: raw MA cloud; façades/roofs/street = overlay toggles
       scene.add(cloudPoints);
     } catch (err) {
       hud.innerHTML += '<br>no point cloud yet';
@@ -280,6 +280,7 @@
           }
         }
       });
+      facadeRoot.visible = false;  // overlay: opt-in via #togFacades / sculpt auto-enable
       scene.add(facadeRoot);
     } catch (err) {
       hud.innerHTML += '<br>no textured facades yet';
@@ -326,6 +327,7 @@
           }
         }
       });
+      roofRoot.visible = false;  // overlay: opt-in via #togRoofs
       scene.add(roofRoot);
     } catch (err) {
       hud.innerHTML += '<br>no sat roofs yet';
@@ -374,6 +376,7 @@
           }
         }
       });
+      streetRoot.visible = false;  // overlay: opt-in via #togStreet
       scene.add(streetRoot);
     } catch (err) {
       hud.innerHTML += '<br>no sat street yet';
@@ -614,7 +617,15 @@
       const camSel = document.getElementById('sculptCam');
       if (camSel) camSel.disabled = !sculptOn;
       if (!sculptOn) clearSelect();
-      else updateSculptStatus();
+      else {
+        // Sculpt needs façades selectable — auto-enable overlay if currently off
+        const tf = document.getElementById('togFacades');
+        if (tf && !tf.checked) {
+          tf.checked = true;
+          if (facadeRoot) facadeRoot.visible = true;
+        }
+        updateSculptStatus();
+      }
     };
     document.getElementById('togSculpt')?.addEventListener('change', (ev) => {
       setSculptEnabled(ev.target.checked);

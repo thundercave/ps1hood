@@ -30,7 +30,7 @@ uv run ps1hood street smoke-dense \
   --cam-corridor-m 4
 ```
 
-Studio: hard-reload → **street** toggle (default **ON** with façades + roofs; raw MA cloud still default-off).
+Studio: hard-reload → **street** toggle (default **OFF** overlay; cloud-first hero — façades/roofs also default-off).
 
 ---
 
