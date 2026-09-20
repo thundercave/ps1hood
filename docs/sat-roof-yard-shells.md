@@ -13,11 +13,16 @@ Pack: `/workspace/complete-scene-no-holes-rd.md` (PR-A only).
 1. Load `runs/<name>/satellite/ortho.jpg` + `ortho.json` into `Ortho` (ENU).
 2. Segment roof / yard footprints: **Canny barriers + flood from image border** (street/open), classify green interiors as yards, remainder as roofs.
 3. Flat **AABB shell quads** in Ortho ENU XY.
-4. **Z** = MA `cloud.ply` median inside polygon, else façade top from `planes.json`, else `ground_z + 8 m` (yards → `ground_z + 0.15`).
-5. Texture from **sat crop** of each footprint (nearest in Studio).
-6. Write `recon/roofs.obj` + `roofs.mtl` + `textures/roof_*.jpg` + `roofs.json`.
+4. **Z (roofs)** = high percentile of MA z in footprint (if clearly above ground / cam slab), else façade top from `planes.json`, else `ground_z + 8 m`. **Never** street/cam height. **Yards** = low ground band (`ground_z + ~0.15`), thin near ground.
+5. **Footprints** = eroded mask + AABB inset (~0.75 m). Reject shells that overlap sat street/asphalt or camera XY corridor (± margin). Skip roofs whose Z still intersects the street-view slab at cam height.
+6. Texture from **sat crop** of each footprint (nearest in Studio).
+7. Write `recon/roofs.obj` + `roofs.mtl` + `textures/roof_*.jpg` + `roofs.json`.
 
-Does **not** touch hybrid façades / unclipped MA cloud. Does **not** invent BAG/OSM extrusions.
+Does **not** touch hybrid façades / unclipped MA cloud. Does **not** invent BAG/OSM extrusions. Sat XY lock stays sacred.
+
+### Post-PR #32 fix (`fix/sat-roofs-z-footprint`)
+
+PC after merge saw ≥1 slab too low / over-wide cutting street-level view (`ma_median` of ground points in a spilled footprint). Fix: roof Z = MA **high** percentile or façade top; shrink footprints; reject street/cam overlap; fail-skip street-slab shells.
 
 ---
 
@@ -45,7 +50,7 @@ Fail-loud: missing `ortho.json` / empty sat image / zero footprints after segmen
 ps1hood roofs smoke-dense
 ```
 
-Studio hard-reload; BAG off; expect roofs/yards closing sky holes over buildings and empty backyards/parking pads (street surface stays sat ground plane).
+Studio hard-reload; BAG off; expect roofs/yards closing sky holes over buildings and empty backyards/parking pads (street surface stays sat ground plane). **No street-cutting slabs** at cam height — roofs at façade-top / MA high median; yards near ground; footprints inset off the road/camera corridor.
 
 ---
 

@@ -13,10 +13,13 @@ from ps1_hood.reconstruct.sat_roofs import (
     SatRoofError,
     assign_shell_z,
     build_sat_roofs,
+    cam_corridor_overlap_frac,
     enu_corners_quad,
     extract_roof_yard_polygons,
+    filter_street_slab_shells,
     load_ortho_for_run,
     px_to_enu,
+    reject_street_overlapping_regions,
     segment_roof_yard_mask,
     write_roofs_obj,
 )
@@ -125,9 +128,9 @@ def test_assign_z_ma_median_and_facade_fallback(tmp_path: Path) -> None:
             np.full(40, 9.5),
         ]
     )
-    out = assign_shell_z(regions, pts, planes_json=None)
+    out = assign_shell_z(regions, pts, planes_json=None, cam_u=2.5)
     roof_out = next(r for r in out if r["id"] == roof["id"])
-    assert roof_out["z_source"] == "ma_median"
+    assert roof_out["z_source"] == "ma_high"
     assert abs(roof_out["z"] - 9.5) < 0.2
 
     # No cloud → façade top / default
@@ -185,7 +188,141 @@ def test_write_roofs_obj_and_build(tmp_path: Path) -> None:
 
 def test_segment_masks_nonempty_on_building() -> None:
     ortho = _synthetic_ortho()
-    roof_m, yard_m = segment_roof_yard_mask(ortho.image)
+    roof_m, yard_m, street_m = segment_roof_yard_mask(ortho.image)
     assert roof_m.shape[:2] == ortho.image.shape[:2]
-    # At least one of roof/yard should light up
+    assert street_m.shape[:2] == ortho.image.shape[:2]
+    # At least one of roof/yard should light up; street (border flood) too
     assert int((roof_m > 0).sum()) + int((yard_m > 0).sum()) > 50
+    assert int((street_m > 0).sum()) > 50
+
+
+def test_roof_z_high_percentile_not_ground_band() -> None:
+    """Roof Z must use high MA band — ground points must not pull shell to street."""
+    ortho = _synthetic_ortho()
+    regions = extract_roof_yard_polygons(ortho, min_area_m2=2.0, inset_m=0.5)
+    roof = next(r for r in regions if r["kind"] == "roof")
+    es = [p[0] for p in roof["polygon_enu"]]
+    ns = [p[1] for p in roof["polygon_enu"]]
+    e0, e1 = min(es), max(es)
+    n0, n1 = min(ns), max(ns)
+    rng = np.random.default_rng(1)
+    # Mix: many ground points + fewer roof-height points
+    n_g, n_r = 60, 20
+    ground = np.column_stack(
+        [
+            rng.uniform(e0, e1, n_g),
+            rng.uniform(n0, n1, n_g),
+            np.full(n_g, 1.2),
+        ]
+    )
+    roof_pts = np.column_stack(
+        [
+            rng.uniform(e0, e1, n_r),
+            rng.uniform(n0, n1, n_r),
+            np.full(n_r, 9.8),
+        ]
+    )
+    xyz = np.vstack([ground, roof_pts])
+    out = assign_shell_z(regions, xyz, planes_json=None, cam_u=2.5)
+    roof_out = next(r for r in out if r["id"] == roof["id"])
+    assert roof_out["z_source"] == "ma_high"
+    assert roof_out["z"] >= 8.0  # façade-ish, not street
+
+
+def test_roof_z_low_ma_falls_back_facade(tmp_path: Path) -> None:
+    """When MA in footprint is only street-height, fall back to façade top."""
+    ortho = _synthetic_ortho()
+    regions = extract_roof_yard_polygons(ortho, min_area_m2=2.0, inset_m=0.5)
+    roof = next(r for r in regions if r["kind"] == "roof")
+    es = [p[0] for p in roof["polygon_enu"]]
+    ns = [p[1] for p in roof["polygon_enu"]]
+    e0, e1 = min(es), max(es)
+    n0, n1 = min(ns), max(ns)
+    rng = np.random.default_rng(2)
+    pts = np.column_stack(
+        [
+            rng.uniform(e0, e1, 40),
+            rng.uniform(n0, n1, 40),
+            np.full(40, 1.4),  # street height only
+        ]
+    )
+    planes = tmp_path / "planes.json"
+    planes.write_text(
+        '{"ground_z": 1.0, "planes": [{"quad": [[0,0,1],[1,0,1],[1,0,10],[0,0,10]], '
+        '"height_m": 9.0}]}',
+        encoding="utf-8",
+    )
+    out = assign_shell_z(regions, pts, planes_json=planes, cam_u=2.5)
+    roof_out = next(r for r in out if r["id"] == roof["id"])
+    assert roof_out["z_source"] in ("facade_top", "facade_top_clamp")
+    assert roof_out["z"] >= 8.0
+
+
+def test_yard_z_stays_near_ground(tmp_path: Path) -> None:
+    ortho = _synthetic_ortho()
+    regions = extract_roof_yard_polygons(ortho, min_area_m2=2.0, inset_m=0.5)
+    yards = [r for r in regions if r["kind"] == "yard"]
+    if not yards:
+        pytest.skip("synthetic ortho produced no yard")
+    planes = tmp_path / "planes.json"
+    planes.write_text(
+        '{"ground_z": 1.0, "planes": [{"quad": [[0,0,1],[1,0,1],[1,0,10],[0,0,10]]}]}',
+        encoding="utf-8",
+    )
+    out = assign_shell_z(regions, None, planes_json=planes, cam_u=2.5)
+    for y in out:
+        if y["kind"] == "yard":
+            assert abs(y["z"] - 1.15) < 0.5  # ground + small offset
+
+
+def test_street_cam_overlap_reject() -> None:
+    """AABB overlapping camera corridor must be rejected."""
+    aabb = [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)]
+    cam_xy = np.array([[0.0, 0.0], [1.0, 0.5]], dtype=np.float64)
+    frac = cam_corridor_overlap_frac(aabb, cam_xy, margin_m=3.0)
+    assert frac > 0.12
+    regions = [
+        {
+            "id": "roof_spill",
+            "kind": "roof",
+            "area_m2": 100.0,
+            "aabb_enu": aabb,
+            "bbox_px": (0, 0, 10, 10),
+            "polygon_enu": aabb,
+        }
+    ]
+    kept = reject_street_overlapping_regions(
+        regions, cam_xy=cam_xy, street_mask=None, cam_overlap_frac=0.10
+    )
+    assert kept == []
+
+
+def test_filter_street_slab_skips_low_roof() -> None:
+    regions = [
+        {
+            "id": "roof_low",
+            "kind": "roof",
+            "z": 1.45,
+            "ground_z": 1.2,
+            "min_roof_z": 5.2,
+        },
+        {
+            "id": "roof_ok",
+            "kind": "roof",
+            "z": 10.2,
+            "ground_z": 1.2,
+            "min_roof_z": 5.2,
+        },
+        {
+            "id": "yard_ok",
+            "kind": "yard",
+            "z": 1.35,
+            "ground_z": 1.2,
+            "min_roof_z": 5.2,
+        },
+    ]
+    kept = filter_street_slab_shells(regions, cam_u=2.5)
+    ids = {r["id"] for r in kept}
+    assert "roof_low" not in ids
+    assert "roof_ok" in ids
+    assert "yard_ok" in ids
