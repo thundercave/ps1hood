@@ -22,12 +22,18 @@ log = logging.getLogger(__name__)
 # Recipe knobs
 GAP_FILL_DISTANCES_M = (6.0, 10.0, 14.0, 18.0)
 GAP_FILL_PEEL_CAP = 32
-GAP_FILL_MAX_KEEP = 18
+GAP_FILL_MAX_KEEP = 24
 GAP_FILL_MIN_FRONTAL = 0.20  # far-side only (default Path α = 0.25)
 GAP_FILL_CAM_MARGIN_M = 3.0
 GAP_FILL_CORNER_INSET_M = 1.0
 GAP_FILL_WIDTH_M = 8.0
 GAP_FILL_HEIGHT_M = 9.0
+
+# Worst-cam targeted seeds (pack: rings × yaw, not global peel spam)
+WORST_CAM_DISTANCES_M = (8.0, 12.0, 16.0, 20.0)
+WORST_CAM_YAWS_DEG = (0.0, 45.0, -45.0, 90.0, -90.0)
+WORST_CAM_MIN_FRONTAL = 0.25
+WORST_CAM_HYP_CAP = 40
 
 
 def estimate_travel_heading_deg(frames: list[dict[str, Any]]) -> float | None:
@@ -325,18 +331,278 @@ def count_untextured_product(dest_obj: Path) -> tuple[int, int]:
     return n_planes, n_untex
 
 
+
+def parse_cam_id(cam_id: str) -> tuple[str, float]:
+    """Parse compare/overlay cam id ``pano_hNNN`` → (pano_id, heading_deg).
+
+    Heading suffix is ``_h`` + integer degrees (e.g. ``_h000``, ``_h120``).
+    """
+    cid = str(cam_id or "").strip()
+    if not cid:
+        raise ValueError("empty cam_id")
+    # Prefer last ``_hNNN`` segment (pano ids may contain underscores)
+    idx = cid.rfind("_h")
+    if idx < 0:
+        raise ValueError(f"cam_id missing _hNNN suffix: {cam_id!r}")
+    pano = cid[:idx]
+    rest = cid[idx + 2 :]
+    if not rest.isdigit():
+        raise ValueError(f"cam_id heading not integer degrees: {cam_id!r}")
+    heading = float(int(rest) % 360)
+    if not pano:
+        raise ValueError(f"cam_id missing pano_id: {cam_id!r}")
+    return pano, heading
+
+
+def make_frame_cam_id(frame: dict[str, Any]) -> str:
+    """Match ``compare.make_cam_id`` without importing compare (light helper)."""
+    pid = str(frame.get("pano_id") or "cam")
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in pid)
+    h = int(round(float(frame.get("heading") or 0.0))) % 360
+    return f"{safe}_h{h:03d}"
+
+
+def find_frame_for_cam_id(
+    frames: list[dict[str, Any]], cam_id: str
+) -> dict[str, Any] | None:
+    """Resolve a worst-cam id to a keyframe dict (exact id, else pano+heading)."""
+    from ps1_hood.geo import heading_diff
+
+    want = str(cam_id).strip()
+    for fr in frames:
+        if make_frame_cam_id(fr) == want:
+            return fr
+    try:
+        pano, heading = parse_cam_id(want)
+    except ValueError:
+        return None
+    best: dict[str, Any] | None = None
+    best_sep = 999.0
+    for fr in frames:
+        if str(fr.get("pano_id") or "") != pano:
+            continue
+        sep = abs(heading_diff(float(fr.get("heading") or 0.0), heading))
+        if sep < best_sep:
+            best_sep = sep
+            best = fr
+    if best is not None and best_sep <= 5.0:
+        return best
+    return None
+
+
+def load_worst_cam_ids_from_compare(
+    project_root: Path, n: int = 3
+) -> list[str]:
+    """Read ``recon/compare/summary.json`` finite-worst list (top-N ids)."""
+    import json
+
+    root = Path(project_root)
+    path = root / "recon" / "compare" / "summary.json"
+    if not path.is_file():
+        log.warning("gap_fill: no compare summary at %s", path)
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("gap_fill: compare summary unreadable (%s)", exc)
+        return []
+    worst = payload.get("worst") or []
+    ids: list[str] = []
+    for row in worst:
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]))
+        elif isinstance(row, str):
+            ids.append(row)
+        if len(ids) >= int(n):
+            break
+    return ids
+
+
+def hyp_frontal_to_frame(hyp: dict[str, Any], frame: dict[str, Any]) -> float:
+    """Frontal score of hyp normal vs camera forward (0..1-ish; may be neg)."""
+    n = np.asarray(hyp["n"], dtype=np.float64)
+    center = np.asarray(hyp["center"], dtype=np.float64)
+    n_xy = n[:2] / (np.linalg.norm(n[:2]) + 1e-12)
+    C = np.array(
+        [float(frame["e"]), float(frame["n"]), float(frame.get("u") or 0.0)],
+        dtype=np.float64,
+    )
+    to_cam = C[:2] - center[:2]
+    n_use = n_xy.copy()
+    if float(n_use @ to_cam) < 0:
+        n_use = -n_use
+    h = math.radians(float(frame.get("heading") or 0.0))
+    # camera_rotation_cv forward xy = (sin h, cos h)
+    fwd = np.array([math.sin(h), math.cos(h)], dtype=np.float64)
+    return float((-fwd) @ n_use)
+
+
+def filter_hyps_visible_in_cams(
+    hyps: list[dict[str, Any]],
+    cam_frames: list[dict[str, Any]],
+    *,
+    min_frontal: float = WORST_CAM_MIN_FRONTAL,
+) -> list[dict[str, Any]]:
+    """Keep hyps with frontal≥min to *at least one* of the given cams."""
+    if not hyps:
+        return []
+    if not cam_frames:
+        return list(hyps)
+    kept: list[dict[str, Any]] = []
+    for h in hyps:
+        if any(hyp_frontal_to_frame(h, fr) >= float(min_frontal) for fr in cam_frames):
+            kept.append(h)
+    return kept
+
+
+def worst_cam_seeds(
+    frames: list[dict[str, Any]],
+    cam_ids: list[str],
+    *,
+    ground_z: float = 0.0,
+    distances_m: tuple[float, ...] = WORST_CAM_DISTANCES_M,
+    yaws_deg: tuple[float, ...] = WORST_CAM_YAWS_DEG,
+    width_m: float = GAP_FILL_WIDTH_M,
+    height_m: float = GAP_FILL_HEIGHT_M,
+    hyp_cap: int = WORST_CAM_HYP_CAP,
+) -> list[dict[str, Any]]:
+    """Seed vertical planes in front of worst cams (dist rings × yaw).
+
+    For each cam C: p0 = C_xy + rot(heading+yaw)*dist; plane faces heading+yaw;
+    source tagged ``worst_cam`` (+ ``pano_id``). Caps total hyps.
+    """
+    if not frames or not cam_ids:
+        return []
+    wall_u = ground_z + height_m * 0.45  # ~3–4 m for default height 9
+    hyps: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int]] = set()
+
+    def _add(
+        n: np.ndarray,
+        d: float,
+        center: np.ndarray,
+        *,
+        pano_id: str,
+        cam_id: str,
+    ) -> None:
+        key = (
+            int(round(math.degrees(math.atan2(float(n[0]), float(n[1]))) / 5.0)),
+            int(round(d * 2.0)),
+            int(round(float(center[0]) + float(center[1]))),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        hyps.append(
+            {
+                "n": n.astype(np.float64),
+                "d": float(d),
+                "center": center.astype(np.float64),
+                "width_m": float(width_m),
+                "height_m": float(height_m),
+                "source": "worst_cam",
+                "pano_id": pano_id,
+                "cam_id": cam_id,
+            }
+        )
+
+    for cid in cam_ids:
+        fr = find_frame_for_cam_id(frames, cid)
+        if fr is None:
+            log.warning("gap_fill: worst cam id not in frames: %s", cid)
+            continue
+        try:
+            pano, _heading_parsed = parse_cam_id(cid)
+        except ValueError:
+            pano = str(fr.get("pano_id") or "")
+        C = np.array(
+            [float(fr["e"]), float(fr["n"]), wall_u],
+            dtype=np.float64,
+        )
+        base_h = float(fr.get("heading") or 0.0)
+        for dist in distances_m:
+            for yaw in yaws_deg:
+                heading = wrap_heading(base_h + float(yaw))
+                fwd = np.array(
+                    [
+                        math.sin(math.radians(heading)),
+                        math.cos(math.radians(heading)),
+                        0.0,
+                    ],
+                    dtype=np.float64,
+                )
+                p0 = C + fwd * float(dist)
+                p0[2] = wall_u
+                n, d = vertical_plane_from_point_heading(p0, heading)
+                _add(n, d, p0, pano_id=pano, cam_id=str(cid))
+                if len(hyps) >= int(hyp_cap):
+                    break
+            if len(hyps) >= int(hyp_cap):
+                break
+        if len(hyps) >= int(hyp_cap):
+            break
+
+    log.info(
+        "gap_fill: %s worst_cam seeds from %s cam ids (cap=%s)",
+        len(hyps),
+        len(cam_ids),
+        hyp_cap,
+    )
+    return hyps
+
+
+def frame_indices_for_cam_ids(
+    frames: list[dict[str, Any]], cam_ids: list[str]
+) -> list[int]:
+    """Frame indices matching worst cam ids (for view-picker boost)."""
+    idxs: list[int] = []
+    for cid in cam_ids:
+        fr = find_frame_for_cam_id(frames, cid)
+        if fr is None:
+            continue
+        for i, f in enumerate(frames):
+            if f is fr or (
+                str(f.get("pano_id")) == str(fr.get("pano_id"))
+                and abs(float(f.get("heading") or 0.0) - float(fr.get("heading") or 0.0))
+                < 0.5
+            ):
+                if i not in idxs:
+                    idxs.append(i)
+                break
+    return idxs
+
+
 def build_gap_fill_seeds(
     frames: list[dict[str, Any]],
     project_root: Path,
     *,
     ground_z: float = 0.0,
     cam_xy: np.ndarray | None = None,
+    worst_cam_ids: list[str] | None = None,
+    hyp_cap: int = WORST_CAM_HYP_CAP,
 ) -> list[dict[str, Any]]:
-    """Manhattan side + sat corner seeds, road-rejected, side-wall ordered."""
+    """Manhattan side + sat corner (+ optional worst-cam) seeds.
+
+    When ``worst_cam_ids`` is set: emit ``worst_cam`` rings first; filter
+    manhattan/corner to hyps visible (frontal≥0.25) in those cams; cap total.
+    """
+    worst_ids = [str(c).strip() for c in (worst_cam_ids or []) if str(c).strip()]
+    worst_frames = [
+        fr
+        for cid in worst_ids
+        if (fr := find_frame_for_cam_id(frames, cid)) is not None
+    ]
+
+    worst = (
+        worst_cam_seeds(frames, worst_ids, ground_z=ground_z, hyp_cap=hyp_cap)
+        if worst_ids
+        else []
+    )
+
     man = manhattan_side_seeds(frames, ground_z=ground_z)
     regions = load_sat_roof_regions(project_root)
     corners = corner_seeds_from_roof_aabbs(regions, ground_z=ground_z) if regions else []
-    seeds = man + corners
+    side_corner = man + corners
 
     street_mask = None
     ortho = None
@@ -363,14 +629,43 @@ def build_gap_fill_seeds(
         _, idx = np.unique(rounded, axis=0, return_index=True)
         cam_xy = xy[np.sort(idx)]
 
-    seeds = reject_road_center_hyps(
-        seeds, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
+    side_corner = reject_road_center_hyps(
+        side_corner, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
     )
+    worst = reject_road_center_hyps(
+        worst, cam_xy=cam_xy, street_mask=street_mask, ortho=ortho
+    )
+
+    if worst_frames:
+        before = len(side_corner)
+        side_corner = filter_hyps_visible_in_cams(
+            side_corner, worst_frames, min_frontal=WORST_CAM_MIN_FRONTAL
+        )
+        log.info(
+            "gap_fill: filtered manhattan/corner to worst-cam visible "
+            "%s → %s (min_frontal=%.2f)",
+            before,
+            len(side_corner),
+            WORST_CAM_MIN_FRONTAL,
+        )
+
     travel = estimate_travel_heading_deg(frames)
-    seeds = prefer_side_wall_order(seeds, travel)
+    side_corner = prefer_side_wall_order(side_corner, travel)
+
+    # Prefer worst_cam seeds first; fill remaining cap with filtered side/corner
+    seeds = list(worst)
+    for h in side_corner:
+        if len(seeds) >= int(hyp_cap):
+            break
+        seeds.append(h)
+
     log.info(
-        "gap_fill: built %s seeds (manhattan+corner; travel=%s)",
+        "gap_fill: built %s seeds (worst_cam=%s manhattan+corner=%s; "
+        "worst_ids=%s travel=%s)",
         len(seeds),
+        len(worst),
+        len(side_corner),
+        worst_ids or None,
         f"{travel:.1f}" if travel is not None else "None",
     )
     return seeds

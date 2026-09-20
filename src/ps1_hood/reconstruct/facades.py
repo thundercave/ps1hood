@@ -804,6 +804,8 @@ def extract_facades(
     ps1_tex_size: int | None = 128,
     gap_fill: bool = False,
     project_root: Path | None = None,
+    worst_cam_ids: list[str] | None = None,
+    worst_from_compare: int | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -847,8 +849,13 @@ def extract_facades(
 
     PR-C ``gap_fill``: keep product / A core; add ZNCC-gated manhattan + sat
     corner seeds and road-rejected MA peels for side/return walls; ``a_priority``
-    union; quality-keep vs existing 10/8. Re-textures untextured product planes
-    on bake (do not drop). Cap peels ≤32. No BAG, no peel-as-hero.
+    union; quality-keep vs existing product. Cap peels ≤32. No BAG, no peel-as-hero.
+
+    Worst-cam targeted gap-fill: ``worst_cam_ids`` / ``worst_from_compare`` seed
+    planes in front of those cams (dist×yaw); filter manhattan/corner to visible
+    in those cams; lock product first, NMS-add new only; ``max_keep`` 24; bake
+    textures for *new* indices only; stage candidate + quality-keep (never wipe
+    existing ``textures/facade_*.jpg`` on fail).
     """
     import logging
 
@@ -917,6 +924,7 @@ def extract_facades(
     path_alpha_attempted = False
     a_kept_n = 0
     ma_added_n = 0
+    gap_bake_lock_n = 0  # product_lock count for gap-fill bake-new-only
     a_ply_str = str(ply_a) if ply_a is not None else ""
     ma_ply_str = str(ply_path) if ply_path is not None else ""
 
@@ -1063,6 +1071,8 @@ def extract_facades(
             ma_hyps = list(hyps)
             min_frontal_ma = 0.25
             keep_cap = int(n_planes)
+            prefer_frame_idxs: list[int] | None = None
+            n_product_lock = 0
             if gap_fill:
                 from ps1_hood.reconstruct.gap_fill import (
                     GAP_FILL_MAX_KEEP,
@@ -1071,6 +1081,8 @@ def extract_facades(
                     build_gap_fill_seeds,
                     count_untextured_product,
                     filter_ma_peels_for_gaps,
+                    frame_indices_for_cam_ids,
+                    load_worst_cam_ids_from_compare,
                 )
 
                 strategy = "a_priority"
@@ -1080,6 +1092,19 @@ def extract_facades(
                     int(GAP_FILL_PEEL_CAP),
                 )
                 root = Path(project_root) if project_root is not None else dest_obj.parent.parent
+                # Resolve worst-cam ids (CLI list and/or compare top-N)
+                worst_ids: list[str] = []
+                if worst_cam_ids:
+                    worst_ids.extend(str(c).strip() for c in worst_cam_ids if str(c).strip())
+                if worst_from_compare is not None and int(worst_from_compare) > 0:
+                    for cid in load_worst_cam_ids_from_compare(
+                        root, n=int(worst_from_compare)
+                    ):
+                        if cid not in worst_ids:
+                            worst_ids.append(cid)
+                prefer_frame_idxs = (
+                    frame_indices_for_cam_ids(frames, worst_ids) if worst_ids else None
+                )
                 n_prod, n_untex = count_untextured_product(dest_obj)
                 if n_untex:
                     log.info(
@@ -1088,17 +1113,19 @@ def extract_facades(
                         n_untex,
                         n_prod,
                     )
-                # Prefer product lock as A core (keep 10/8)
+                # Prefer product lock as A core (keep 18/18 / 10/8)
                 product_json = dest_obj.parent / "planes.json"
                 locked = planes_from_product_json(product_json) if product_json.is_file() else []
                 if locked:
                     accepted_a = locked
+                    n_product_lock = len(locked)
                     log.info(
                         "facades gap_fill: A core = product_lock %s planes",
                         len(accepted_a),
                     )
                 else:
                     accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
+                    n_product_lock = len(accepted_a)
                 ma_hyps = filter_ma_peels_for_gaps(
                     hyps,
                     frames,
@@ -1106,17 +1133,22 @@ def extract_facades(
                     peel_cap=peel_cap,
                 )
                 gap_seeds = build_gap_fill_seeds(
-                    frames, root, ground_z=ground_z_a
+                    frames,
+                    root,
+                    ground_z=ground_z_a,
+                    worst_cam_ids=worst_ids or None,
                 )
                 min_frontal_ma = float(GAP_FILL_MIN_FRONTAL)
                 log.info(
                     "facades gap_fill: ma_peels=%s→%s gap_seeds=%s "
-                    "min_frontal=%.2f keep_cap=%s",
+                    "min_frontal=%.2f keep_cap=%s worst_cams=%s prefer_frames=%s",
                     len(hyps),
                     len(ma_hyps),
                     len(gap_seeds),
                     min_frontal_ma,
                     keep_cap,
+                    worst_ids or None,
+                    prefer_frame_idxs,
                 )
             else:
                 accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
@@ -1134,15 +1166,39 @@ def extract_facades(
                 nms_xy_split_m=nms_xy_split,
                 union_strategy="nms",  # MA/gap NMS; final union below
                 min_frontal=min_frontal_ma,
+                prefer_frame_indices=prefer_frame_idxs,
+            )
+            # Lock product: retag A-family gap seeds so a_priority NMS-adds only
+            # (never evict product_lock via higher-ZNCC manhattan/worst_cam).
+            def _tag_gap_addable(p: dict) -> dict:
+                src = str(p.get("source") or "")
+                if src == "product_lock":
+                    return p
+                if _is_a(src):
+                    q = dict(p)
+                    q["source"] = f"ma_gap_{src}"
+                    return q
+                if src == "worst_cam":
+                    q = dict(p)
+                    q["source"] = "ma_gap_worst_cam"
+                    return q
+                return p
+
+            accepted_new = (
+                [_tag_gap_addable(p) for p in accepted_ma] if gap_fill else list(accepted_ma)
             )
             accepted = union_keep_planes(
-                list(accepted_a) + list(accepted_ma),
+                list(accepted_a) + accepted_new,
                 strategy=strategy,
                 max_keep=keep_cap,
                 nms_xy_m=nms_xy,
                 nms_xy_split_m=nms_xy_split,
                 telemetry=union_tel,
             )
+            if gap_fill:
+                if n_product_lock <= 0:
+                    n_product_lock = int(union_tel.get("a_kept") or len(accepted_a))
+                gap_bake_lock_n = int(n_product_lock)
             a_pre = int(union_tel.get("a_pre_nms") or len(accepted_a))
             a_n = int(union_tel.get("a_kept") or sum(1 for p in accepted if _is_a(p.get("source"))))
             ma_added = int(
@@ -1440,16 +1496,27 @@ def extract_facades(
         out_json = planes_json
         bake_tex_dir = tex_dir
         tex_map_prefix = "textures"
-        # Wipe-on-write only when replacing the live product
+        # Wipe-on-write only when replacing the live product.
+        # Gap-fill bake-new-only: never delete existing facade_00..N.jpg.
         tex_dir.mkdir(parents=True, exist_ok=True)
-        if tex_dir.is_dir():
+        if tex_dir.is_dir() and not (gap_fill and gap_bake_lock_n > 0):
             for old_tex in tex_dir.glob("facade_*.jpg"):
                 old_tex.unlink(missing_ok=True)
 
     bake_tex_dir.mkdir(parents=True, exist_ok=True)
+    bake_new_only = bool(gap_fill and gap_bake_lock_n > 0 and kind != "control")
     if kind in {"candidate", "control"}:
         for old_tex in bake_tex_dir.glob("facade_*.jpg"):
             old_tex.unlink(missing_ok=True)
+        # Gap-fill: seed candidate with existing product textures for locked planes
+        # so we never depend on re-baking 18/18 (and never touch product on fail).
+        if bake_new_only and tex_dir.is_dir():
+            import shutil
+
+            for i in range(int(gap_bake_lock_n)):
+                src = tex_dir / f"facade_{i:02d}.jpg"
+                if src.is_file():
+                    shutil.copy2(src, bake_tex_dir / src.name)
 
     materials: list[dict[str, Any]] = []
     # Ground sat texture always lives at textures/ground.jpg (shared)
@@ -1471,6 +1538,26 @@ def extract_facades(
         quad = pl.get("quad") or _plane_quad(pl)
         mat_name = f"facade_{i:02d}"
         map_rel = None
+        # Gap-fill: keep locked product textures; bake *new* indices only
+        if bake_new_only and i < int(gap_bake_lock_n):
+            existing = bake_tex_dir / f"facade_{i:02d}.jpg"
+            product_jpg = tex_dir / f"facade_{i:02d}.jpg"
+            if existing.is_file() or product_jpg.is_file():
+                if not existing.is_file() and product_jpg.is_file():
+                    import shutil
+
+                    shutil.copy2(product_jpg, existing)
+                map_rel = f"{tex_map_prefix}/facade_{i:02d}.jpg"
+                textured += 1
+            materials.append(
+                {
+                    "name": mat_name,
+                    "map": map_rel,
+                    "kd": (0.55, 0.50, 0.42),
+                    "quad": quad,
+                }
+            )
+            continue
         if frames:
             cam = _pick_frontal_camera(pl, quad, frames)
             if cam is not None:

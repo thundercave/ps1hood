@@ -728,6 +728,18 @@ def export_mapanything_bundle_cmd(
     help="PR-C: manhattan+corner seeds from sat roofs + MA peels for side walls; "
     "a_priority; quality-keep vs product (no peel spam / no BAG)",
 )
+@click.option(
+    "--worst-cams",
+    default=None,
+    type=str,
+    help="Comma-separated compare cam ids (pano_hNNN) for targeted gap-fill seeds",
+)
+@click.option(
+    "--worst-from-compare",
+    default=None,
+    type=int,
+    help="Auto-load top-N worst cam ids from recon/compare/summary.json",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -757,6 +769,8 @@ def facades_cmd(
     ps1_tex_size: int,
     sat_roofs: bool,
     gap_fill: bool,
+    worst_cams: str | None,
+    worst_from_compare: int | None,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -765,7 +779,11 @@ def facades_cmd(
 
     ``--gap-fill`` (PR-C): keep product A core; add ZNCC-gated manhattan /
     sat-corner seeds + road-rejected MA peels for side/return walls; promote
-    only via quality-keep (never demote 10/8).
+    only via quality-keep (never demote product).
+
+    ``--worst-cams`` / ``--worst-from-compare``: seed planes toward those cams
+    (dist 8–20 m × yaw 0/±45/±90); filter manhattan/corner to visible in them;
+    lock product, NMS-add new, max_keep 24, bake new textures only.
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
@@ -859,6 +877,12 @@ def facades_cmd(
             ps1_tex_size=(None if int(ps1_tex_size) <= 0 else int(ps1_tex_size)),
             gap_fill=gap_fill,
             project_root=project.root,
+            worst_cam_ids=(
+                [c.strip() for c in str(worst_cams).split(",") if c.strip()]
+                if worst_cams
+                else None
+            ),
+            worst_from_compare=worst_from_compare,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)

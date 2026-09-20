@@ -12,15 +12,23 @@ import pytest
 
 from ps1_hood.reconstruct.facades import _is_strictly_better, extract_facades
 from ps1_hood.reconstruct.gap_fill import (
+    GAP_FILL_MAX_KEEP,
     GAP_FILL_PEEL_CAP,
+    WORST_CAM_DISTANCES_M,
+    WORST_CAM_YAWS_DEG,
     build_gap_fill_seeds,
     corner_seeds_from_roof_aabbs,
     count_untextured_product,
     estimate_travel_heading_deg,
+    filter_hyps_visible_in_cams,
     filter_ma_peels_for_gaps,
+    find_frame_for_cam_id,
+    load_worst_cam_ids_from_compare,
     manhattan_side_seeds,
+    parse_cam_id,
     prefer_side_wall_order,
     reject_road_center_hyps,
+    worst_cam_seeds,
 )
 from ps1_hood.reconstruct.planarize import is_a_source, is_ma_source
 
@@ -306,3 +314,160 @@ def test_gap_fill_extract_keeps_product_on_weak(
     product = json.loads((tmp_path / "planes.json").read_text(encoding="utf-8"))
     assert len(product["planes"]) == 10
     assert meta.get("preserved_previous") or meta.get("planes") == 10
+
+
+def test_parse_cam_id_heading_suffix() -> None:
+    pano, h = parse_cam_id("1-hH0xS8V_656nPgqQnl6A_h000")
+    assert pano == "1-hH0xS8V_656nPgqQnl6A"
+    assert h == 0.0
+    pano2, h2 = parse_cam_id("Vd7vlCY1OAUkLlszrnLbDg_h120")
+    assert pano2 == "Vd7vlCY1OAUkLlszrnLbDg"
+    assert h2 == 120.0
+    pano3, h3 = parse_cam_id("1g2FRL3bCGcwgPO48E70-Q_h180")
+    assert h3 == 180.0
+    with pytest.raises(ValueError):
+        parse_cam_id("no_suffix")
+
+
+def test_worst_cam_seeds_rings_and_yaws() -> None:
+    frames = [
+        _frame(0.0, 0.0, 0.0, travel=90.0, i=0),  # looking N
+    ]
+    frames[0]["pano_id"] = "1-hH0xS8V_656nPgqQnl6A"
+    cam_id = "1-hH0xS8V_656nPgqQnl6A_h000"
+    hyps = worst_cam_seeds(frames, [cam_id], ground_z=0.0)
+    assert hyps
+    assert all(h["source"] == "worst_cam" for h in hyps)
+    assert all(h.get("pano_id") == "1-hH0xS8V_656nPgqQnl6A" for h in hyps)
+    # 4 distances × 5 yaws = 20 (under cap)
+    assert len(hyps) == len(WORST_CAM_DISTANCES_M) * len(WORST_CAM_YAWS_DEG)
+    # Centers should sit ~8–20 m from cam along some yaw
+    dists = [float(np.linalg.norm(h["center"][:2] - np.array([0.0, 0.0]))) for h in hyps]
+    assert min(dists) >= 7.5
+    assert max(dists) <= 20.5
+
+
+def test_filter_hyps_visible_in_worst_cams() -> None:
+    # Cam looking +E (heading 90); plane facing cam (normal +W toward cam from +E)
+    cam = _frame(0.0, 0.0, 90.0, travel=0.0, i=0)
+    visible = {
+        "n": np.array([-1.0, 0.0, 0.0]),
+        "d": 10.0,
+        "center": np.array([10.0, 0.0, 4.0]),
+        "width_m": 8.0,
+        "height_m": 9.0,
+        "source": "manhattan",
+    }
+    behind = {
+        "n": np.array([1.0, 0.0, 0.0]),
+        "d": -10.0,
+        "center": np.array([-10.0, 0.0, 4.0]),
+        "width_m": 8.0,
+        "height_m": 9.0,
+        "source": "manhattan",
+    }
+    kept = filter_hyps_visible_in_cams([visible, behind], [cam], min_frontal=0.25)
+    assert len(kept) == 1
+    assert float(kept[0]["center"][0]) == 10.0
+
+
+def test_find_frame_for_cam_id() -> None:
+    frames = [
+        _frame(1.0, 2.0, 120.0, travel=0.0, i=0),
+        _frame(3.0, 4.0, 0.0, travel=0.0, i=1),
+    ]
+    frames[0]["pano_id"] = "Vd7vlCY1OAUkLlszrnLbDg"
+    frames[1]["pano_id"] = "other"
+    fr = find_frame_for_cam_id(frames, "Vd7vlCY1OAUkLlszrnLbDg_h120")
+    assert fr is not None
+    assert float(fr["e"]) == 1.0
+
+
+def test_load_worst_from_compare(tmp_path: Path) -> None:
+    compare = tmp_path / "recon" / "compare"
+    compare.mkdir(parents=True)
+    (compare / "summary.json").write_text(
+        json.dumps(
+            {
+                "worst": [
+                    {"id": "a_h000", "zncc_mean": -0.1},
+                    {"id": "b_h120", "zncc_mean": -0.05},
+                    {"id": "c_h180", "zncc_mean": -0.01},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ids = load_worst_cam_ids_from_compare(tmp_path, n=2)
+    assert ids == ["a_h000", "b_h120"]
+
+
+def test_build_gap_fill_seeds_worst_cam_filter(tmp_path: Path) -> None:
+    frames = [
+        _frame(0.0, 0.0, 0.0, travel=90.0, i=0),
+        _frame(5.0, 0.0, 0.0, travel=90.0, i=1),
+    ]
+    frames[0]["pano_id"] = "camA"
+    frames[1]["pano_id"] = "camB"
+    with patch(
+        "ps1_hood.reconstruct.gap_fill.load_sat_roof_regions", return_value=[]
+    ):
+        seeds = build_gap_fill_seeds(
+            frames,
+            tmp_path,
+            ground_z=0.0,
+            worst_cam_ids=["camA_h000"],
+        )
+    assert any(h["source"] == "worst_cam" for h in seeds)
+    # manhattan (if any remain) must be visible to camA
+    man = [h for h in seeds if h["source"] == "manhattan"]
+    if man:
+        kept = filter_hyps_visible_in_cams(man, [frames[0]], min_frontal=0.25)
+        assert len(kept) == len(man)
+
+
+def test_gap_fill_max_keep_24() -> None:
+    assert GAP_FILL_MAX_KEEP == 24
+
+
+def test_worst_cam_not_a_family() -> None:
+    assert not is_a_source("worst_cam")
+    assert not is_a_source("ma_gap_worst_cam")
+    assert not is_a_source("ma_gap_manhattan")
+    assert is_a_source("product_lock")
+    assert is_a_source("manhattan")
+    assert is_ma_source("ma_gap_worst_cam")
+
+
+def test_quality_keep_18_18_bar() -> None:
+    """Promote if planes↑ or textured≥18 with mean not ↓>0.02."""
+    prev = {"textured": 18, "plane_count": 18, "mean_zncc": 0.138}
+    # More planes, mean within eps — promote (clause2)
+    ok, why = _is_strictly_better(
+        {"textured": 18, "plane_count": 20, "mean_zncc": 0.130}, prev
+    )
+    assert ok
+    assert "clause2" in why
+    # Mean regress >0.02 with more planes — reject
+    ok2, _ = _is_strictly_better(
+        {"textured": 18, "plane_count": 20, "mean_zncc": 0.100}, prev
+    )
+    assert not ok2
+    # Fewer textured — never promote
+    ok3, _ = _is_strictly_better(
+        {"textured": 17, "plane_count": 20, "mean_zncc": 0.20}, prev
+    )
+    assert not ok3
+
+
+def test_cli_worst_cams_options() -> None:
+    from click.testing import CliRunner
+
+    from ps1_hood.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["facades", "--help"])
+    assert result.exit_code == 0
+    assert "--worst-cams" in result.output
+    assert "--worst-from-compare" in result.output
+    assert "--gap-fill" in result.output

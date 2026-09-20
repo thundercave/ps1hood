@@ -662,8 +662,12 @@ def is_a_source(src: str | None) -> bool:
     """Milestone A family: heading×distance / manhattan / sparse / photo_* / product lock.
 
     ``corner_sat`` = PR-C gap-fill corner wraps from sat roof AABB (hypotheses only).
+    ``worst_cam`` / ``ma_gap_*`` are *addable* (not locked A) so a_priority keeps
+    product_lock first and NMS-adds new only.
     """
     s = (src or "").lower()
+    if s == "worst_cam" or s.startswith("ma_gap_"):
+        return False
     return (
         s in {"heading_distance", "manhattan", "sparse", "product_lock", "corner_sat"}
         or s.startswith("photo_")
@@ -876,6 +880,7 @@ def score_planar_hyps(
     nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
     union_strategy: str = DEFAULT_UNION_STRATEGY,
     min_frontal: float = 0.25,
+    prefer_frame_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
 
@@ -1008,7 +1013,12 @@ def score_planar_hyps(
                 continue
 
             idxs = pp._pick_scoring_views(
-                frames, n_c, c_c, max_views=4, min_frontal=float(min_frontal)
+                frames,
+                n_c,
+                c_c,
+                max_views=4,
+                min_frontal=float(min_frontal),
+                prefer_indices=prefer_frame_indices,
             )
             if len(idxs) < 2:
                 continue
