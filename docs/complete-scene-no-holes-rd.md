@@ -62,12 +62,24 @@ Soft floater clip stays **off** unless you explicitly run
 `ps1hood align/run … --cloud-clip-sat` (not densify default).  
 Docs: [`mapanything-densify.md`](mapanything-densify.md) §PR-B.
 
-### PR-C — Façade gap fill (after A/B)
+### PR-C — Façade gap fill (after A/B) ★ shipped glue
 1. Seed planes from MA vertical peels **or** sat building outlines as *hypotheses only* → ZNCC gate (existing Path α).  
 2. Do **not** promote un-scored shells.  
 3. Cap peels; quality-keep vs 10/8 product.
 
 *Addresses #2 without peel-as-hero spam.*
+
+**PC recipe (smoke-dense):**
+
+```bash
+uv run ps1hood facades smoke-dense \
+  --source mapanything --a-source flow \
+  --gap-fill --max-planes 16 --zncc-accept 0.35
+# optional after promote:
+uv run ps1hood ps1-facades smoke-dense
+```
+
+Docs: [`facade-gap-fill.md`](facade-gap-fill.md).
 
 ### PR-D — Sat seat tighten (parallel, cheap)
 Edge-fused NCC (pack already shipped) when usage allows — lowers #5 residual.

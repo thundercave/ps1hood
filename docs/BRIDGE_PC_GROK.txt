@@ -64,3 +64,15 @@ grep 'element vertex' runs/smoke-dense/recon/cloud*.ply
 # Expect denser street than prior ~580k MA; façades.obj / roofs.obj unchanged; cloud.ply.bak present.
 # Do NOT pass --ignore_pose_inputs. Soft clip stays off (no --cloud-clip-sat).
 ```
+
+
+## PR-C — façade gap fill (ZNCC side/corner)
+```bash
+cd ~/ps1hood && git pull
+uv run ps1hood facades smoke-dense \
+  --source mapanything --a-source flow \
+  --gap-fill --max-planes 16 --zncc-accept 0.35
+# optional after promote:
+uv run ps1hood ps1-facades smoke-dense
+```
+Keep BAG off. Quality-keep must not demote 10/8/0.418 — expect *.candidate if weaker.

@@ -686,6 +686,8 @@ def extract_facades(
     control_out: bool = False,
     ps1_rectify: bool = True,
     ps1_tex_size: int | None = 128,
+    gap_fill: bool = False,
+    project_root: Path | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -726,6 +728,11 @@ def extract_facades(
     textured↑ alone when planes↓ or mean regresses >eps. Weaker or equal
     results — including Milestone A fallback after Path α 0 accepts — go to
     ``*.candidate`` and the live product is kept.
+
+    PR-C ``gap_fill``: keep product / A core; add ZNCC-gated manhattan + sat
+    corner seeds and road-rejected MA peels for side/return walls; ``a_priority``
+    union; quality-keep vs existing 10/8. Re-textures untextured product planes
+    on bake (do not drop). Cap peels ≤32. No BAG, no peel-as-hero.
     """
     import logging
 
@@ -882,6 +889,11 @@ def extract_facades(
             if union_strategy is None
             else str(union_strategy)
         )
+        # PR-C gap_fill requires dual-source Path α (product/A + MA peels).
+        if gap_fill:
+            hybrid_heading = True
+            hybrid_a_full_search = True
+            strategy = "a_priority"
         dual_arm = bool(hybrid_heading and hybrid_a_full_search and frames)
         seed_hyps: list[dict] = []
         union_tel: dict[str, Any] = {}
@@ -929,24 +941,88 @@ def extract_facades(
 
         if dual_arm:
             # Dual-source dual-arm: A on flow xyz / product lock; MA peels only.
-            accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
+            # PR-C gap_fill: lock product 10/8 core when present; score gap seeds
+            # + road-rejected MA peels; softer min_frontal for far-side only.
+            gap_seeds: list[dict] = []
+            ma_hyps = list(hyps)
+            min_frontal_ma = 0.25
+            keep_cap = int(n_planes)
+            if gap_fill:
+                from ps1_hood.reconstruct.gap_fill import (
+                    GAP_FILL_MAX_KEEP,
+                    GAP_FILL_MIN_FRONTAL,
+                    GAP_FILL_PEEL_CAP,
+                    build_gap_fill_seeds,
+                    count_untextured_product,
+                    filter_ma_peels_for_gaps,
+                )
+
+                strategy = "a_priority"
+                keep_cap = max(int(n_planes), int(GAP_FILL_MAX_KEEP))
+                peel_cap = min(
+                    int(peel_n),
+                    int(GAP_FILL_PEEL_CAP),
+                )
+                root = Path(project_root) if project_root is not None else dest_obj.parent.parent
+                n_prod, n_untex = count_untextured_product(dest_obj)
+                if n_untex:
+                    log.info(
+                        "facades gap_fill: product has %s/%s untextured — "
+                        "re-warp on bake before inventing new planes",
+                        n_untex,
+                        n_prod,
+                    )
+                # Prefer product lock as A core (keep 10/8)
+                product_json = dest_obj.parent / "planes.json"
+                locked = planes_from_product_json(product_json) if product_json.is_file() else []
+                if locked:
+                    accepted_a = locked
+                    log.info(
+                        "facades gap_fill: A core = product_lock %s planes",
+                        len(accepted_a),
+                    )
+                else:
+                    accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
+                ma_hyps = filter_ma_peels_for_gaps(
+                    hyps,
+                    frames,
+                    root,
+                    peel_cap=peel_cap,
+                )
+                gap_seeds = build_gap_fill_seeds(
+                    frames, root, ground_z=ground_z_a
+                )
+                min_frontal_ma = float(GAP_FILL_MIN_FRONTAL)
+                log.info(
+                    "facades gap_fill: ma_peels=%s→%s gap_seeds=%s "
+                    "min_frontal=%.2f keep_cap=%s",
+                    len(hyps),
+                    len(ma_hyps),
+                    len(gap_seeds),
+                    min_frontal_ma,
+                    keep_cap,
+                )
+            else:
+                accepted_a = _run_a_arm(zncc=min(float(zncc_accept), 0.35))
+
             accepted_ma = score_planar_hyps(
-                hyps,
+                ma_hyps,
                 frames,
                 zncc_accept=float(zncc_accept),
-                max_keep=n_planes,
-                seed_hyps=None,
+                max_keep=keep_cap,
+                seed_hyps=gap_seeds or None,
                 split_trigger_width_m=split_trigger,
                 split_window_m=split_window,
                 split_overlap_m=split_overlap,
                 nms_xy_m=nms_xy,
                 nms_xy_split_m=nms_xy_split,
-                union_strategy="nms",  # MA-only NMS; final union below
+                union_strategy="nms",  # MA/gap NMS; final union below
+                min_frontal=min_frontal_ma,
             )
             accepted = union_keep_planes(
                 list(accepted_a) + list(accepted_ma),
                 strategy=strategy,
-                max_keep=n_planes,
+                max_keep=keep_cap,
                 nms_xy_m=nms_xy,
                 nms_xy_split_m=nms_xy_split,
                 telemetry=union_tel,
@@ -958,7 +1034,9 @@ def extract_facades(
                 or sum(1 for p in accepted if _is_ma(p.get("source")))
             )
             ma_n = ma_added
-            if a_n and ma_n:
+            if gap_fill:
+                source_tag = "mapanything_gap_fill"
+            elif a_n and ma_n:
                 source_tag = "mapanything_hybrid"
             elif a_n:
                 source_tag = "mapanything_hybrid"
@@ -969,10 +1047,12 @@ def extract_facades(
             a_kept_n = a_n
             ma_added_n = ma_added
             log.info(
-                "facades Path α dual_arm: a_arm=search_photo_consistent_planes "
-                "kept=%s; ma_arm=%s; strategy=%s a_pre_nms=%s a_kept=%s "
-                "ma_added=%s union_kept=%s; a_ply=%s ma_ply=%s a_pts=%s "
-                "ma_pts=%s; source=%s; promote vs product 7/5/0.42",
+                "facades Path α dual_arm%s: a_arm=%s kept=%s; ma_arm=%s; "
+                "strategy=%s a_pre_nms=%s a_kept=%s ma_added=%s union_kept=%s; "
+                "a_ply=%s ma_ply=%s a_pts=%s ma_pts=%s; source=%s; "
+                "promote vs product 10/8/0.418",
+                " gap_fill" if gap_fill else "",
+                "product_lock" if gap_fill and a_source else "search_photo_consistent_planes",
                 len(accepted_a),
                 len(accepted_ma),
                 strategy,

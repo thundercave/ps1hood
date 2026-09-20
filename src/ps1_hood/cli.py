@@ -721,6 +721,13 @@ def export_mapanything_bundle_cmd(
     show_default=True,
     help="Also build sat-locked roof/yard shells → recon/roofs.obj (PR-A)",
 )
+@click.option(
+    "--gap-fill/--no-gap-fill",
+    default=False,
+    show_default=True,
+    help="PR-C: manhattan+corner seeds from sat roofs + MA peels for side walls; "
+    "a_priority; quality-keep vs product (no peel spam / no BAG)",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -749,11 +756,16 @@ def facades_cmd(
     ps1_rectify: bool,
     ps1_tex_size: int,
     sat_roofs: bool,
+    gap_fill: bool,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
     Prefer MapAnything product PLY for plane seeds; still photo-ZNCC gate.
     No OSM/BAG hero. Residual organic omitted (no Poisson in α1).
+
+    ``--gap-fill`` (PR-C): keep product A core; add ZNCC-gated manhattan /
+    sat-corner seeds + road-rejected MA peels for side/return walls; promote
+    only via quality-keep (never demote 10/8).
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
@@ -845,6 +857,8 @@ def facades_cmd(
             control_out=control_out,
             ps1_rectify=ps1_rectify,
             ps1_tex_size=(None if int(ps1_tex_size) <= 0 else int(ps1_tex_size)),
+            gap_fill=gap_fill,
+            project_root=project.root,
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
