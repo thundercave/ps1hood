@@ -19,6 +19,7 @@ from ps1_hood.reconstruct.gap_fill import (
     GAP_FILL_PEEL_CAP,
     WORST_CAM_DISTANCES_M,
     WORST_CAM_YAWS_DEG,
+    aabb_boundary_edges,
     build_gap_fill_seeds,
     corner_seeds_from_roof_aabbs,
     count_untextured_product,
@@ -32,9 +33,13 @@ from ps1_hood.reconstruct.gap_fill import (
     manhattan_side_seeds,
     parse_cam_id,
     prefer_side_wall_order,
+    product_plane_covers_edge,
     reject_road_center_hyps,
     sat_aabb_edge_ok,
+    sat_edge_seeds,
+    uncovered_roof_edges,
     worst_cam_seeds,
+    write_gap_needs_json,
 )
 from ps1_hood.reconstruct.planarize import is_a_source, is_ma_source
 
@@ -423,6 +428,7 @@ def test_build_gap_fill_seeds_worst_cam_filter(tmp_path: Path) -> None:
             tmp_path,
             ground_z=0.0,
             worst_cam_ids=["camA_h000"],
+            gap_seeds_mode="legacy",
         )
     assert any(h["source"] == "worst_cam" for h in seeds)
     # manhattan (if any remain) must be visible to camA
@@ -438,11 +444,14 @@ def test_gap_fill_max_keep_24() -> None:
 
 def test_worst_cam_not_a_family() -> None:
     assert not is_a_source("worst_cam")
+    assert not is_a_source("sat_edge")
     assert not is_a_source("ma_gap_worst_cam")
+    assert not is_a_source("ma_gap_sat_edge")
     assert not is_a_source("ma_gap_manhattan")
     assert is_a_source("product_lock")
     assert is_a_source("manhattan")
     assert is_ma_source("ma_gap_worst_cam")
+    assert is_ma_source("ma_gap_sat_edge")
 
 
 def test_quality_keep_18_18_bar() -> None:
@@ -618,3 +627,170 @@ def test_filter_gap_adds_cap_and_prefer_non_ma() -> None:
     srcs = [p["source"] for p in kept]
     assert "ma_gap_manhattan" in srcs
     assert "ma_gap_worst_cam" in srcs
+
+
+def test_uncovered_roof_edges_vs_product() -> None:
+    """West product plane covers west AABB edge; other three stay uncovered."""
+    regions = [
+        {
+            "kind": "roof",
+            "id": "roof_0",
+            "aabb_enu": [(10.0, 10.0), (20.0, 10.0), (20.0, 18.0), (10.0, 18.0)],
+        }
+    ]
+    # Plane on west face: n = -E, through e=10
+    n = np.array([-1.0, 0.0, 0.0])
+    center = np.array([10.0, 14.0, 3.5])
+    d = float(-n @ center)
+    product = [{"n": n, "d": d, "center": center, "source": "product_lock"}]
+    edges = uncovered_roof_edges(regions, product, max_edges=8)
+    assert len(edges) == 3
+    # No west edge (n_out ≈ -E)
+    for e in edges:
+        assert float(e["n_out"][0]) > -0.5  # not strongly -E
+
+
+def test_product_plane_covers_edge_align_and_dist() -> None:
+    aabb = [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)]
+    edges = aabb_boundary_edges(aabb, roof_id="r")
+    # South edge: mid~(5,0), n_out~(0,-1)
+    south = [e for e in edges if float(e["n_out"][1]) < -0.5][0]
+    n = np.array([0.0, -1.0, 0.0])
+    center = np.array([5.0, 0.0, 3.5])
+    pl = {"n": n, "d": float(-n @ center), "center": center}
+    assert product_plane_covers_edge(pl, south)
+    # Far plane — not covering
+    far = {
+        "n": n,
+        "d": float(-n @ np.array([5.0, -10.0, 3.5])),
+        "center": np.array([5.0, -10.0, 3.5]),
+    }
+    assert not product_plane_covers_edge(far, south)
+
+
+def test_sat_edge_seeds_facing_cam() -> None:
+    """Cam east of building looking west → seed on east wall."""
+    regions = [
+        {
+            "kind": "roof",
+            "id": "garage",
+            "aabb_enu": [(0.0, 0.0), (8.0, 0.0), (8.0, 6.0), (0.0, 6.0)],
+        }
+    ]
+    # No product → all 4 edges uncovered (capped)
+    # Cam east of east wall (e=8), looking west (heading 270)
+    frames = [
+        _frame(20.0, 3.0, 270.0, travel=0.0, i=0),  # 12 m east of mid~(8,3)
+        _frame(22.0, 3.0, 270.0, travel=0.0, i=1),
+    ]
+    hyps, needs = sat_edge_seeds(frames, regions, product_planes=[], ground_z=0.0)
+    assert hyps
+    assert all(h["source"] == "sat_edge" for h in hyps)
+    # At least one east-facing plane (n ≈ +E)
+    assert any(float(h["n"][0]) > 0.7 for h in hyps)
+    assert all("seed_cams" in h for h in hyps)
+
+
+def test_sat_edge_needs_no_facing_cam(tmp_path: Path) -> None:
+    """Zero facing cams → needs entry; write gap_needs.json; no MA invent."""
+    regions = [
+        {
+            "kind": "roof",
+            "id": "far_side",
+            "aabb_enu": [(100.0, 100.0), (110.0, 100.0), (110.0, 108.0), (100.0, 108.0)],
+        }
+    ]
+    # Cams far away / wrong heading
+    frames = [_frame(0.0, 0.0, 90.0, travel=0.0, i=0)]
+    hyps, needs = sat_edge_seeds(frames, regions, [], ground_z=0.0, max_edges=4)
+    assert hyps == []
+    assert needs
+    assert all(n["reason"] == "no_facing_cam" for n in needs)
+    out = write_gap_needs_json(
+        tmp_path / "recon" / "gap_needs.json",
+        needs,
+        run="smoke-dense",
+        product_planes=18,
+    )
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["product_planes"] == 18
+    assert payload["run"] == "smoke-dense"
+    assert payload["needs"]
+    assert "fixed poses only" in payload["hint"]
+
+
+def test_build_gap_fill_seeds_sat_edge_mode(tmp_path: Path) -> None:
+    regions = [
+        {
+            "kind": "roof",
+            "id": "r0",
+            "aabb_enu": [(0.0, 0.0), (8.0, 0.0), (8.0, 6.0), (0.0, 6.0)],
+        }
+    ]
+    frames = [
+        _frame(20.0, 3.0, 270.0, travel=0.0, i=0),
+        _frame(22.0, 3.0, 270.0, travel=0.0, i=1),
+    ]
+    with patch(
+        "ps1_hood.reconstruct.gap_fill.load_sat_roof_regions",
+        return_value=regions,
+    ):
+        seeds = build_gap_fill_seeds(
+            frames,
+            tmp_path,
+            ground_z=0.0,
+            gap_seeds_mode="sat-edge",
+            product_planes=[],
+        )
+    assert seeds
+    assert all(h["source"] == "sat_edge" for h in seeds)
+    # No manhattan in sat-edge mode
+    assert not any(h["source"] == "manhattan" for h in seeds)
+
+
+def test_filter_gap_adds_prefer_sat_edge() -> None:
+    frames = [
+        _frame(0.0, 0.0, 90.0, travel=0.0, i=0),
+        _frame(0.0, 5.0, 90.0, travel=0.0, i=1),
+    ]
+    regions = [
+        {
+            "kind": "roof",
+            "aabb_enu": [(8.0, 0.0), (12.0, 0.0), (12.0, 20.0), (8.0, 20.0)],
+        }
+    ]
+
+    def _pl(src: str, z: float) -> dict:
+        return {
+            "n": np.array([-1.0, 0.0, 0.0]),
+            "center": np.array([8.0, 5.0, 4.0]),
+            "zncc": z,
+            "scores": [z, z - 0.02],
+            "view_indices": [0, 1],
+            "source": src,
+        }
+
+    planes = [
+        _pl("ma_segment", 0.55),
+        _pl("ma_gap_manhattan", 0.50),
+        _pl("ma_gap_sat_edge", 0.40),
+    ]
+    kept = filter_gap_adds(
+        planes, frames, roof_regions=regions, sat_aabb_gate_m=2.0, max_gap_adds=2
+    )
+    assert len(kept) == 2
+    assert kept[0]["source"] == "ma_gap_sat_edge"
+    assert kept[1]["source"] == "ma_gap_manhattan"
+
+
+def test_cli_gap_seeds_sat_edge_default() -> None:
+    from click.testing import CliRunner
+
+    from ps1_hood.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["facades", "--help"])
+    assert result.exit_code == 0
+    assert "--gap-seeds" in result.output
+    assert "sat-edge" in result.output
+    assert "both" in result.output

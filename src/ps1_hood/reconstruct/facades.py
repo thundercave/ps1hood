@@ -859,8 +859,9 @@ def extract_facades(
     Gap-*adds* only (not product_lock) also pass stricter multi-view + sat AABB:
     ZNCC≥0.35 on ≥``gap_min_views`` cams, median ZNCC≥0.10, max |n·cam_fwd|≥0.4,
     center ≤``sat_aabb_gate_m`` of a roof boundary with n∥edge; cap with
-    ``max_gap_adds``. Soft-pass sat gate when no roofs. ``gap_seeds_mode=sat-edge``
-    is reserved (legacy manhattan/worst-cam seeds remain default).
+    ``max_gap_adds``. Soft-pass sat gate when no roofs. ``gap_seeds_mode``:
+    ``sat-edge`` (default) = uncovered roof AABB edges → same-side facing cams
+    (else ``gap_needs.json``); ``legacy`` = manhattan/corner/worst-cam; ``both``.
 
     Worst-cam targeted gap-fill: ``worst_cam_ids`` / ``worst_from_compare`` seed
     planes in front of those cams (dist×yaw); filter manhattan/corner to visible
@@ -1143,19 +1144,26 @@ def extract_facades(
                     root,
                     peel_cap=peel_cap,
                 )
+                _seeds_mode = (
+                    str(gap_seeds_mode).strip().lower()
+                    if gap_seeds_mode
+                    else "sat-edge"
+                )
                 gap_seeds = build_gap_fill_seeds(
                     frames,
                     root,
                     ground_z=ground_z_a,
                     worst_cam_ids=worst_ids or None,
+                    gap_seeds_mode=_seeds_mode,
+                    product_planes=list(accepted_a),
+                    write_needs=True,
+                    run_name=root.name,
                 )
                 min_frontal_ma = float(GAP_FILL_MIN_FRONTAL)
-                if gap_seeds_mode and str(gap_seeds_mode) not in {"legacy", "", "None"}:
-                    log.info(
-                        "facades gap_fill: gap_seeds_mode=%r reserved "
-                        "(sat-edge seeds = follow-up; using legacy manhattan/worst-cam)",
-                        gap_seeds_mode,
-                    )
+                log.info(
+                    "facades gap_fill: gap_seeds_mode=%s",
+                    _seeds_mode,
+                )
                 log.info(
                     "facades gap_fill: ma_peels=%s→%s gap_seeds=%s "
                     "min_frontal=%.2f keep_cap=%s peel_cap=%s worst_cams=%s "
@@ -1200,6 +1208,10 @@ def extract_facades(
                 if src == "worst_cam":
                     q = dict(p)
                     q["source"] = "ma_gap_worst_cam"
+                    return q
+                if src == "sat_edge":
+                    q = dict(p)
+                    q["source"] = "ma_gap_sat_edge"
                     return q
                 return p
 
