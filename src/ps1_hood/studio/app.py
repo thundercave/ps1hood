@@ -156,6 +156,20 @@ def create_app() -> Flask:
             return jsonify({"error": "no facades mtl yet"}), 404
         return send_file(path)
 
+    @app.get("/api/runs/<name>/roofs.obj")
+    def api_roofs_obj(name: str):
+        path = open_project(name).recon_dir / "roofs.obj"
+        if not path.is_file():
+            return jsonify({"error": "no roofs yet"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/roofs.mtl")
+    def api_roofs_mtl(name: str):
+        path = open_project(name).recon_dir / "roofs.mtl"
+        if not path.is_file():
+            return jsonify({"error": "no roofs mtl yet"}), 404
+        return send_file(path)
+
     @app.get("/api/runs/<name>/textures/<path:filename>")
     def api_facade_texture(name: str, filename: str):
         root = open_project(name).recon_dir / "textures"
