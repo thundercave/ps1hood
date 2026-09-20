@@ -659,12 +659,16 @@ def planes_from_mapanything_ply(
 
 
 def is_a_source(src: str | None) -> bool:
-    """Milestone A family: heading×distance / manhattan / sparse / photo_* / product lock."""
+    """Milestone A family: heading×distance / manhattan / sparse / photo_* / product lock.
+
+    ``corner_sat`` = PR-C gap-fill corner wraps from sat roof AABB (hypotheses only).
+    """
     s = (src or "").lower()
     return (
-        s in {"heading_distance", "manhattan", "sparse", "product_lock"}
+        s in {"heading_distance", "manhattan", "sparse", "product_lock", "corner_sat"}
         or s.startswith("photo_")
         or s.startswith("product")
+        or s.startswith("corner_")
     )
 
 
@@ -871,6 +875,7 @@ def score_planar_hyps(
     nms_xy_m: float = DEFAULT_NMS_XY_M,
     nms_xy_split_m: float = DEFAULT_NMS_XY_SPLIT_M,
     union_strategy: str = DEFAULT_UNION_STRATEGY,
+    min_frontal: float = 0.25,
 ) -> list[dict[str, Any]]:
     """ZNCC-gate MA segment hyps via Milestone A scoring + ±n depth refine.
 
@@ -886,10 +891,12 @@ def score_planar_hyps(
        *after* ±n refine (so refine can rescue depth).
     3. Re-picks views per candidate (esp. after normal flip).
     4. Flips ``n`` toward the nearest cam before scoring so the ref sees the front.
-    5. Optional ``seed_hyps`` (Milestone A heading×distance) scored in the same
-       pass. Union default ``a_priority``: keep A accepts first, then add
-       non-duplicate MA (PR-3). ``union_strategy=nms`` is the old ZNCC-sorted
-       NMS for A/B compare. Quality-keep / zncc_accept unchanged.
+    5. Optional ``seed_hyps`` (Milestone A heading×distance / PR-C gap seeds)
+       scored in the same pass. Union default ``a_priority``: keep A accepts
+       first, then add non-duplicate MA (PR-3). ``union_strategy=nms`` is the
+       old ZNCC-sorted NMS for A/B compare. Quality-keep / zncc_accept unchanged.
+    6. ``min_frontal`` (default 0.25): PR-C gap-fill may pass 0.20 for far-side
+       returns only — do not lower globally.
     """
     from ps1_hood.reconstruct import photo_planes as pp
     from ps1_hood.reconstruct.photo_planes import load_view
@@ -1001,7 +1008,7 @@ def score_planar_hyps(
                 continue
 
             idxs = pp._pick_scoring_views(
-                frames, n_c, c_c, max_views=4, min_frontal=0.25
+                frames, n_c, c_c, max_views=4, min_frontal=float(min_frontal)
             )
             if len(idxs) < 2:
                 continue
