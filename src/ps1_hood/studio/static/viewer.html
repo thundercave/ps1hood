@@ -53,6 +53,7 @@
     const sceneJson = await (await fetch('/api/runs/' + encodeURIComponent(run) + '/scene')).json();
     hud.innerHTML = `<b>${sceneJson.name}</b><br>${sceneJson.cameras.length} cameras`
       + `<br><label><input type="checkbox" id="togCloud" checked> cloud</label>`
+      + ` <label><input type="checkbox" id="togZclean"> zclean</label>`
       + ` <label><input type="checkbox" id="togFacades" checked> facades</label>`
       + ` <label><input type="checkbox" id="togRoofs" checked> roofs</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
@@ -195,6 +196,7 @@
     }
 
     let cloudPoints = null;
+    let zcleanPoints = null;
     try {
       const geom = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud.ply');
       remapEnuGeometry(geom);
@@ -203,6 +205,16 @@
       scene.add(cloudPoints);
     } catch (err) {
       hud.innerHTML += '<br>no point cloud yet';
+    }
+    try {
+      const geomZ = await new PLYLoader().loadAsync('/api/runs/' + encodeURIComponent(run) + '/cloud_zclean.ply');
+      remapEnuGeometry(geomZ);
+      const matZ = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, opacity: 0.55, transparent: true });
+      zcleanPoints = new THREE.Points(geomZ, matZ);
+      zcleanPoints.visible = false;
+      scene.add(zcleanPoints);
+    } catch (err) {
+      /* optional sidecar from ps1hood cloud-zclean */
     }
 
     let facadeRoot = null;
@@ -299,6 +311,15 @@
 
     document.getElementById('togCloud')?.addEventListener('change', (ev) => {
       if (cloudPoints) cloudPoints.visible = ev.target.checked;
+    });
+    document.getElementById('togZclean')?.addEventListener('change', (ev) => {
+      if (zcleanPoints) {
+        zcleanPoints.visible = ev.target.checked;
+        // Prefer zclean alone when toggled on (raw still available via cloud checkbox)
+        if (ev.target.checked && cloudPoints) cloudPoints.visible = false;
+        const tc = document.getElementById('togCloud');
+        if (ev.target.checked && tc) tc.checked = false;
+      }
     });
     document.getElementById('togFacades')?.addEventListener('change', (ev) => {
       if (facadeRoot) facadeRoot.visible = ev.target.checked;

@@ -279,12 +279,29 @@ def satellite_cmd(name: str) -> None:
     show_default=True,
     help="ENU margin (m) outside Ortho bbox when --cloud-clip-sat.",
 )
+@click.option(
+    "--cloud-zclean/--no-cloud-zclean",
+    "cloud_zclean",
+    default=False,
+    show_default=True,
+    help="Opt-in soft Z gate after sat seat: write recon/cloud_zclean.ply (does not replace product cloud).",
+)
+@click.option(
+    "--zclean-margin-m",
+    "zclean_margin_m",
+    type=float,
+    default=1.5,
+    show_default=True,
+    help="Drop pts inside sat roof AABB with z > shell_z + margin (m).",
+)
 def align_cmd(
     name: str,
     align_prior: str,
     sat_edge_weight: float,
     cloud_clip_sat: bool,
     sat_cloud_margin_m: float,
+    cloud_zclean: bool,
+    zclean_margin_m: float,
 ) -> None:
     from ps1_hood.pipeline import stage_align
 
@@ -299,6 +316,8 @@ def align_cmd(
         sat_edge_weight=sat_edge_weight,
         cloud_clip_sat=cloud_clip_sat,
         sat_cloud_margin_m=sat_cloud_margin_m,
+        cloud_zclean=cloud_zclean,
+        zclean_margin_m=zclean_margin_m,
     )
 
 
@@ -1546,6 +1565,88 @@ def gap_needs_fetch_cmd(
         "next: ps1hood facades "
         f"{name} --a-source product --no-gap-fill --no-planarize  "
         "# photo search; NOT sat_edge; lock 18"
+    )
+
+
+
+@main.command("cloud-zclean")
+@click.argument("name")
+@click.option(
+    "--margin-m",
+    "--margin",
+    "margin_m",
+    type=float,
+    default=1.5,
+    show_default=True,
+    help="Drop pts inside sat roof AABB with z > shell_z + margin (m).",
+)
+@click.option(
+    "--aabb-inset-m",
+    "aabb_inset_m",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Inset (m) applied to roof AABB footprints before the Z gate.",
+)
+@click.option(
+    "--drop-sinks/--no-drop-sinks",
+    "drop_sinks",
+    default=False,
+    show_default=True,
+    help="Also drop pts inside roof AABB with z < ground_z - 1.0 m (off by default).",
+)
+@click.option(
+    "--replace-product/--no-replace-product",
+    "replace_product",
+    default=False,
+    show_default=True,
+    help="Also rewrite cloud.ply from zclean (default: write cloud_zclean.ply sidecar only).",
+)
+def cloud_zclean_cmd(
+    name: str,
+    margin_m: float,
+    aabb_inset_m: float,
+    drop_sinks: bool,
+    replace_product: bool,
+) -> None:
+    """Opt-in soft Z gate vs sat roof shells — drop sky floaters above roofs.
+
+    Inside each sat roof footprint AABB (inset), drop cloud pts with
+    z > shell_z + margin. Yards/street outside AABBs unchanged. Writes
+    recon/cloud_zclean.ply (+ bak); does NOT change default product to XY-clipped.
+    Façades/roofs shells untouched. Mapillary garage fill is a separate non-goal.
+    """
+    from ps1_hood.align.georef import zclean_recon_clouds
+
+    project = open_project(name)
+    roofs = project.recon_dir / "roofs.json"
+    if not roofs.is_file():
+        click.echo(
+            f"cloud-zclean: missing {roofs} — run: ps1hood roofs {name}",
+            err=True,
+        )
+        raise SystemExit(1)
+    if not (project.recon_dir / "cloud.ply").is_file():
+        click.echo(f"cloud-zclean: missing recon/cloud.ply in {name}", err=True)
+        raise SystemExit(1)
+
+    stats = zclean_recon_clouds(
+        project.recon_dir,
+        margin_m=float(margin_m),
+        aabb_inset_m=float(aabb_inset_m),
+        drop_sinks=bool(drop_sinks),
+        replace_product=bool(replace_product),
+    )
+    georef_path = project.align_dir / "georef.json"
+    georef = project.read_json(georef_path) if georef_path.is_file() else {}
+    georef["cloud_zclean"] = stats
+    project.align_dir.mkdir(parents=True, exist_ok=True)
+    project.write_json(georef_path, georef)
+
+    click.echo(
+        f"cloud-zclean ok  kept={stats.get('kept')}  dropped={stats.get('dropped')}  "
+        f"margin_m={stats.get('margin_m')}  n_roofs={stats.get('n_roofs')}  "
+        f"sidecar=recon/cloud_zclean.ply  replace_product={replace_product}"
     )
 
 

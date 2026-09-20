@@ -210,3 +210,7 @@ Mocks cover bundle shape, cam2world vs w2c convention, `pts3d_cam`→ENU fuse
 - `scripts/demo_inference_on_colmap_outputs.py`  
 - https://huggingface.co/facebook/map-anything-apache  
 - Related: [rd-interp-and-v2pc.md](rd-interp-and-v2pc.md), [openmvs-densify.md](openmvs-densify.md), [mapanything-rocm-gfx1030.md](mapanything-rocm-gfx1030.md) (RX 6900 XT / ROCm)
+
+## Soft Z floaters (opt-in, separate)
+
+After densify + `ps1hood roofs`, run `ps1hood cloud-zclean <run> --margin-m 1.5` to write `recon/cloud_zclean.ply` (drop pts above sat roof shells). Does not change densify defaults or XY-clip the product cloud. See [`roof-floater-zclean.md`](roof-floater-zclean.md).
