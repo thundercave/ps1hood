@@ -589,12 +589,14 @@ def frame_indices_for_cam_ids(
 
 SAT_EDGE_COVER_ALIGN = 0.7  # |n · n_out| for product plane covering an edge
 SAT_EDGE_COVER_DIST_M = 2.0  # |d + n·M| plane-to-midpoint
-SAT_EDGE_COVER_CENTER_M = 4.0  # product center within this of segment
+SAT_EDGE_COVER_CENTER_M = 2.0  # product center within this of segment (was 4; tighten so front ≠ return)
 SAT_EDGE_CAM_DIST = (6.0, 35.0)
 SAT_EDGE_LOOK_AT = 0.5  # (v/dist)·fwd
 SAT_EDGE_GRAZE = 0.35  # |n_out · fwd| below this = grazing past wall
 SAT_EDGE_WALL_Z = 3.5  # center height above ground
-SAT_EDGE_MAX_EDGES = 8
+SAT_EDGE_MAX_EDGES = 16  # was 8; room for return walls after street sides
+SAT_EDGE_MAX_DRIFT_M = 3.0  # |d_refined − d_anchor| reject refine_drift
+SAT_EDGE_SOFT_AABB_M = 5.0  # optional soft gate for sat_edge only (not MA peels)
 
 
 def _roof_aabb_xy(aabb_enu: list | tuple) -> tuple[float, float, float, float] | None:
@@ -705,15 +707,44 @@ def product_plane_covers_edge(
     return True
 
 
+def edge_return_score(
+    edge: dict[str, Any],
+    travel_heading_deg: float | None,
+) -> float:
+    """1.0 when edge outward heading is ⟂ travel (return wall); 0 if unknown."""
+    if travel_heading_deg is None:
+        return 0.0
+    from ps1_hood.geo import heading_diff
+
+    n_out = np.asarray(edge["n_out"], dtype=np.float64)[:2]
+    nn = float(np.linalg.norm(n_out))
+    if nn < 1e-9:
+        return 0.0
+    n_out = n_out / nn
+    heading = wrap_heading(
+        math.degrees(math.atan2(float(n_out[0]), float(n_out[1])))
+    )
+    sep = abs(heading_diff(float(heading), float(travel_heading_deg)))
+    return float(1.0 - abs(sep - 90.0) / 90.0)
+
+
 def uncovered_roof_edges(
     regions: list[dict[str, Any]],
     product_planes: list[dict[str, Any]] | None,
     *,
     max_edges: int = SAT_EDGE_MAX_EDGES,
+    travel_heading_deg: float | None = None,
+    cover_center_m: float = SAT_EDGE_COVER_CENTER_M,
 ) -> list[dict[str, Any]]:
-    """AABB roof/building edges with no covering product plane."""
+    """AABB roof/building edges with no covering product plane.
+
+    Prefers return walls (|heading−travel|≈90°) before long street sides, then
+    slices to ``max_edges``. Logs cover reasons (which product plane covered
+    each skipped edge).
+    """
     planes = list(product_planes or [])
     uncovered: list[dict[str, Any]] = []
+    covered_log: list[str] = []
     for ri, reg in enumerate(regions):
         kind = reg.get("kind")
         if kind not in {None, "roof", "building"}:
@@ -723,12 +754,44 @@ def uncovered_roof_edges(
             continue
         roof_id = str(reg.get("id") or f"roof_{ri}")
         for edge in aabb_boundary_edges(aabb, roof_id=roof_id):
-            covered = any(product_plane_covers_edge(pl, edge) for pl in planes)
-            if not covered:
-                uncovered.append(edge)
-            if len(uncovered) >= int(max_edges) * 4:
-                # collect generously; caller slices
-                pass
+            cover_pl = None
+            for pl in planes:
+                if product_plane_covers_edge(
+                    pl, edge, center_m=float(cover_center_m)
+                ):
+                    cover_pl = pl
+                    break
+            if cover_pl is not None:
+                pid = str(
+                    cover_pl.get("id")
+                    or cover_pl.get("source")
+                    or "product"
+                )
+                covered_log.append(
+                    f"{edge.get('id')} covered_by={pid}"
+                )
+                continue
+            edge = dict(edge)
+            edge["return_score"] = edge_return_score(edge, travel_heading_deg)
+            uncovered.append(edge)
+    # Prefer returns before street-long sides, then stable by id
+    uncovered.sort(
+        key=lambda e: (
+            -float(e.get("return_score") or 0.0),
+            str(e.get("id") or ""),
+        )
+    )
+    if covered_log:
+        log.info(
+            "gap_fill: covered edges (%s): %s",
+            len(covered_log),
+            "; ".join(covered_log[:24]),
+        )
+    if uncovered:
+        log.info(
+            "gap_fill: uncovered edge_ids (prefer returns): %s",
+            [e.get("id") for e in uncovered[: int(max_edges) if max_edges else None]],
+        )
     return uncovered[: int(max_edges)] if max_edges else uncovered
 
 
@@ -776,13 +839,16 @@ def sat_edge_seeds(
     needs: list[dict[str, Any]] = []
     if not regions:
         return hyps, needs
-    edges = uncovered_roof_edges(
-        regions, product_planes, max_edges=int(max_edges)
-    )
-    wall_u = float(ground_z) + float(SAT_EDGE_WALL_Z)
     travel = travel_heading_deg
     if travel is None:
         travel = estimate_travel_heading_deg(frames)
+    edges = uncovered_roof_edges(
+        regions,
+        product_planes,
+        max_edges=int(max_edges),
+        travel_heading_deg=travel,
+    )
+    wall_u = float(ground_z) + float(SAT_EDGE_WALL_Z)
     d_lo, d_hi = SAT_EDGE_CAM_DIST
 
     for edge in edges:
@@ -851,6 +917,9 @@ def sat_edge_seeds(
                 "source": "sat_edge",
                 "edge_id": str(edge.get("id") or ""),
                 "roof_id": str(edge.get("roof_id") or ""),
+                "edge_p0": np.asarray(edge["p0"], dtype=np.float64)[:2].copy(),
+                "edge_p1": np.asarray(edge["p1"], dtype=np.float64)[:2].copy(),
+                "edge_n_out": n_out.copy(),
                 "seed_cams": seed_cams,
                 "return_score": float(ret_score),
             }
@@ -1126,6 +1195,162 @@ def dist_point_to_segment_xy(
     return float(np.linalg.norm(p - (a + t * ab)))
 
 
+def closest_point_on_segment_xy(
+    p: np.ndarray, a: np.ndarray, b: np.ndarray
+) -> np.ndarray:
+    """Closest XY point on segment a→b to p (returns length-2 array)."""
+    p = np.asarray(p, dtype=np.float64)[:2]
+    a = np.asarray(a, dtype=np.float64)[:2]
+    b = np.asarray(b, dtype=np.float64)[:2]
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-12:
+        return a.copy()
+    t = float(np.clip(((p - a) @ ab) / L2, 0.0, 1.0))
+    return a + t * ab
+
+
+def lookup_edge_segment(
+    regions: list[dict[str, Any]] | None,
+    edge_id: str | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Resolve edge_id → (p0, p1, n_out_xy) from roof AABB regions."""
+    eid = str(edge_id or "").strip()
+    if not eid or not regions:
+        return None
+    for ri, reg in enumerate(regions):
+        kind = reg.get("kind")
+        if kind not in {None, "roof", "building"}:
+            continue
+        aabb = reg.get("aabb_enu")
+        if not aabb or len(aabb) < 4:
+            continue
+        roof_id = str(reg.get("id") or f"roof_{ri}")
+        for edge in aabb_boundary_edges(aabb, roof_id=roof_id):
+            if str(edge.get("id") or "") == eid:
+                return (
+                    np.asarray(edge["p0"], dtype=np.float64)[:2].copy(),
+                    np.asarray(edge["p1"], dtype=np.float64)[:2].copy(),
+                    np.asarray(edge["n_out"], dtype=np.float64)[:2].copy(),
+                )
+    return None
+
+
+def plane_seed_edge_segment(
+    plane: dict[str, Any],
+    regions: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Seed edge (p0, p1, n_out) from plane stash or edge_id lookup."""
+    p0 = plane.get("edge_p0")
+    p1 = plane.get("edge_p1")
+    n_out = plane.get("edge_n_out")
+    if p0 is not None and p1 is not None:
+        p0a = np.asarray(p0, dtype=np.float64)[:2]
+        p1a = np.asarray(p1, dtype=np.float64)[:2]
+        if n_out is not None:
+            na = np.asarray(n_out, dtype=np.float64)[:2]
+        else:
+            t = p1a - p0a
+            tn = float(np.linalg.norm(t))
+            if tn < 1e-9:
+                return None
+            tang = t / tn
+            na = np.array([-float(tang[1]), float(tang[0])], dtype=np.float64)
+        return p0a, p1a, na
+    return lookup_edge_segment(regions, plane.get("edge_id"))
+
+
+def is_sat_edge_source(source: str | None) -> bool:
+    src = str(source or "")
+    return "sat_edge" in src
+
+
+def reanchor_sat_edge_after_score(
+    plane: dict[str, Any],
+    regions: list[dict[str, Any]] | None = None,
+    *,
+    max_drift_m: float = SAT_EDGE_MAX_DRIFT_M,
+    snap_n_to_edge: bool = False,
+) -> tuple[dict[str, Any] | None, str]:
+    """Re-anchor sat_edge center to seed edge after ZNCC refine; cap |Δd|.
+
+    Keeps refined ``n`` (or snaps to ``edge_n_out`` if ``snap_n_to_edge``).
+    Sets ``center_xy`` to closest point on seed segment, ``d = -n·center``.
+    Rejects with ``refine_drift`` when |d_refined − d_anchor| > max_drift_m.
+    """
+    if not is_sat_edge_source(plane.get("source")):
+        return dict(plane), "not_sat_edge"
+    seg = plane_seed_edge_segment(plane, regions)
+    if seg is None:
+        return dict(plane), "no_seed_edge"
+    p0, p1, n_edge = seg
+    n = np.asarray(plane.get("n"), dtype=np.float64).reshape(-1).copy()
+    if n.size < 2:
+        return None, "refine_drift degenerate_n"
+    if snap_n_to_edge:
+        nn_e = float(np.linalg.norm(n_edge))
+        if nn_e < 1e-9:
+            return None, "refine_drift degenerate_edge_n"
+        # Preserve facing: flip edge n to match current n sign
+        n_xy = n[:2]
+        nn = float(np.linalg.norm(n_xy))
+        n_use = n_edge / nn_e
+        if nn > 1e-9 and float(n_xy @ n_use) < 0:
+            n_use = -n_use
+        n = np.array([float(n_use[0]), float(n_use[1]), 0.0], dtype=np.float64)
+    nn = float(np.linalg.norm(n[:2]))
+    if nn < 1e-9:
+        return None, "refine_drift degenerate_n"
+    n_unit = n.copy()
+    n_unit[:2] = n[:2] / nn
+    if n_unit.size >= 3:
+        n_unit[2] = 0.0
+
+    center0 = plane.get("center")
+    if center0 is None and plane.get("corners") is not None:
+        center0 = np.asarray(plane["corners"], dtype=np.float64).reshape(-1, 3).mean(
+            axis=0
+        )
+    if center0 is None:
+        return None, "refine_drift no_center"
+    center0 = np.asarray(center0, dtype=np.float64).reshape(-1)
+    z = float(center0[2]) if center0.size >= 3 else float(SAT_EDGE_WALL_Z)
+
+    try:
+        d_refined = float(plane["d"]) if plane.get("d") is not None else float(
+            -n_unit @ np.array(
+                [float(center0[0]), float(center0[1]), z], dtype=np.float64
+            )
+        )
+    except (TypeError, ValueError):
+        d_refined = float(
+            -n_unit
+            @ np.array([float(center0[0]), float(center0[1]), z], dtype=np.float64)
+        )
+
+    closest_xy = closest_point_on_segment_xy(center0[:2], p0, p1)
+    center_new = np.array(
+        [float(closest_xy[0]), float(closest_xy[1]), z], dtype=np.float64
+    )
+    d_anchor = float(-n_unit @ center_new)
+    drift = abs(d_refined - d_anchor)
+    if drift > float(max_drift_m):
+        return None, (
+            f"refine_drift |Δd|={drift:.2f}>{max_drift_m} "
+            f"(d_ref={d_refined:.2f} d_anchor={d_anchor:.2f} "
+            f"edge_id={plane.get('edge_id')})"
+        )
+    out = dict(plane)
+    out["n"] = n_unit
+    out["d"] = d_anchor
+    out["center"] = center_new
+    out["sat_edge_reanchor"] = (
+        f"ok drift={drift:.2f}m edge_id={plane.get('edge_id')}"
+    )
+    out["refine_drift_m"] = float(drift)
+    return out, out["sat_edge_reanchor"]
+
+
 def nearest_roof_boundary(
     center_xy: np.ndarray,
     regions: list[dict[str, Any]],
@@ -1164,34 +1389,84 @@ def sat_aabb_edge_ok(
     *,
     max_edge_m: float = GAP_ADD_SAT_EDGE_M,
     min_align: float = GAP_ADD_SAT_EDGE_ALIGN,
+    edge_id: str | None = None,
+    edge_p0: np.ndarray | None = None,
+    edge_p1: np.ndarray | None = None,
 ) -> tuple[bool, str]:
     """Hard gate: center ≤ max_edge_m of a roof boundary + n ∥ edge.
 
+    When ``edge_id`` / ``edge_p0``+``edge_p1`` are set (sat_edge seeds), distance
+    is to *that* seed segment — not the global nearest roof AABB. Logs both
+    ``dist_seed_edge`` and ``dist_nearest_any`` in reject/ok why strings.
+
     Soft-pass when no roof regions (can't gate without sat footprints).
     """
+    c = np.asarray(center, dtype=np.float64)
+    # Resolve seed segment if provided
+    seed_p0 = seed_p1 = None
+    if edge_p0 is not None and edge_p1 is not None:
+        seed_p0 = np.asarray(edge_p0, dtype=np.float64)[:2]
+        seed_p1 = np.asarray(edge_p1, dtype=np.float64)[:2]
+    elif edge_id:
+        looked = lookup_edge_segment(regions, edge_id)
+        if looked is not None:
+            seed_p0, seed_p1, _n_out = looked
+
+    dist_nearest_any = float("inf")
+    tang_any: np.ndarray | None = None
+    if regions:
+        dist_nearest_any, tang_any, _reg = nearest_roof_boundary(c, regions)
+
+    if seed_p0 is not None and seed_p1 is not None:
+        dist_seed = dist_point_to_segment_xy(c, seed_p0, seed_p1)
+        ab = seed_p1 - seed_p0
+        L2 = float(ab @ ab)
+        tang = (ab / math.sqrt(L2)) if L2 > 1e-12 else None
+        d = float(dist_seed)
+        why_prefix = (
+            f"dist_seed_edge={dist_seed:.2f} "
+            f"dist_nearest_any="
+            f"{dist_nearest_any:.2f}"
+            if math.isfinite(dist_nearest_any)
+            else f"dist_seed_edge={dist_seed:.2f} dist_nearest_any=inf"
+        )
+        if tang is None:
+            return False, f"sat_aabb_edge degenerate_seed ({why_prefix})"
+        if d > float(max_edge_m):
+            return False, (
+                f"sat_aabb_edge dist={d:.2f}>{max_edge_m} ({why_prefix} "
+                f"edge_id={edge_id})"
+            )
+        n_xy = np.asarray(n, dtype=np.float64)[:2]
+        nn = float(np.linalg.norm(n_xy))
+        if nn < 1e-9:
+            return False, f"sat_aabb_edge degenerate_n ({why_prefix})"
+        n_xy = n_xy / nn
+        n_edge = np.array([-float(tang[1]), float(tang[0])], dtype=np.float64)
+        align = abs(float(n_xy @ n_edge))
+        if align < float(min_align):
+            return False, (
+                f"sat_aabb_align |n·n_edge|={align:.2f}<{min_align} ({why_prefix})"
+            )
+        return True, f"sat_aabb_ok d={d:.2f} align={align:.2f} ({why_prefix})"
+
+    # Global nearest (non-sat_edge / no seed edge)
     if not regions:
         return True, "no_roofs_soft_pass"
-    d, tang, _reg = nearest_roof_boundary(center, regions)
+    d, tang, _reg = nearest_roof_boundary(c, regions)
     if not math.isfinite(d) or tang is None:
         return True, "no_roofs_soft_pass"
     if d > float(max_edge_m):
-        return False, f"sat_aabb_edge dist={d:.2f}>{max_edge_m}"
+        return False, (
+            f"sat_aabb_edge dist={d:.2f}>{max_edge_m} "
+            f"(dist_nearest_any={d:.2f})"
+        )
     n_xy = np.asarray(n, dtype=np.float64)[:2]
     nn = float(np.linalg.norm(n_xy))
     if nn < 1e-9:
         return False, "sat_aabb_edge degenerate_n"
     n_xy = n_xy / nn
-    # Plane ≈ parallel to edge ⇒ normal ⟂ tangent ⇒ |n · tang| small;
-    # pack asks |n · edge_tangent| ≥ 0.7 meaning plane normal aligns with…
-    # Re-read: "|n · edge_tangent| ≥ 0.7  # plane ≈ parallel to that roof edge"
-    # If n is plane normal and edge_tangent is along the wall, parallel plane
-    # means n ⟂ tangent → |n·t| ≈ 0. That's the opposite of ≥0.7.
-    # They likely meant |n · edge_outward_normal| ≥ 0.7, OR
-    # |n × k · tangent| / alignment of plane with edge.
-    # For a vertical wall along edge tangent t=(tx,ty), plane normal should be
-    # perpendicular to t: |n·t| small. Pack text says ≥0.7 with comment
-    # "plane ≈ parallel to that roof edge" — that's inconsistent with ·tangent.
-    # Interpret as: rotate tangent 90° → edge outward in XY; |n · n_edge| ≥ 0.7.
+    # Plane ≈ parallel to edge ⇒ rotate tangent 90° → edge outward; |n · n_edge| ≥ 0.7.
     n_edge = np.array([-float(tang[1]), float(tang[0])], dtype=np.float64)
     align = abs(float(n_xy @ n_edge))
     if align < float(min_align):
@@ -1300,23 +1575,32 @@ def filter_gap_adds(
     *,
     roof_regions: list[dict[str, Any]] | None = None,
     sat_aabb_gate_m: float | None = GAP_ADD_SAT_EDGE_M,
+    sat_aabb_gate_sat_edge_m: float | None = None,
     sat_align: float = GAP_ADD_SAT_EDGE_ALIGN,
     min_zncc: float = GAP_ADD_MIN_ZNCC,
     min_views: int = GAP_ADD_MIN_VIEWS,
     median_min: float = GAP_ADD_MEDIAN_MIN,
     min_max_frontal: float = GAP_ADD_MIN_MAX_FRONTAL,
     max_gap_adds: int = GAP_ADD_MAX_ADDS,
+    sat_edge_reanchor: bool = True,
+    sat_edge_max_drift_m: float = SAT_EDGE_MAX_DRIFT_M,
 ) -> list[dict[str, Any]]:
     """Apply sat AABB + multi-view gates to gap-add candidates; cap count.
 
     Does **not** filter ``product_lock`` (caller should only pass new adds).
     Soft-passes sat AABB when ``sat_aabb_gate_m`` is None/≤0 or no roofs.
+
+    For ``source`` containing ``sat_edge``:
+      - optional re-anchor center onto seed edge segment (cap |Δd|)
+      - AABB distance measured to **that** edge_id segment
+      - optional softer ``sat_aabb_gate_sat_edge_m`` (e.g. 5 m) — never
+        widens the gate for MA peels / manhattan
     """
     if not planes:
         return []
     regions = list(roof_regions or [])
     kept: list[dict[str, Any]] = []
-    n_mv = n_sat = 0
+    n_mv = n_sat = n_drift = 0
     for p in planes:
         src = str(p.get("source") or "")
         if src == "product_lock":
@@ -1334,7 +1618,31 @@ def filter_gap_adds(
             n_mv += 1
             log.info("gap_fill reject multiview [%s]: %s", src, why_mv)
             continue
-        if sat_aabb_gate_m is not None and float(sat_aabb_gate_m) > 0:
+
+        # sat_edge: re-anchor onto seed edge after ZNCC refine (before AABB)
+        if sat_edge_reanchor and is_sat_edge_source(src):
+            reanchored, why_ra = reanchor_sat_edge_after_score(
+                p,
+                regions,
+                max_drift_m=float(sat_edge_max_drift_m),
+            )
+            if reanchored is None:
+                n_drift += 1
+                log.info("gap_fill reject refine_drift [%s]: %s", src, why_ra)
+                continue
+            p = reanchored
+            log.info("gap_fill sat_edge reanchor [%s]: %s", src, why_ra)
+
+        gate_m = sat_aabb_gate_m
+        if (
+            is_sat_edge_source(src)
+            and sat_aabb_gate_sat_edge_m is not None
+            and float(sat_aabb_gate_sat_edge_m) > 0
+        ):
+            # Soft-cap for sat_edge only (last resort) — NOT for MA peels
+            gate_m = float(sat_aabb_gate_sat_edge_m)
+
+        if gate_m is not None and float(gate_m) > 0:
             center = np.asarray(
                 p.get("center") if p.get("center") is not None else p.get("quad_center"),
                 dtype=np.float64,
@@ -1344,12 +1652,19 @@ def filter_gap_adds(
                     axis=0
                 )
             n = np.asarray(p.get("n"), dtype=np.float64)
+            edge_kwargs: dict[str, Any] = {}
+            if is_sat_edge_source(src):
+                edge_kwargs["edge_id"] = p.get("edge_id")
+                if p.get("edge_p0") is not None and p.get("edge_p1") is not None:
+                    edge_kwargs["edge_p0"] = p.get("edge_p0")
+                    edge_kwargs["edge_p1"] = p.get("edge_p1")
             ok_sat, why_sat = sat_aabb_edge_ok(
                 center,
                 n,
                 regions,
-                max_edge_m=float(sat_aabb_gate_m),
+                max_edge_m=float(gate_m),
                 min_align=float(sat_align),
+                **edge_kwargs,
             )
             if not ok_sat:
                 n_sat += 1
@@ -1383,13 +1698,18 @@ def filter_gap_adds(
         kept = kept[: int(max_gap_adds)]
     log.info(
         "gap_fill filter_gap_adds: in=%s out=%s reject_mv=%s reject_sat=%s "
-        "sat_gate_m=%s min_views=%s max_adds=%s",
+        "reject_drift=%s sat_gate_m=%s sat_edge_soft_m=%s min_views=%s max_adds=%s "
+        "reanchor=%s max_drift=%s",
         len(planes),
         len(kept),
         n_mv,
         n_sat,
+        n_drift,
         sat_aabb_gate_m,
+        sat_aabb_gate_sat_edge_m,
         min_views,
         max_gap_adds,
+        sat_edge_reanchor,
+        sat_edge_max_drift_m,
     )
     return kept
