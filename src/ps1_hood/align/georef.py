@@ -574,6 +574,344 @@ def clip_recon_clouds_to_ortho(
     return summary
 
 
+
+DEFAULT_ZCLEAN_MARGIN_M = 1.5
+DEFAULT_ZCLEAN_AABB_INSET_M = 0.5
+SINK_DROP_BELOW_GROUND_M = 1.0
+
+
+def load_roof_shell_aabbs(
+    roofs_json: Path,
+    *,
+    aabb_inset_m: float = DEFAULT_ZCLEAN_AABB_INSET_M,
+) -> list[dict[str, float]]:
+    """Load ``kind=roof`` shells as inset AABB + shell_z for soft Z gate.
+
+    Uses existing ``assign_shell_z`` product ``roofs.json`` — never invents Z from BAG.
+    """
+    if not roofs_json.is_file():
+        return []
+    data = json.loads(roofs_json.read_text(encoding="utf-8"))
+    shells = data.get("shells") if isinstance(data, dict) else data
+    if not isinstance(shells, list):
+        return []
+    out: list[dict[str, float]] = []
+    inset = float(aabb_inset_m)
+    for sh in shells:
+        if not isinstance(sh, dict) or sh.get("kind") != "roof":
+            continue
+        aabb = sh.get("aabb_enu") or []
+        if len(aabb) < 2:
+            continue
+        try:
+            es = [float(p[0]) for p in aabb]
+            ns = [float(p[1]) for p in aabb]
+            z = float(sh["z"])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if not math.isfinite(z):
+            continue
+        e_lo, e_hi = min(es) + inset, max(es) - inset
+        n_lo, n_hi = min(ns) + inset, max(ns) - inset
+        if e_hi <= e_lo or n_hi <= n_lo:
+            # Degenerate after inset — keep un-inset AABB (tiny roofs)
+            e_lo, e_hi = min(es), max(es)
+            n_lo, n_hi = min(ns), max(ns)
+        out.append(
+            {
+                "id": str(sh.get("id") or ""),
+                "e_lo": float(e_lo),
+                "e_hi": float(e_hi),
+                "n_lo": float(n_lo),
+                "n_hi": float(n_hi),
+                "shell_z": float(z),
+                "ground_z": float(sh["ground_z"]) if sh.get("ground_z") is not None else float("nan"),
+            }
+        )
+    return out
+
+
+def _roof_shell_z_for_xy(
+    e: float,
+    n: float,
+    roofs: list[dict[str, float]],
+) -> float | None:
+    """Max shell_z among roof AABBs containing (e,n); None if outside all roofs."""
+    matched: list[float] = []
+    for r in roofs:
+        if r["e_lo"] <= e <= r["e_hi"] and r["n_lo"] <= n <= r["n_hi"]:
+            matched.append(r["shell_z"])
+    if not matched:
+        return None
+    return max(matched)
+
+
+def zclean_ply_against_roof_aabbs(
+    path: Path,
+    roofs: list[dict[str, float]],
+    *,
+    margin_m: float = DEFAULT_ZCLEAN_MARGIN_M,
+    drop_sinks: bool = False,
+    ground_z: float | None = None,
+    dest: Path | None = None,
+) -> dict[str, Any]:
+    """Drop PLY verts inside sat roof AABBs with ``z > shell_z + margin_m``.
+
+    Points outside all roof footprints are kept (yards/street untouched).
+    Does not touch façades.obj / roofs.obj. Writes ``dest`` (default in-place).
+    """
+    if not path.is_file():
+        return {
+            "kept": 0,
+            "dropped": 0,
+            "margin_m": float(margin_m),
+            "skipped": True,
+            "reason": "missing_ply",
+        }
+    if not roofs:
+        return {
+            "kept": 0,
+            "dropped": 0,
+            "margin_m": float(margin_m),
+            "skipped": True,
+            "reason": "no_roof_shells",
+        }
+
+    raw = path.read_bytes()
+    header_end = raw.find(b"end_header")
+    if header_end < 0:
+        raise RuntimeError(f"not a PLY: {path}")
+    header = raw[:header_end].decode("ascii", errors="replace")
+    body = raw[header_end + len(b"end_header") :]
+    nl = b"\n"
+    if body.startswith(b"\r\n"):
+        body = body[2:]
+        nl = b"\r\n"
+    elif body.startswith(b"\n"):
+        body = body[1:]
+
+    fmt = "ascii"
+    n_verts = 0
+    props: list[tuple[str, str]] = []
+    in_vertex = False
+    header_lines = header.splitlines()
+    for line in header_lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            fmt = parts[1]
+        elif parts[0] == "element" and parts[1] == "vertex":
+            n_verts = int(parts[2])
+            in_vertex = True
+        elif parts[0] == "element":
+            in_vertex = False
+        elif in_vertex and parts[0] == "property":
+            props.append((parts[1], parts[2]))
+
+    if n_verts <= 0:
+        return {"kept": 0, "dropped": 0, "margin_m": float(margin_m), "n_roofs": len(roofs)}
+
+    margin = float(margin_m)
+    gnd = float(ground_z) if ground_z is not None and math.isfinite(float(ground_z)) else None
+    # Fallback ground from shells
+    if gnd is None:
+        gs = [r["ground_z"] for r in roofs if math.isfinite(r.get("ground_z", float("nan")))]
+        if gs:
+            gnd = float(sum(gs) / len(gs))
+
+    def keep_xyz(x: float, y: float, z: float) -> bool:
+        shell_z = _roof_shell_z_for_xy(x, y, roofs)
+        if shell_z is None:
+            return True  # outside roof footprints
+        if z > shell_z + margin:
+            return False
+        if drop_sinks and gnd is not None and z < gnd - SINK_DROP_BELOW_GROUND_M:
+            return False
+        return True
+
+    out_path = dest if dest is not None else path
+    dropped = 0
+
+    if fmt == "ascii":
+        text_body = body.decode("ascii", errors="replace")
+        lines = text_body.splitlines(keepends=True)
+        kept_str: list[str] = []
+        for i, line in enumerate(lines):
+            if i >= n_verts:
+                break
+            parts = line.split()
+            if len(parts) < 3:
+                dropped += 1
+                continue
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            if keep_xyz(x, y, z):
+                kept_str.append(line if line.endswith("\n") else line + "\n")
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_str)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + "".join(kept_str).encode("ascii"))
+        kept = len(kept_str)
+    else:
+        type_map = {
+            "char": "b",
+            "uchar": "B",
+            "int8": "b",
+            "uint8": "B",
+            "short": "h",
+            "ushort": "H",
+            "int16": "h",
+            "uint16": "H",
+            "int": "i",
+            "uint": "I",
+            "int32": "i",
+            "uint32": "I",
+            "float": "f",
+            "float32": "f",
+            "double": "d",
+            "float64": "d",
+        }
+        endian = "<" if "little" in fmt else ">"
+        fmt_chars = []
+        for t, _name in props:
+            if t not in type_map:
+                raise RuntimeError(f"unsupported PLY prop type {t} in {path}")
+            fmt_chars.append(type_map[t])
+        if len(fmt_chars) < 3 or fmt_chars[0] not in "fd" or fmt_chars[1] not in "fd":
+            raise RuntimeError(f"PLY {path} does not start with float x/y")
+        if fmt_chars[2] not in "fd":
+            raise RuntimeError(f"PLY {path} z is not float/double")
+        vert_fmt = endian + "".join(fmt_chars)
+        vert_size = struct.calcsize(vert_fmt)
+        if len(body) < n_verts * vert_size:
+            raise RuntimeError(f"PLY body short: {path}")
+        kept_blobs: list[bytes] = []
+        for i in range(n_verts):
+            off = i * vert_size
+            chunk = body[off : off + vert_size]
+            vals = struct.unpack_from(vert_fmt, body, off)
+            x, y, z = float(vals[0]), float(vals[1]), float(vals[2])
+            if keep_xyz(x, y, z):
+                kept_blobs.append(bytes(chunk))
+            else:
+                dropped += 1
+        new_header_lines = []
+        for line in header_lines:
+            parts = line.strip().split()
+            if parts and parts[0] == "element" and parts[1] == "vertex":
+                new_header_lines.append(f"element vertex {len(kept_blobs)}")
+            else:
+                new_header_lines.append(line.rstrip("\n\r"))
+        header_out = ("\n".join(new_header_lines) + "\nend_header").encode("ascii")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(header_out + nl + b"".join(kept_blobs))
+        kept = len(kept_blobs)
+
+    log.info(
+        "zclean_ply_against_roof_aabbs %s: kept=%s dropped=%s margin=%.1fm roofs=%s",
+        out_path.name,
+        kept,
+        dropped,
+        margin,
+        len(roofs),
+    )
+    return {
+        "kept": int(kept),
+        "dropped": int(dropped),
+        "margin_m": float(margin),
+        "n_roofs": len(roofs),
+        "drop_sinks": bool(drop_sinks),
+        "path": str(out_path),
+        "source": str(path),
+    }
+
+
+def zclean_recon_clouds(
+    recon_dir: Path,
+    *,
+    margin_m: float = DEFAULT_ZCLEAN_MARGIN_M,
+    aabb_inset_m: float = DEFAULT_ZCLEAN_AABB_INSET_M,
+    drop_sinks: bool = False,
+    ply_names: tuple[str, ...] = ("cloud.ply",),
+    replace_product: bool = False,
+) -> dict[str, Any]:
+    """Opt-in soft Z gate: write ``cloud_zclean.ply`` (+ bak); leave product cloud.
+
+    Sacred: does **not** hungry-XY-clip; façades/roofs shells untouched; default
+    product stays unclipped ``cloud.ply`` unless ``replace_product=True``.
+    """
+    roofs_path = Path(recon_dir) / "roofs.json"
+    roofs = load_roof_shell_aabbs(roofs_path, aabb_inset_m=aabb_inset_m)
+    summary: dict[str, Any] = {
+        "margin_m": float(margin_m),
+        "aabb_inset_m": float(aabb_inset_m),
+        "drop_sinks": bool(drop_sinks),
+        "n_roofs": len(roofs),
+        "replace_product": bool(replace_product),
+        "clouds": {},
+    }
+    if not roofs:
+        summary["skipped"] = True
+        summary["reason"] = "no_roof_shells"
+        summary["kept"] = 0
+        summary["dropped"] = 0
+        return summary
+
+    total_kept = 0
+    total_dropped = 0
+    for name in ply_names:
+        src = Path(recon_dir) / name
+        if not src.is_file():
+            continue
+        # Sidecar: cloud.ply → cloud_zclean.ply; cloud_photo.ply → cloud_photo_zclean.ply
+        if name == "cloud.ply":
+            dest_name = "cloud_zclean.ply"
+        elif name.endswith(".ply"):
+            dest_name = name[:-4] + "_zclean.ply"
+        else:
+            dest_name = name + "_zclean"
+        dest = Path(recon_dir) / dest_name
+        if dest.is_file():
+            bak = Path(str(dest) + ".bak")
+            bak.write_bytes(dest.read_bytes())
+        # Bak source once when replacing product (reversible)
+        src_bak = Path(str(src) + ".bak")
+        if replace_product and src.is_file() and not src_bak.is_file():
+            src_bak.write_bytes(src.read_bytes())
+
+        try:
+            stats = zclean_ply_against_roof_aabbs(
+                src,
+                roofs,
+                margin_m=margin_m,
+                drop_sinks=drop_sinks,
+                dest=dest,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("zclean: skip %s (%s)", src, exc)
+            summary["clouds"][name] = {"error": str(exc)}
+            continue
+
+        if replace_product and dest.is_file():
+            src.write_bytes(dest.read_bytes())
+
+        summary["clouds"][name] = stats
+        total_kept += int(stats.get("kept", 0))
+        total_dropped += int(stats.get("dropped", 0))
+
+    summary["kept"] = total_kept
+    summary["dropped"] = total_dropped
+    return summary
+
+
 def seat_recon_artefacts(
     recon_dir: Path,
     T: dict[str, float],

@@ -16,6 +16,7 @@ from ps1_hood.align.georef import (
     refresh_scene_cameras,
     seat_recon_artefacts,
     summarize_se2,
+    zclean_recon_clouds,
 )
 from ps1_hood.align.pose_graph import (
     explode_orbit_cameras,
@@ -268,6 +269,8 @@ def stage_align(
     sat_edge_weight: float | None = None,
     cloud_clip_sat: bool | None = None,
     sat_cloud_margin_m: float | None = None,
+    cloud_zclean: bool | None = None,
+    zclean_margin_m: float | None = None,
 ) -> list:
     """GPS/OSM prior → sat or BAG absolute seat.
 
@@ -275,6 +278,8 @@ def stage_align(
     **never** ``snap_camera_to_bag``; skip footprint push that fights sat.
     Cloud clip is **opt-in** (``cloud_clip_sat=False`` by default): prefer the
     unclipped product cloud; use ``--cloud-clip-sat`` only as a floater tool.
+    Soft Z gate (``--cloud-zclean``) is also opt-in: writes ``cloud_zclean.ply``
+    without replacing the product cloud or hungry-XY-clipping yards.
     Writes ``align/georef.json`` and seats existing recon artefacts with one SE(2).
     ``align_prior=bag`` keeps legacy BAG-first behaviour for debug.
     """
@@ -291,6 +296,8 @@ def stage_align(
     w_ncc = 1.0 - w_edge
     do_clip = False if cloud_clip_sat is None else bool(cloud_clip_sat)
     clip_margin = float(2.0 if sat_cloud_margin_m is None else sat_cloud_margin_m)
+    do_zclean = False if cloud_zclean is None else bool(cloud_zclean)
+    zc_margin = float(1.5 if zclean_margin_m is None else zclean_margin_m)
 
     shots = project.read_json(project.cropped_dir / "shots.json")
     shots, dropped = _shots_in_bbox(shots, spec.bbox)
@@ -473,6 +480,29 @@ def stage_align(
             "align",
             f"clipped MA cloud: dropped {clip_stats.get('dropped', 0)} outside Ortho ±{clip_margin:.0f}m",
         )
+
+    # Opt-in soft Z: drop sky floaters above sat roof shells (sidecar; product untouched)
+    if prior == "sat" and do_zclean and (project.recon_dir / "cloud.ply").is_file():
+        if (project.recon_dir / "roofs.json").is_file():
+            zc_stats = zclean_recon_clouds(
+                project.recon_dir,
+                margin_m=zc_margin,
+                replace_product=False,
+            )
+            georef["cloud_zclean"] = zc_stats
+            log.info(
+                "sat cloud zclean kept=%s dropped=%s margin=%.1fm",
+                zc_stats.get("kept"),
+                zc_stats.get("dropped"),
+                zc_margin,
+            )
+            _emit(
+                progress,
+                "align",
+                f"zclean cloud: dropped {zc_stats.get('dropped', 0)} above roof shells +{zc_margin:.1f}m",
+            )
+        else:
+            log.warning("cloud-zclean requested but recon/roofs.json missing — skip")
 
     cameras = explode_orbit_cameras(poses, shots)
     project.write_json(project.align_dir / "poses.json", poses)
@@ -765,6 +795,8 @@ def run_all(
     sat_edge_weight: float | None = None,
     cloud_clip_sat: bool | None = None,
     sat_cloud_margin_m: float | None = None,
+    cloud_zclean: bool | None = None,
+    zclean_margin_m: float | None = None,
 ) -> None:
     if from_stage not in STAGES:
         raise ValueError(f"unknown stage {from_stage}")
@@ -782,6 +814,8 @@ def run_all(
             sat_edge_weight=sat_edge_weight,
             cloud_clip_sat=cloud_clip_sat,
             sat_cloud_margin_m=sat_cloud_margin_m,
+            cloud_zclean=cloud_zclean,
+            zclean_margin_m=zclean_margin_m,
         ),
         "interpolate": lambda: stage_interpolate(project, progress),
         "reconstruct": lambda: stage_reconstruct(project, progress),

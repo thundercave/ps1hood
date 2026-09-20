@@ -44,6 +44,7 @@ def create_app() -> Flask:
                             "bbox": spec.bbox.as_dict(),
                             "source": spec.source,
                             "has_cloud": (child / "recon" / "cloud.ply").is_file(),
+                            "has_cloud_zclean": (child / "recon" / "cloud_zclean.ply").is_file(),
                             "has_compare": (child / "recon" / "compare" / "summary.json").is_file(),
                             "has_scene": (child / "recon" / "scene.json").is_file(),
                             "has_live": (child / "live.json").is_file(),
@@ -141,6 +142,13 @@ def create_app() -> Flask:
         path = open_project(name).recon_dir / "cloud.ply"
         if not path.is_file():
             return jsonify({"error": "no cloud yet"}), 404
+        return send_file(path)
+
+    @app.get("/api/runs/<name>/cloud_zclean.ply")
+    def api_cloud_zclean(name: str):
+        path = open_project(name).recon_dir / "cloud_zclean.ply"
+        if not path.is_file():
+            return jsonify({"error": "no cloud_zclean yet — run: ps1hood cloud-zclean <run>"}), 404
         return send_file(path)
 
     @app.get("/api/runs/<name>/facades.obj")
