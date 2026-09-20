@@ -1243,6 +1243,312 @@ def facades_retexture_cmd(
     )
 
 
+
+@main.group("gap-needs")
+def gap_needs_group() -> None:
+    """Far-side SV for recon/gap_needs.json (prefer existing facing; fetch better probes)."""
+
+
+@gap_needs_group.command("show")
+@click.argument("name")
+@click.option(
+    "--need-id",
+    "--id",
+    "need_id",
+    default=None,
+    help="Single need id / edge_id (e.g. roof_099_e0); default: all",
+)
+def gap_needs_show_cmd(name: str, need_id: str | None) -> None:
+    """List gap_needs entries with ENU→ll, probes, and existing nearly-facing cams."""
+    from ps1_hood.reconstruct.gap_needs import (
+        GapNeedsMissing,
+        load_gap_needs,
+        local_frame_for_run,
+        select_need,
+        summarize_need,
+    )
+
+    project = open_project(name)
+    path = project.recon_dir / "gap_needs.json"
+    try:
+        payload = load_gap_needs(path)
+    except GapNeedsMissing as exc:
+        click.echo(f"gap-needs show: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"gap-needs show: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    try:
+        needs = select_need(payload, need_id)
+        frame = local_frame_for_run(project.root)
+    except Exception as exc:
+        click.echo(f"gap-needs show: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    cams_path = project.align_dir / "cameras.json"
+    cameras = project.read_json(cams_path) if cams_path.is_file() else []
+    click.echo(
+        f"gap_needs {path}  run={payload.get('run')}  "
+        f"product_planes={payload.get('product_planes')}  needs={len(payload.get('needs') or [])}"
+    )
+    for need in needs:
+        s = summarize_need(need, frame, cameras)
+        click.echo(
+            f"  {s['id']}  ENU=({s['e']:.2f},{s['n']:.2f})  "
+            f"heading={s['heading']:.1f}  ll=({s['lat']:.7f},{s['lon']:.7f})  "
+            f"reason={s.get('reason')}"
+        )
+        click.echo(
+            f"    prefer existing facing: {s['n_existing_facing']} pano(s) "
+            "(fetch still probes for better)"
+        )
+        for ef in s["existing_facing"][:6]:
+            click.echo(
+                f"      {ef['pano_id']}  h={ef['heading']}  "
+                f"dist={ef['dist_m']:.1f}m  score={ef['score']:.3f}"
+            )
+        for pr in s["probes"]:
+            click.echo(
+                f"    probe r={pr['radius_m']:.0f}m  "
+                f"ENU=({pr['e']:.2f},{pr['n']:.2f})  "
+                f"ll=({pr['lat']:.7f},{pr['lon']:.7f})"
+            )
+
+
+@gap_needs_group.command("fetch")
+@click.argument("name")
+@click.option(
+    "--need-id",
+    "--id",
+    "need_id",
+    default=None,
+    help="Single need id / edge_id (e.g. roof_099_e0); default: all needs",
+)
+@click.option(
+    "--radii",
+    default="8,12,16,20",
+    show_default=True,
+    help="Comma-separated probe radii in metres along outward normal",
+)
+@click.option(
+    "--max-panos",
+    default=6,
+    show_default=True,
+    type=int,
+    help="Cap on new panos appended per need",
+)
+@click.option(
+    "--align/--no-align",
+    default=True,
+    show_default=True,
+    help="After capture/crop, align with --align-prior sat (no free-pose)",
+)
+@click.option(
+    "--film/--no-film",
+    "do_film",
+    default=True,
+    show_default=True,
+    help="If <2 facing frames after prefer+fetch, ENU-lerp FILM spur (PR-B)",
+)
+@click.option(
+    "--capture/--no-capture",
+    "do_capture",
+    default=True,
+    show_default=True,
+    help="Capture/crop new panos (reuse existing capture path); off = discover-only",
+)
+def gap_needs_fetch_cmd(
+    name: str,
+    need_id: str | None,
+    radii: str,
+    max_panos: int,
+    align: bool,
+    do_film: bool,
+    do_capture: bool,
+) -> None:
+    """Probe opposite the wall, prefer existing facing, fetch better SV, sat-align.
+
+    Sacred: fixed poses only · --align-prior sat · lock 18 · no sat_edge peels.
+    """
+    from ps1_hood.reconstruct.gap_needs import (
+        GapNeedsMissing,
+        build_probe_seeds,
+        capture_new_panos_only,
+        crop_new_shots_only,
+        existing_pano_ids,
+        filter_facing_panos_enu,
+        find_existing_facing,
+        interpolate_facing_spur,
+        load_gap_needs,
+        local_frame_for_run,
+        lookup_new_panos,
+        merge_discover_panos,
+        need_id_of,
+        select_need,
+        unique_facing_pano_count,
+    )
+
+    settings = Settings.from_env()
+    project = open_project(name)
+    path = project.recon_dir / "gap_needs.json"
+    try:
+        payload = load_gap_needs(path)
+        needs = select_need(payload, need_id)
+        frame = local_frame_for_run(project.root)
+    except GapNeedsMissing as exc:
+        click.echo(f"gap-needs fetch: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"gap-needs fetch: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    try:
+        radii_m = tuple(float(x.strip()) for x in radii.split(",") if x.strip())
+    except ValueError as exc:
+        click.echo(f"gap-needs fetch: bad --radii {radii!r}", err=True)
+        raise SystemExit(1) from exc
+    if not radii_m:
+        click.echo("gap-needs fetch: --radii empty", err=True)
+        raise SystemExit(1)
+
+    cams_path = project.align_dir / "cameras.json"
+    cameras = project.read_json(cams_path) if cams_path.is_file() else []
+    discover_path = project.discover_dir / "panos.json"
+    discover = (
+        project.read_json(discover_path)
+        if discover_path.is_file()
+        else {"source": "gap_needs", "panos": []}
+    )
+    have_ids = existing_pano_ids(discover)
+    # also treat captured raw dirs as existing
+    if project.raw_dir.is_dir():
+        for d in project.raw_dir.iterdir():
+            if d.is_dir() and not d.name.startswith("seed-"):
+                have_ids.add(d.name)
+
+    lookup_fn = None
+    if settings.google_maps_api_key:
+        from ps1_hood.capture.google_static import lookup_pano
+
+        key = settings.google_maps_api_key
+
+        def lookup_fn(lat: float, lon: float):  # noqa: F811
+            return lookup_pano(lat, lon, key)
+
+    all_new: list[dict] = []
+    facing_after: dict[str, int] = {}
+
+    for need in needs:
+        nid = need_id_of(need)
+        existing = find_existing_facing(cameras, need)
+        n_exist = unique_facing_pano_count(existing)
+        click.echo(
+            f"need {nid}: prefer existing facing={n_exist} "
+            f"(e.g. {[c.get('pano_id') for c in existing[:3]]}); "
+            "fetch still probes for better"
+        )
+        seeds = build_probe_seeds(need, frame, radii_m=radii_m, need_id=nid)
+        resolved = lookup_new_panos(
+            seeds,
+            existing_ids=have_ids,
+            lookup_fn=lookup_fn,
+            max_panos=int(max_panos),
+        )
+        # Prefer panos that can face; keep provisional seeds if lookup empty
+        facing_new = filter_facing_panos_enu(resolved, need, frame)
+        chosen = facing_new if facing_new else resolved
+        for p in chosen:
+            have_ids.add(str(p.get("pano_id")))
+        all_new.extend(chosen)
+        facing_after[nid] = n_exist  # updated after capture/align
+
+    if not all_new:
+        click.echo(
+            "gap-needs fetch: no new panos to attach "
+            "(existing facing may already cover — still prefer those)"
+        )
+    else:
+        discover = merge_discover_panos(discover, all_new)
+        project.write_json(discover_path, discover)
+        click.echo(f"appended {len(all_new)} pano(s) → {discover_path}")
+
+    new_shots: list = []
+    if do_capture and all_new:
+        try:
+            new_shots = capture_new_panos_only(project, settings, all_new)
+            click.echo(f"captured {len(new_shots)} frame(s) from new panos")
+            if new_shots:
+                cropped = crop_new_shots_only(project, settings, new_shots)
+                click.echo(f"cropped {len(cropped)} frame(s)")
+        except Exception as exc:
+            click.echo(f"gap-needs fetch capture failed: {exc}", err=True)
+            raise SystemExit(1) from exc
+    elif not do_capture:
+        click.echo("skip capture (--no-capture)")
+
+    if align and (all_new or do_capture):
+        from ps1_hood.pipeline import stage_align
+
+        spec = project.load_spec()
+        if getattr(spec, "align_prior", None) != "sat":
+            spec.align_prior = "sat"
+            project.save_spec(spec)
+        click.echo("align --align-prior sat (seat new cams into same ENU; no free-pose)")
+        try:
+            stage_align(project, align_prior="sat")
+        except Exception as exc:
+            click.echo(f"gap-needs fetch align failed: {exc}", err=True)
+            raise SystemExit(1) from exc
+        # refresh cameras after align
+        if cams_path.is_file():
+            cameras = project.read_json(cams_path)
+
+    # Recompute facing counts; optional FILM spur if still <2
+    for need in needs:
+        nid = need_id_of(need)
+        existing = find_existing_facing(cameras, need)
+        n_face = unique_facing_pano_count(existing)
+        facing_after[nid] = n_face
+        click.echo(f"need {nid}: facing panos after fetch/align = {n_face}")
+        if do_film and n_face < 2:
+            click.echo(
+                f"need {nid}: <2 facing — ENU-lerp FILM spur "
+                "(appearance only; reuse PR-B lerp_pose)"
+            )
+            try:
+                spur = interpolate_facing_spur(project, existing if len(existing) >= 2 else existing)
+                # If only 1 facing, try spur with nearest aligned poses to that cam
+                if not spur and existing:
+                    # pair with nearest other camera by XY
+                    anchor = existing[0]
+                    others = [
+                        c
+                        for c in cameras
+                        if c.get("pano_id") != anchor.get("pano_id")
+                    ]
+                    others.sort(
+                        key=lambda c: (
+                            (float(c["e"]) - float(anchor["e"])) ** 2
+                            + (float(c["n"]) - float(anchor["n"])) ** 2
+                        )
+                    )
+                    pair = [anchor] + others[:1]
+                    spur = interpolate_facing_spur(project, pair)
+                click.echo(f"need {nid}: spur midframes={len(spur)}")
+            except Exception as exc:
+                click.echo(f"gap-needs FILM spur failed: {exc}", err=True)
+                raise SystemExit(1) from exc
+        elif n_face >= 2:
+            click.echo(f"need {nid}: ≥2 facing — skip FILM densify")
+
+    click.echo(
+        "next: ps1hood facades "
+        f"{name} --a-source product --no-gap-fill --no-planarize  "
+        "# photo search; NOT sat_edge; lock 18"
+    )
+
+
 @main.command("roofs")
 @click.argument("name")
 @click.option(

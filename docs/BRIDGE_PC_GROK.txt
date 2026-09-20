@@ -85,3 +85,17 @@ uv run ps1hood compare smoke-dense --max-cams 40
 # → runs/smoke-dense/recon/compare/summary.json + *_hNNN.jpg
 # Soft-warn if global zncc ≪ 0.35. Does NOT densify or change poses/product.
 ```
+
+
+## Far-side gap_needs (prefer existing facing → fetch → sat-align)
+```bash
+cd ~/ps1hood && git pull
+# Prefer existing nearly-facing (e.g. Ot6jYiTfjNNn h180); fetch still probes 8–20 m
+uv run ps1hood gap-needs show smoke-dense --need-id roof_099_e0
+uv run ps1hood gap-needs fetch smoke-dense --need-id roof_099_e0 \
+  --radii 8,12,16,20 --max-panos 6
+# then photo search — NOT sat_edge; lock 18
+uv run ps1hood facades smoke-dense \
+  --a-source product --no-gap-fill --no-planarize
+```
+Docs: docs/far-side-gap-needs.md
