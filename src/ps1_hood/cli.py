@@ -682,6 +682,12 @@ def export_mapanything_bundle_cmd(
     type=int,
     help="Nearest resize short side (128² or 128×256) + RGB555; 0 disables",
 )
+@click.option(
+    "--sat-roofs/--no-sat-roofs",
+    default=False,
+    show_default=True,
+    help="Also build sat-locked roof/yard shells → recon/roofs.obj (PR-A)",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -709,6 +715,7 @@ def facades_cmd(
     union_strategy: str,
     ps1_rectify: bool,
     ps1_tex_size: int,
+    sat_roofs: bool,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -845,6 +852,25 @@ def facades_cmd(
         f"a_kept={meta.get('a_kept')}  ma_added={meta.get('ma_added')}  "
         f"output_kind={meta.get('output_kind')}"
     )
+    if sat_roofs:
+        from ps1_hood.reconstruct.sat_roofs import SatRoofError, build_sat_roofs
+
+        try:
+            rmeta = build_sat_roofs(project.root)
+            click.echo(
+                f"sat-roofs ok  roofs={rmeta.get('n_roof')}  yards={rmeta.get('n_yard')}  "
+                f"textured={rmeta.get('textured')}  mean_edge_m={rmeta.get('mean_edge_m')}  "
+                f"gate_target_ok={rmeta.get('gate_target_ok')}  obj={rmeta.get('obj')}"
+            )
+            if scene_path.is_file():
+                import json as _json
+
+                payload = _json.loads(scene_path.read_text(encoding="utf-8"))
+                payload["roofs"] = rmeta
+                scene_path.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+        except SatRoofError as exc:
+            click.echo(f"sat-roofs failed: {exc}", err=True)
+            raise SystemExit(1) from exc
     # Product intact on quality-keep; only fail-hard when nothing usable remains
     if n_planes_out <= 0 and not preserved:
         raise SystemExit(1)
@@ -888,6 +914,62 @@ def ps1_facades_cmd(name: str, ps1_tex_size: int, no_backup: bool) -> None:
         f"textures={meta.get('textures_rewritten')}  "
         f"tex_size={meta.get('ps1_tex_size')}  "
         f"obj={meta.get('obj')}  planes_json={meta.get('planes_json')}"
+    )
+
+
+@main.command("roofs")
+@click.argument("name")
+@click.option(
+    "--min-area",
+    "min_area_m2",
+    default=8.0,
+    show_default=True,
+    type=float,
+    help="Minimum footprint area (m²) after sat segmentation",
+)
+@click.option(
+    "--edge-gate",
+    "edge_gate_m",
+    default=1.0,
+    show_default=True,
+    type=float,
+    help="Target mean shell↔sat-edge distance (m); logs gate_target_ok",
+)
+def roofs_cmd(name: str, min_area_m2: float, edge_gate_m: float) -> None:
+    """Sat-locked roof/yard shells from Ortho (PR-A). Writes recon/roofs.obj.
+
+    XY from sat absolute ENU; Z from MA cloud median in footprint or façade top.
+    No BAG/OSM extruded shells. Fail-loud if ortho missing or zero footprints.
+    """
+    from ps1_hood.reconstruct.sat_roofs import SatRoofError, build_sat_roofs
+
+    project = open_project(name)
+    try:
+        meta = build_sat_roofs(
+            project.root,
+            min_area_m2=float(min_area_m2),
+            edge_gate_m=float(edge_gate_m),
+        )
+    except SatRoofError as exc:
+        click.echo(f"roofs failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    except Exception as exc:
+        click.echo(f"roofs failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    scene_path = project.recon_dir / "scene.json"
+    if scene_path.is_file():
+        import json
+
+        payload = json.loads(scene_path.read_text(encoding="utf-8"))
+        payload["roofs"] = meta
+        scene_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    click.echo(
+        f"roofs ok  roofs={meta.get('n_roof')}  yards={meta.get('n_yard')}  "
+        f"textured={meta.get('textured')}  mean_edge_m={meta.get('mean_edge_m')}  "
+        f"p90_edge_m={meta.get('p90_edge_m')}  gate_target_ok={meta.get('gate_target_ok')}  "
+        f"obj={meta.get('obj')}"
     )
 
 
