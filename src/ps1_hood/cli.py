@@ -740,6 +740,43 @@ def export_mapanything_bundle_cmd(
     type=int,
     help="Auto-load top-N worst cam ids from recon/compare/summary.json",
 )
+@click.option(
+    "--max-gap-adds",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Cap new gap-fill planes after stricter multi-view + sat AABB gates",
+)
+@click.option(
+    "--sat-aabb-gate",
+    "sat_aabb_gate_m",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Gap-add center must be within this many metres of a sat roof boundary "
+    "(0 disables; soft-pass when no roofs)",
+)
+@click.option(
+    "--ma-peel-cap",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Max MA peels kept for gap-fill scoring (rethink: stop peel spam)",
+)
+@click.option(
+    "--gap-min-views",
+    default=2,
+    show_default=True,
+    type=int,
+    help="Gap adds need ZNCC≥0.35 on at least this many scoring pair/cams",
+)
+@click.option(
+    "--gap-seeds",
+    default="legacy",
+    show_default=True,
+    type=click.Choice(["legacy", "sat-edge"]),
+    help="Gap seed source: legacy manhattan/worst-cam; sat-edge = follow-up",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -771,6 +808,11 @@ def facades_cmd(
     gap_fill: bool,
     worst_cams: str | None,
     worst_from_compare: int | None,
+    max_gap_adds: int,
+    sat_aabb_gate_m: float,
+    ma_peel_cap: int,
+    gap_min_views: int,
+    gap_seeds: str,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -784,6 +826,10 @@ def facades_cmd(
     ``--worst-cams`` / ``--worst-from-compare``: seed planes toward those cams
     (dist 8–20 m × yaw 0/±45/±90); filter manhattan/corner to visible in them;
     lock product, NMS-add new, max_keep 24, bake new textures only.
+
+    Gap-add hygiene: ``--sat-aabb-gate`` / ``--gap-min-views`` / ``--max-gap-adds``
+    / ``--ma-peel-cap`` tighten multi-view + sat footprint for *new* planes only
+    (product_lock untouched). ``--gap-seeds sat-edge`` reserved for follow-up.
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
@@ -883,6 +929,11 @@ def facades_cmd(
                 else None
             ),
             worst_from_compare=worst_from_compare,
+            max_gap_adds=int(max_gap_adds),
+            sat_aabb_gate_m=float(sat_aabb_gate_m),
+            ma_peel_cap=int(ma_peel_cap),
+            gap_min_views=int(gap_min_views),
+            gap_seeds_mode=str(gap_seeds),
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)
