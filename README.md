@@ -210,3 +210,14 @@ PS1HOOD_SOURCE=google_web
 uv sync --extra dev
 uv run pytest
 ```
+
+## Forced sat SE(2) (`sat-offset`)
+
+When edge re-seat no-ops but product (red) is stuck vs Ortho edges (yellow), measure one rigid SE(2) from façade long edges vs Ortho Canny and force-apply it (bak first; skip sat-native roofs/street):
+
+```bash
+uv run ps1hood sat-offset measure smoke-dense --out align/T_force.json
+uv run ps1hood sat-offset apply smoke-dense --from align/T_force.json
+```
+
+See [`docs/sat-forced-se2.md`](docs/sat-forced-se2.md).
