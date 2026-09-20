@@ -17,10 +17,14 @@ from ps1_hood.reconstruct.gap_fill import (
     GAP_ADD_SAT_EDGE_M,
     GAP_FILL_MAX_KEEP,
     GAP_FILL_PEEL_CAP,
+    SAT_EDGE_COVER_CENTER_M,
+    SAT_EDGE_MAX_DRIFT_M,
+    SAT_EDGE_MAX_EDGES,
     WORST_CAM_DISTANCES_M,
     WORST_CAM_YAWS_DEG,
     aabb_boundary_edges,
     build_gap_fill_seeds,
+    closest_point_on_segment_xy,
     corner_seeds_from_roof_aabbs,
     count_untextured_product,
     estimate_travel_heading_deg,
@@ -34,6 +38,7 @@ from ps1_hood.reconstruct.gap_fill import (
     parse_cam_id,
     prefer_side_wall_order,
     product_plane_covers_edge,
+    reanchor_sat_edge_after_score,
     reject_road_center_hyps,
     sat_aabb_edge_ok,
     sat_edge_seeds,
@@ -794,3 +799,232 @@ def test_cli_gap_seeds_sat_edge_default() -> None:
     assert "--gap-seeds" in result.output
     assert "sat-edge" in result.output
     assert "both" in result.output
+    assert "--sat-edge-reanchor" in result.output
+    assert "--sat-edge-max-drift" in result.output
+    assert "--sat-aabb-gate-sat-edge" in result.output
+
+
+def test_sat_edge_cover_center_tightened() -> None:
+    assert SAT_EDGE_COVER_CENTER_M == 2.0
+    assert SAT_EDGE_MAX_EDGES == 16
+    assert SAT_EDGE_MAX_DRIFT_M == 3.0
+
+
+def test_uncovered_prefers_return_walls() -> None:
+    """Street-long sides fill quota last; returns (|heading−travel|≈90) first."""
+    # Travel +N (0°). Building with long E/W street sides and short N/S returns.
+    # With max_edges=2 and no product, prefer N/S (return) over E/W (street).
+    regions = [
+        {
+            "kind": "roof",
+            "id": "garage",
+            "aabb_enu": [(0.0, 0.0), (20.0, 0.0), (20.0, 6.0), (0.0, 6.0)],
+        }
+    ]
+    edges = uncovered_roof_edges(
+        regions, [], max_edges=2, travel_heading_deg=0.0
+    )
+    assert len(edges) == 2
+    # Return walls: outward ±E (heading 90/270) when travel is N
+    for e in edges:
+        assert abs(float(e["n_out"][0])) > 0.7  # ±E normals
+
+
+def test_cover_center_2m_does_not_cover_distant_return() -> None:
+    """Front-wall plane 3.5 m from return segment mid must not cover it."""
+    aabb = [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)]
+    edges = aabb_boundary_edges(aabb, roof_id="r")
+    # East return: mid~(10,4), n_out~(+1,0)
+    east = [e for e in edges if float(e["n_out"][0]) > 0.5][0]
+    # Product on south front, center near SW — within old 4 m of east mid? 
+    # east segment from (10,0)-(10,8); point (10,0.5) is on segment.
+    # Use a south-facing plane whose center is at (5,0) — far from east.
+    n = np.array([0.0, -1.0, 0.0])
+    center = np.array([5.0, 0.0, 3.5])
+    pl = {"n": n, "d": float(-n @ center), "center": center, "id": "front"}
+    assert not product_plane_covers_edge(pl, east, center_m=2.0)
+    # Same-orientation wrong: plane facing east but center 3 m west of east wall
+    # along the wall length offset — center (7,4) is 3 m from east segment
+    n_e = np.array([1.0, 0.0, 0.0])
+    c_off = np.array([7.0, 4.0, 3.5])
+    pl_e = {"n": n_e, "d": float(-n_e @ np.array([10.0, 4.0, 3.5])), "center": c_off}
+    # |d+n·M|=0 so plane-dist ok; center-to-segment = 3 m > 2 → not covered
+    assert not product_plane_covers_edge(pl_e, east, center_m=2.0)
+    assert product_plane_covers_edge(pl_e, east, center_m=4.0)
+
+
+def test_reanchor_sat_edge_snaps_and_rejects_drift() -> None:
+    regions = [
+        {
+            "kind": "roof",
+            "id": "r0",
+            "aabb_enu": [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        }
+    ]
+    # Seed on south edge mid~(5,0), n=(0,-1)
+    p0 = np.array([0.0, 0.0])
+    p1 = np.array([10.0, 0.0])
+    n = np.array([0.0, -1.0, 0.0])
+    # Refined center walked ~5 m south (classic ZNCC drift)
+    center_ref = np.array([5.0, -5.0, 3.5])
+    d_ref = float(-n @ center_ref)  # = -5
+    plane = {
+        "n": n,
+        "d": d_ref,
+        "center": center_ref,
+        "source": "ma_gap_sat_edge",
+        "edge_id": "r0_e0",
+        "edge_p0": p0,
+        "edge_p1": p1,
+        "edge_n_out": np.array([0.0, -1.0]),
+        "zncc": 0.5,
+    }
+    out, why = reanchor_sat_edge_after_score(plane, regions, max_drift_m=3.0)
+    assert out is None
+    assert "refine_drift" in why
+    # Mild drift 2 m — accept and snap back onto edge
+    center_mild = np.array([5.0, -2.0, 3.5])
+    d_mild = float(-n @ center_mild)
+    plane2 = {**plane, "center": center_mild, "d": d_mild}
+    out2, why2 = reanchor_sat_edge_after_score(plane2, regions, max_drift_m=3.0)
+    assert out2 is not None, why2
+    assert abs(float(out2["center"][1])) < 1e-6  # on y=0 edge
+    assert abs(float(out2["center"][0]) - 5.0) < 1e-6
+    assert abs(float(out2["refine_drift_m"]) - 2.0) < 1e-6
+
+
+def test_sat_aabb_uses_seed_edge_not_global_nearest() -> None:
+    """After drift toward another building, gate to seed edge_id — not nearest."""
+    regions = [
+        {
+            "kind": "roof",
+            "id": "seed_bldg",
+            "aabb_enu": [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        },
+        {
+            "kind": "roof",
+            "id": "other",
+            "aabb_enu": [(0.0, -6.0), (10.0, -6.0), (10.0, -4.0), (0.0, -4.0)],
+        },
+    ]
+    # Center near other building south of seed; seed edge is south of seed_bldg
+    center = np.array([5.0, -4.5, 3.5])
+    n = np.array([0.0, -1.0, 0.0])
+    # Global nearest is other roof (~0.5 m); seed edge at y=0 is ~4.5 m away
+    ok_global, why_g = sat_aabb_edge_ok(center, n, regions, max_edge_m=2.0)
+    assert ok_global, why_g  # would falsely pass via other building
+    ok_seed, why_s = sat_aabb_edge_ok(
+        center,
+        n,
+        regions,
+        max_edge_m=2.0,
+        edge_id="seed_bldg_e0",
+        edge_p0=np.array([0.0, 0.0]),
+        edge_p1=np.array([10.0, 0.0]),
+    )
+    assert not ok_seed
+    assert "dist_seed_edge" in why_s
+    assert "dist_nearest_any" in why_s
+
+
+def test_filter_gap_adds_reanchor_and_sat_edge_soft_only() -> None:
+    frames = [
+        _frame(0.0, -12.0, 0.0, travel=90.0, i=0),  # looking N at south wall
+        _frame(2.0, -12.0, 0.0, travel=90.0, i=1),
+    ]
+    regions = [
+        {
+            "kind": "roof",
+            "id": "r0",
+            "aabb_enu": [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        }
+    ]
+    n = np.array([0.0, -1.0, 0.0])
+    # Mild-drift sat_edge: 1.5 m off edge → reanchor to 0, pass 2 m gate
+    c_sat = np.array([5.0, -1.5, 3.5])
+    sat = {
+        "n": n,
+        "d": float(-n @ c_sat),
+        "center": c_sat,
+        "zncc": 0.45,
+        "scores": [0.45, 0.40],
+        "view_indices": [0, 1],
+        "source": "ma_gap_sat_edge",
+        "edge_id": "r0_e0",
+        "edge_p0": np.array([0.0, 0.0]),
+        "edge_p1": np.array([10.0, 0.0]),
+        "edge_n_out": np.array([0.0, -1.0]),
+    }
+    # MA peel 4 m off any edge — soft sat_edge gate must NOT rescue it
+    c_ma = np.array([5.0, -4.0, 3.5])
+    ma = {
+        "n": n,
+        "d": float(-n @ c_ma),
+        "center": c_ma,
+        "zncc": 0.55,
+        "scores": [0.55, 0.50],
+        "view_indices": [0, 1],
+        "source": "ma_segment",
+    }
+    kept = filter_gap_adds(
+        [sat, ma],
+        frames,
+        roof_regions=regions,
+        sat_aabb_gate_m=2.0,
+        sat_aabb_gate_sat_edge_m=5.0,  # soft for sat_edge only
+        max_gap_adds=3,
+        sat_edge_reanchor=True,
+        sat_edge_max_drift_m=3.0,
+    )
+    srcs = [p["source"] for p in kept]
+    assert "ma_gap_sat_edge" in srcs
+    assert "ma_segment" not in srcs
+    sat_kept = [p for p in kept if "sat_edge" in p["source"]][0]
+    assert abs(float(sat_kept["center"][1])) < 1e-6  # reanchored
+
+
+def test_filter_rejects_large_refine_drift() -> None:
+    frames = [
+        _frame(0.0, -12.0, 0.0, travel=90.0, i=0),
+        _frame(2.0, -12.0, 0.0, travel=90.0, i=1),
+    ]
+    regions = [
+        {
+            "kind": "roof",
+            "id": "r0",
+            "aabb_enu": [(0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0)],
+        }
+    ]
+    n = np.array([0.0, -1.0, 0.0])
+    c = np.array([5.0, -5.0, 3.5])  # 5 m drift
+    plane = {
+        "n": n,
+        "d": float(-n @ c),
+        "center": c,
+        "zncc": 0.50,
+        "scores": [0.50, 0.48],
+        "view_indices": [0, 1],
+        "source": "ma_gap_sat_edge",
+        "edge_id": "r0_e0",
+        "edge_p0": np.array([0.0, 0.0]),
+        "edge_p1": np.array([10.0, 0.0]),
+    }
+    kept = filter_gap_adds(
+        [plane],
+        frames,
+        roof_regions=regions,
+        sat_aabb_gate_m=2.0,
+        sat_aabb_gate_sat_edge_m=5.0,
+        max_gap_adds=3,
+        sat_edge_reanchor=True,
+        sat_edge_max_drift_m=3.0,
+    )
+    assert kept == []
+
+
+def test_closest_point_on_segment() -> None:
+    p = closest_point_on_segment_xy(
+        np.array([5.0, -3.0]), np.array([0.0, 0.0]), np.array([10.0, 0.0])
+    )
+    assert abs(float(p[0]) - 5.0) < 1e-9
+    assert abs(float(p[1])) < 1e-9

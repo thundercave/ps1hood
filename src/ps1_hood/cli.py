@@ -778,6 +778,29 @@ def export_mapanything_bundle_cmd(
     help="Gap seeds: sat-edge (uncovered roof AABB + facing cams), "
     "legacy (manhattan/corner/worst-cam), or both",
 )
+@click.option(
+    "--sat-edge-reanchor/--no-sat-edge-reanchor",
+    default=True,
+    show_default=True,
+    help="After ZNCC, re-anchor sat_edge center onto seed edge segment "
+    "(reject refine_drift if |Δd| exceeds --sat-edge-max-drift)",
+)
+@click.option(
+    "--sat-edge-max-drift",
+    "sat_edge_max_drift_m",
+    default=3.0,
+    show_default=True,
+    type=float,
+    help="Max |d_refined − d_anchor| (m) when re-anchoring sat_edge",
+)
+@click.option(
+    "--sat-aabb-gate-sat-edge",
+    "sat_aabb_gate_sat_edge_m",
+    default=None,
+    type=float,
+    help="Optional softer AABB gate (m) for sat_edge only (e.g. 5.0). "
+    "Does NOT widen gate for MA peels / manhattan. Default: use --sat-aabb-gate",
+)
 def facades_cmd(
     name: str,
     source: str,
@@ -814,6 +837,9 @@ def facades_cmd(
     ma_peel_cap: int,
     gap_min_views: int,
     gap_seeds: str,
+    sat_edge_reanchor: bool,
+    sat_edge_max_drift_m: float,
+    sat_aabb_gate_sat_edge_m: float | None,
 ) -> None:
     """Path α: planarize dense ENU cloud → ZNCC-gated façades.obj + planes.json.
 
@@ -832,6 +858,11 @@ def facades_cmd(
     / ``--ma-peel-cap`` tighten multi-view + sat footprint for *new* planes only
     (product_lock untouched). ``--gap-seeds sat-edge`` (default) invents
     uncovered roof-edge hyps; zero facing cams → ``recon/gap_needs.json``.
+
+    ``--sat-edge-reanchor`` (default on): after ZNCC, snap sat_edge center back
+    onto its seed edge; reject ``refine_drift`` if |Δd| > ``--sat-edge-max-drift``.
+    AABB distance is to that ``edge_id`` segment. Optional
+    ``--sat-aabb-gate-sat-edge`` softens the gate for sat_edge only (not MA peels).
     """
     from ps1_hood.geo import LocalFrame
     from ps1_hood.reconstruct.facades import extract_facades
@@ -936,6 +967,13 @@ def facades_cmd(
             ma_peel_cap=int(ma_peel_cap),
             gap_min_views=int(gap_min_views),
             gap_seeds_mode=str(gap_seeds),
+            sat_edge_reanchor=bool(sat_edge_reanchor),
+            sat_edge_max_drift_m=float(sat_edge_max_drift_m),
+            sat_aabb_gate_sat_edge_m=(
+                None
+                if sat_aabb_gate_sat_edge_m is None
+                else float(sat_aabb_gate_sat_edge_m)
+            ),
         )
     except Exception as exc:
         click.echo(f"facades failed: {exc}", err=True)

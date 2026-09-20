@@ -4,7 +4,7 @@
 **Goal:** stop clause-2 from promoting volume that hurts global compare  
 **Sacred:** sat XY · no free-pose · don’t auto-revert live 23 (PC triage of +5 is separate)  
 **Out:** densify · free-pose · compare-aware keep (pack §3 C — next)
-**Follow-up shipped:** [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md) (`--gap-seeds sat-edge`)
+**Follow-up shipped:** [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md) (`--gap-seeds sat-edge`); [`sat-edge-reanchor.md`](sat-edge-reanchor.md) (re-anchor + seed-edge AABB)
 
 Packs: `/workspace/gap-fill-compare-regress-rd.md` §3 B · `/workspace/gap-fill-seed-rethink-rd.md` §2 A.
 

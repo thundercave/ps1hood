@@ -69,7 +69,7 @@ See also [`worst-cam-gap-fill.md`](worst-cam-gap-fill.md) for targeted seeds tow
 ---
 
 
-Stricter gap-add gates: [`gap-fill-stricter-multiview.md`](gap-fill-stricter-multiview.md). Sat-edge seeds: [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md).
+Stricter gap-add gates: [`gap-fill-stricter-multiview.md`](gap-fill-stricter-multiview.md). Sat-edge seeds: [`sat-edge-gap-seeds.md`](sat-edge-gap-seeds.md). Re-anchor / seed-edge AABB: [`sat-edge-reanchor.md`](sat-edge-reanchor.md).
 
 ## Non-goals
 

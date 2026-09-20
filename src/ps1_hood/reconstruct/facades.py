@@ -811,6 +811,9 @@ def extract_facades(
     ma_peel_cap: int | None = None,
     gap_min_views: int | None = None,
     gap_seeds_mode: str | None = None,
+    sat_edge_reanchor: bool = True,
+    sat_edge_max_drift_m: float | None = None,
+    sat_aabb_gate_sat_edge_m: float | None = None,
 ) -> dict:
     """Photo-consistent vertical façades under known poses.
 
@@ -862,6 +865,10 @@ def extract_facades(
     ``max_gap_adds``. Soft-pass sat gate when no roofs. ``gap_seeds_mode``:
     ``sat-edge`` (default) = uncovered roof AABB edges → same-side facing cams
     (else ``gap_needs.json``); ``legacy`` = manhattan/corner/worst-cam; ``both``.
+    ``sat_edge_reanchor`` snaps accepted sat_edge centers back onto the seed
+    segment (reject refine_drift beyond ``sat_edge_max_drift_m``); AABB uses
+    that edge_id. ``sat_aabb_gate_sat_edge_m`` optionally softens AABB for
+    sat_edge only (never MA peels).
 
     Worst-cam targeted gap-fill: ``worst_cam_ids`` / ``worst_from_compare`` seed
     planes in front of those cams (dist×yaw); filter manhattan/corner to visible
@@ -1223,6 +1230,7 @@ def extract_facades(
                     GAP_ADD_MAX_ADDS,
                     GAP_ADD_MIN_VIEWS,
                     GAP_ADD_SAT_EDGE_M,
+                    SAT_EDGE_MAX_DRIFT_M,
                     filter_gap_adds,
                     load_sat_roof_regions,
                 )
@@ -1242,6 +1250,16 @@ def extract_facades(
                     if max_gap_adds is None
                     else int(max_gap_adds)
                 )
+                _drift = (
+                    float(SAT_EDGE_MAX_DRIFT_M)
+                    if sat_edge_max_drift_m is None
+                    else float(sat_edge_max_drift_m)
+                )
+                _sat_edge_soft = (
+                    None
+                    if sat_aabb_gate_sat_edge_m is None
+                    else float(sat_aabb_gate_sat_edge_m)
+                )
                 roof_regs = load_sat_roof_regions(root)
                 before_gate = len(accepted_new)
                 accepted_new = filter_gap_adds(
@@ -1249,17 +1267,24 @@ def extract_facades(
                     frames,
                     roof_regions=roof_regs,
                     sat_aabb_gate_m=_sat_m,
+                    sat_aabb_gate_sat_edge_m=_sat_edge_soft,
                     min_views=_min_views,
                     max_gap_adds=_max_adds,
+                    sat_edge_reanchor=bool(sat_edge_reanchor),
+                    sat_edge_max_drift_m=_drift,
                 )
                 log.info(
                     "facades gap_fill stricter gate: %s → %s "
-                    "(sat_aabb=%.2f min_views=%s max_adds=%s)",
+                    "(sat_aabb=%.2f sat_edge_soft=%s min_views=%s max_adds=%s "
+                    "reanchor=%s max_drift=%.2f)",
                     before_gate,
                     len(accepted_new),
                     _sat_m,
+                    _sat_edge_soft,
                     _min_views,
                     _max_adds,
+                    sat_edge_reanchor,
+                    _drift,
                 )
             accepted = union_keep_planes(
                 list(accepted_a) + accepted_new,
