@@ -106,3 +106,5 @@ uv run ps1hood sat-offset apply smoke-dense --from align/T_cam_road.json \
 Gates: n≥4 · rms≤2 m · |yaw|≤10° · ||t||≤12 m · `source=cam_street_centerline`. Measure does **not** apply.
 
 Full notes: [`sat-offset-cam-road.md`](sat-offset-cam-road.md).
+
+**Studio draw:** when auto measure still fails, toggle **cam-road polyline** in the viewer — draw a yellow dotted sat centerline → fit preview (`T_pick_cam_road`) → confirm apply. No new auto measure.

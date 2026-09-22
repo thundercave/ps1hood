@@ -72,6 +72,11 @@
       + ` <button type="button" id="btnSatApply" disabled>apply T</button>`
       + ` <button type="button" id="btnSatClear" disabled>clear</button>`
       + `<br><span id="satPickStatus" style="color:#e8c36a">sat-offset: off · do not auto-apply Chamfer T</span>`
+      + `<br><label><input type="checkbox" id="togCamRoad"> cam-road polyline</label>`
+      + ` <button type="button" id="btnCamRoadFit" disabled>fit</button>`
+      + ` <button type="button" id="btnCamRoadApply" disabled>apply T</button>`
+      + ` <button type="button" id="btnCamRoadClear" disabled>clear</button>`
+      + `<br><span id="camRoadStatus" style="color:#e8c36a">cam-road: off · draw dotted sat centerline → fit → confirm apply</span>`
       + `<br><a href="/">back</a>`;
 
     // ENU (x=east, y=north, z=up) → Three (x, y=up, z=south-ish): (e, u, -n)
@@ -719,6 +724,7 @@
     let satPairs = []; // {yellow:{e,n}, red:{e,n}}
     let satPendingYellow = null;
     let satPreview = null;
+    let camRoadOn = false; // mutual exclusive w/ satPickOn; draw UI below
     const satPickGroup = new THREE.Group();
     scene.add(satPickGroup);
     const satGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -806,6 +812,10 @@
         const ts = document.getElementById('togSculpt');
         if (ts) { ts.checked = false; ts.dispatchEvent(new Event('change')); }
       }
+      if (satPickOn && camRoadOn) {
+        const tc = document.getElementById('togCamRoad');
+        if (tc) { tc.checked = false; camRoadOn = false; updateCamRoadStatus(); redrawCamRoad(); }
+      }
       if (satPickOn) {
         const tf = document.getElementById('togFacades');
         if (tf && !tf.checked) { tf.checked = true; tf.dispatchEvent(new Event('change')); }
@@ -885,7 +895,7 @@
 
     renderer.domElement.addEventListener('pointerdown', (ev) => {
       if (!satPickOn || ev.button !== 0) return;
-      if (sculptOn) return;
+      if (sculptOn || camRoadOn) return;
       const enu = pickGroundEnu(ev);
       if (!enu) return;
       if (satExpect === 'yellow') {
@@ -914,11 +924,207 @@
       }
     });
 
+    // --- cam-road polyline draw (Studio) — reuse POST …/sat-offset/cam-road-pairs ---
+    // Mutual exclusive with façade sat-offset pick. Preview only; apply via T_pick_cam_road.
+    let camRoadPts = []; // [{e,n}, ...] yellow dotted centerline
+    let camRoadPreview = null;
+    const camRoadGroup = new THREE.Group();
+    scene.add(camRoadGroup);
+
+    function uniqueCamXy() {
+      const seen = new Set();
+      const out = [];
+      for (const c of (sceneJson.cameras || [])) {
+        if (!Number.isFinite(c.e) || !Number.isFinite(c.n)) continue;
+        const key = c.e.toFixed(2) + ',' + c.n.toFixed(2);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ e: c.e, n: c.n, u: Number.isFinite(c.u) ? c.u : 2.5 });
+      }
+      return out;
+    }
+
+    function clearCamRoadMarkers() {
+      while (camRoadGroup.children.length) {
+        const c = camRoadGroup.children.pop();
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+      }
+    }
+
+    function addCamRoadMarker(e, n, color, y = 0.45) {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.4, 10, 8),
+        new THREE.MeshBasicMaterial({ color, depthTest: false })
+      );
+      mesh.position.copy(to3(e, n, y));
+      mesh.renderOrder = 11;
+      camRoadGroup.add(mesh);
+    }
+
+    function addCamRoadDashed(pts, color, y = 0.32) {
+      if (!pts || pts.length < 2) return;
+      const points = pts.map((p) => to3(p.e, p.n, y));
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineDashedMaterial({
+        color, dashSize: 0.9, gapSize: 0.45, depthTest: false,
+      });
+      const line = new THREE.Line(geo, mat);
+      line.computeLineDistances();
+      line.renderOrder = 11;
+      camRoadGroup.add(line);
+    }
+
+    function addCamRoadSolid(pts, color, y = 0.28) {
+      if (!pts || pts.length < 2) return;
+      const points = pts.map((p) => to3(p.e, p.n, y));
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, depthTest: false }));
+      line.renderOrder = 11;
+      camRoadGroup.add(line);
+    }
+
+    function redrawCamRoad() {
+      clearCamRoadMarkers();
+      if (!camRoadOn && !camRoadPts.length && !camRoadPreview) return;
+      // Red cam track always visible in this mode
+      if (camRoadOn) {
+        const cams = uniqueCamXy();
+        for (const c of cams) addCamRoadMarker(c.e, c.n, 0xe05050, 0.55);
+        addCamRoadSolid(cams, 0xe05050, 0.25);
+      }
+      // Yellow dotted drawn centerline
+      for (const p of camRoadPts) addCamRoadMarker(p.e, p.n, 0xf0e060, 0.5);
+      addCamRoadDashed(camRoadPts, 0xf0e060, 0.35);
+      // Cyan mapped preview
+      if (camRoadPreview && camRoadPreview.preview) {
+        const mapped = camRoadPreview.preview.red_mapped || [];
+        for (const m of mapped) addCamRoadMarker(m.e, m.n, 0x50e0f0, 0.7);
+        for (const ar of (camRoadPreview.preview.arrows || [])) {
+          if (ar.from && ar.mapped) addCamRoadSolid([ar.from, ar.mapped], 0x50e0f0, 0.4);
+        }
+      }
+    }
+
+    function updateCamRoadStatus() {
+      const el = document.getElementById('camRoadStatus');
+      if (!el) return;
+      if (!camRoadOn) {
+        el.textContent = 'cam-road: off · draw dotted sat centerline → fit → confirm apply';
+        return;
+      }
+      let msg = `cam-road polyline: pts=${camRoadPts.length} (need ≥2; click sat road)`;
+      if (camRoadPreview) {
+        const mad = (camRoadPreview.mad_m != null) ? ` mad=${Number(camRoadPreview.mad_m).toFixed(3)}m` : '';
+        msg += `  |  T tx=${camRoadPreview.tx_m.toFixed(2)} ty=${camRoadPreview.ty_m.toFixed(2)} yaw=${camRoadPreview.yaw_deg.toFixed(2)}° rms=${camRoadPreview.rms_m.toFixed(3)}m${mad} — preview only`;
+      }
+      el.textContent = msg;
+      const fitBtn = document.getElementById('btnCamRoadFit');
+      const applyBtn = document.getElementById('btnCamRoadApply');
+      const clearBtn = document.getElementById('btnCamRoadClear');
+      if (fitBtn) fitBtn.disabled = camRoadPts.length < 2;
+      if (applyBtn) applyBtn.disabled = !camRoadPreview;
+      if (clearBtn) clearBtn.disabled = false;
+    }
+
+    function setCamRoad(on) {
+      camRoadOn = !!on;
+      if (camRoadOn) {
+        // mutual exclusive w/ façade sat-offset pick + sculpt
+        if (satPickOn) {
+          const ts = document.getElementById('togSatPick');
+          if (ts) { ts.checked = false; setSatPick(false); }
+        }
+        if (sculptOn) {
+          const tsc = document.getElementById('togSculpt');
+          if (tsc) { tsc.checked = false; tsc.dispatchEvent(new Event('change')); }
+        }
+        camera.position.set(camera.position.x, Math.max(camera.position.y, 55), camera.position.z);
+        controls.update();
+      }
+      updateCamRoadStatus();
+      redrawCamRoad();
+    }
+
+    async function fitCamRoadPolyline() {
+      if (camRoadPts.length < 2) { alert('draw ≥2 polyline points on sat road'); return; }
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sat-offset/cam-road-pairs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ polyline: camRoadPts }),
+      });
+      const data = await resp.json();
+      if (!data.ok) { alert('fit failed: ' + (data.error || resp.status)); return; }
+      camRoadPreview = data;
+      redrawCamRoad();
+      updateCamRoadStatus();
+    }
+
+    document.getElementById('togCamRoad')?.addEventListener('change', (ev) => {
+      setCamRoad(ev.target.checked);
+    });
+    document.getElementById('btnCamRoadClear')?.addEventListener('click', () => {
+      camRoadPts = [];
+      camRoadPreview = null;
+      redrawCamRoad();
+      updateCamRoadStatus();
+    });
+    document.getElementById('btnCamRoadFit')?.addEventListener('click', () => fitCamRoadPolyline());
+    document.getElementById('btnCamRoadApply')?.addEventListener('click', async () => {
+      if (!camRoadPreview) { alert('fit preview first'); return; }
+      const madBit = (camRoadPreview.mad_m != null) ? ` mad=${Number(camRoadPreview.mad_m).toFixed(3)}m` : '';
+      const msg = `Apply cam-road SE(2) tx=${camRoadPreview.tx_m.toFixed(2)} ty=${camRoadPreview.ty_m.toFixed(2)} yaw=${camRoadPreview.yaw_deg.toFixed(2)}° rms=${camRoadPreview.rms_m.toFixed(3)}m${madBit}?\nBak first; moves cams+cloud+facades+planes; skips roofs/street.\nfrom=T_pick_cam_road`;
+      if (!confirm(msg)) return;
+      const resp = await fetch('/api/runs/' + encodeURIComponent(run) + '/sat-offset/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, from: 'T_pick_cam_road' }),
+      });
+      const data = await resp.json();
+      if (!data.ok) { alert('apply failed: ' + (data.error || resp.status)); return; }
+      location.reload();
+    });
+
+    renderer.domElement.addEventListener('pointerdown', (ev) => {
+      if (!camRoadOn || ev.button !== 0) return;
+      if (sculptOn || satPickOn) return;
+      const enu = pickGroundEnu(ev);
+      if (!enu) return;
+      camRoadPts.push({ e: enu.e, n: enu.n });
+      camRoadPreview = null;
+      redrawCamRoad();
+      updateCamRoadStatus();
+      ev.stopPropagation();
+    }, true);
+
+    addEventListener('keydown', (ev) => {
+      if (!camRoadOn) return;
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        fitCamRoadPolyline();
+      } else if (ev.key === 'Escape') {
+        if (camRoadPts.length) {
+          camRoadPts.pop();
+          camRoadPreview = null;
+          redrawCamRoad();
+          updateCamRoadStatus();
+        }
+      } else if (ev.key === 'Backspace' && !ev.target.matches?.('input,textarea,select')) {
+        if (camRoadPts.length) {
+          ev.preventDefault();
+          camRoadPts.pop();
+          camRoadPreview = null;
+          redrawCamRoad();
+          updateCamRoadStatus();
+        }
+      }
+    });
+
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
     renderer.domElement.addEventListener('pointerdown', (ev) => {
-      if (!sculptOn || satPickOn || ev.button !== 0) return;
+      if (!sculptOn || satPickOn || camRoadOn || ev.button !== 0) return;
       if (tcontrols.dragging) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;

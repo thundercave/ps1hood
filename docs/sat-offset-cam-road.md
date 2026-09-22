@@ -1,7 +1,7 @@
 # Sat-offset from cam track → street centerline (`measure-cams`)
 
 **Date:** 2026-09-20 (Europe/Amsterdam)  
-**Pack:** `/workspace/sat-offset-cam-road-fix-rd.md` (fix for multi-branch NN)  
+**Pack:** `/workspace/sat-offset-cam-road-fix-rd.md` · Studio draw UI: `/workspace/studio-cam-road-polyline-rd.md`  
 **Sacred:** sat absolute XY · **one rigid SE(2)** · no free-pose · bak · skip sat-native roofs/street  
 **Reuse:** `apply_forced_se2` / `bak_force` / `fit_se2` (`align/sat_offset.py`)
 
@@ -43,7 +43,22 @@ Undo: restore `align.bak_force_<ts>/` over `align/` and `recon/bak_force_<ts>/` 
 | **MAD gate** | Report `median_abs_m` + `mad_m`; reject if `mad > max_mad_m` (default 1.5 m) |
 | **Translation-only** | `--translation-only` / `--se2-mode translation` when yaw is noise |
 
-## Studio fallback (if A–C still fail)
+## Studio draw polyline (preferred when auto measure still fails)
+
+**Stop further auto measure PRs** unless asked — prefer Studio draw / picks. API already fits (`fit_cam_road_from_polyline` / `cam-road-pairs` from #55).
+
+### How-to (viewer)
+
+1. `uv run ps1hood studio` → open viewer for the run
+2. Toggle **cam-road polyline** (mutual exclusive w/ façade **sat-offset pick**; nudges top-down; shows **red cam track**)
+3. Click a sequence of points along the sat road → **yellow dotted** centerline (`LineDashed`)
+4. **fit** (or Enter) → `POST …/sat-offset/cam-road-pairs` `{polyline:[{e,n},…]}` → server snaps unique cams to polyline → preview cyan mapped track + tx/ty/yaw/rms/mad · writes `align/T_pick_cam_road.json` (**does not apply**)
+5. If cyan ≈ yellow (±~1 m): **apply T** → confirm → bak + cams/cloud/facades/planes; **skips roofs/street** (`from=T_pick_cam_road`)
+6. Hard-reload viewer after apply
+
+Escape / Backspace pops last point; **clear** resets.
+
+### API (same endpoints)
 
 ```text
 POST /api/runs/<name>/sat-offset/cam-road-pairs
@@ -84,4 +99,4 @@ Façade-Canny auto apply · free-pose · wipe 18 · Mapillary · force-apply fai
 
 ## One-liner
 
-*rms ≫ \|\|t\|\| = multi-branch skeleton NN — corridor-crop the mask, continuity-match along the cam path, gate on MAD; measure → T_cam_road.json only; apply separate with bak; do not force-apply the failed 1.9 m T.*
+*Stop auto cam-road iterate; Studio draw dotted road polyline (API already fits) → preview → confirm apply. Corridor/MAD measure stays available but do not force-apply a failed T.*
