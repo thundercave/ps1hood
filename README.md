@@ -240,4 +240,6 @@ uv run ps1hood sat-offset measure smoke-dense --out align/T_force.json
 
 Studio: viewer → **sat-offset pick** → yellow then red corners → **fit preview** → **apply T**.
 
+Studio cam↔road: viewer → **cam-road polyline** → click dotted sat centerline → **fit** → cyan preview → **apply T** (confirm; `T_pick_cam_road`; skips roofs/street). Prefer this over further auto measure.
+
 See [`docs/sat-forced-se2.md`](docs/sat-forced-se2.md) and [`docs/sat-offset-cam-road.md`](docs/sat-offset-cam-road.md).
