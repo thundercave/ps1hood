@@ -56,9 +56,9 @@
       + `<br><label><input type="checkbox" id="togCloud" checked> cloud (raw MA)</label>`
       + ` <label><input type="checkbox" id="togZclean"> zclean</label>`
       + ` <label><input type="checkbox" id="togOfftile"> offtile</label>`
-      + ` <label><input type="checkbox" id="togFacades"> facades (overlay)</label>`
-      + ` <label><input type="checkbox" id="togRoofs"> roofs (overlay)</label>`
-      + ` <label><input type="checkbox" id="togStreet"> street (overlay)</label>`
+      + ` <label><input type="checkbox" id="togFacades" checked> facades (overlay)</label>`
+      + ` <label><input type="checkbox" id="togRoofs" checked> roofs (overlay)</label>`
+      + ` <label><input type="checkbox" id="togStreet" checked> street (overlay)</label>`
       + ` <label><input type="checkbox" id="togBag"> BAG</label>`
       + `<br><label><input type="checkbox" id="togSculpt"> sculpt</label>`
       + ` <button type="button" id="btnSculptTranslate" disabled>nudge n</button>`
@@ -290,7 +290,7 @@
           }
         }
       });
-      facadeRoot.visible = false;  // overlay: opt-in via #togFacades / sculpt auto-enable
+      facadeRoot.visible = true;  // overlay: on by default; sculpt may also enable it
       scene.add(facadeRoot);
     } catch (err) {
       hud.innerHTML += '<br>no textured facades yet';
@@ -337,7 +337,7 @@
           }
         }
       });
-      roofRoot.visible = false;  // overlay: opt-in via #togRoofs
+      roofRoot.visible = true;  // overlay: on by default via #togRoofs
       scene.add(roofRoot);
     } catch (err) {
       hud.innerHTML += '<br>no sat roofs yet';
@@ -386,7 +386,7 @@
           }
         }
       });
-      streetRoot.visible = false;  // overlay: opt-in via #togStreet
+      streetRoot.visible = true;  // overlay: on by default via #togStreet
       scene.add(streetRoot);
     } catch (err) {
       hud.innerHTML += '<br>no sat street yet';
