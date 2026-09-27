@@ -12,13 +12,16 @@ Façade↔Canny pairs were noisy; **cam-on-road** is the hard constraint. Fit SE
 ## CLI (PC)
 
 ```bash
-# 1) Measure only — corridor crop + continuity match → align/T_cam_road.json (does NOT apply)
+# 1) Measure only — corridor + single-branch + continuity → align/T_cam_road.json
+#    (does NOT apply). Always writes align/cam_road_debug.png.
 uv run ps1hood sat-offset measure-cams smoke-dense \
   --corridor-m 15 \
+  --single-branch \
+  --continuity \
   --translation-only \
   --max-mad-m 1.5 \
   --out align/T_cam_road.json \
-  --overlay
+  --debug-png align/cam_road_debug.png
 # dumps mean_nn_m, median_abs_m, mad_m, tx, ty, yaw, rms, n_cams, ||t||; applied=false
 
 # Alias:
@@ -38,9 +41,11 @@ Undo: restore `align.bak_force_<ts>/` over `align/` and `recon/bak_force_<ts>/` 
 
 | Fix | What |
 |-----|------|
-| **Corridor crop** | `street_m &= dilate(cam disks, corridor_m≈15)` **before** skeleton/medial |
-| **Continuity match** | Order cams along travel; attach to one branch via road-tangent prediction (no NN jump to parallel parking/side) |
+| **Corridor crop** | `street_c = street_m & dilate(cam disks, corridor_m≈15)` **before** skeleton |
+| **Single-branch** | Keep ONE skeleton CC: `score = length_m * exp(-median_dist_to_cams / 5)` → ordered polyline P |
+| **Continuity match** | Arc-length `|Δs| ≤ 1.5× median cam spacing` along P (fallback road-tangent / NN) |
 | **MAD gate** | Report `median_abs_m` + `mad_m`; reject if `mad > max_mad_m` (default 1.5 m) |
+| **Debug PNG** | Always write `align/cam_road_debug.png` (street_m \| street_c \| skel \| P \| cams \| arrows) |
 | **Translation-only** | `--translation-only` / `--se2-mode translation` when yaw is noise |
 
 ## Studio draw polyline (preferred when auto measure still fails)
@@ -75,8 +80,10 @@ POST …/sat-offset/apply { "confirm": true, "from": "T_pick_cam_road" }
 | Unique cam XY | `unique_cam_xy_from_project` / `order_cams_along_path` |
 | Ortho street mask | `segment_roof_yard_mask` → `street_m` |
 | Corridor crop | `crop_street_mask_to_cam_corridor` (`cam_xy_mask`, R≈12–20 m) |
-| Medial / centerline | `street_mask_centerline` → `street_centerline_enu` |
-| Correspondences | `match_cams_to_centerline_continuity` (fallback plain NN) |
+| Single-branch | `select_single_skeleton_branch` → ordered polyline P |
+| Medial / centerline | `extract_street_skeleton` / `street_centerline_enu` (multi-branch fallback) |
+| Correspondences | `match_cams_to_polyline_arc_continuity` (fallback continuity / NN) |
+| Debug | `write_cam_road_debug_png` (always) |
 | Fit SE(2) | `fit_se2`; if \|yaw\| ≤ 2° or `--translation-only` → translation-only |
 | Gates | n_pairs ≥ 4 · rms ≤ 2 m · mad ≤ 1.5 m · \|yaw\| ≤ 10° · \|\|t\|\| ≤ 12 m |
 | Persist | `align/T_cam_road.json` · `source=cam_street_centerline` · `applied=false` |

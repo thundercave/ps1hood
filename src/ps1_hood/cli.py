@@ -2160,6 +2160,9 @@ def sat_offset_measure_cmd(
                 min_pairs=int(min_pairs),
                 max_yaw_deg=float(max_yaw_deg) if max_yaw_deg is not None else 10.0,
                 max_translation_m=float(max_translation_m) if max_translation_m is not None else 12.0,
+                single_branch=True,
+                continuity=True,
+                debug_png=Path("align/cam_road_debug.png"),
             )
             paths = persist_t_cam_road(
                 project, payload, t_path=out_path, overlay=bool(overlay)
@@ -2265,6 +2268,27 @@ def sat_offset_measure_cmd(
     help="Match along cam path (no NN jump to parallel branches)",
 )
 @click.option(
+    "--single-branch/--no-single-branch",
+    default=True,
+    show_default=True,
+    help="Keep ONE skeleton CC near cams (kills parking/side-street latch)",
+)
+@click.option(
+    "--debug-png",
+    "debug_png",
+    default="align/cam_road_debug.png",
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Always-write debug montage (street_m|street_c|skel|P|cams); empty to skip",
+)
+@click.option(
+    "--no-debug-png",
+    "no_debug_png",
+    is_flag=True,
+    default=False,
+    help="Skip debug PNG (overrides --debug-png)",
+)
+@click.option(
     "--overlay/--no-overlay",
     default=False,
     show_default=True,
@@ -2285,10 +2309,14 @@ def sat_offset_measure_cams_cmd(
     corridor_m: float,
     max_mad_m: float,
     continuity: bool,
+    single_branch: bool,
+    debug_png: Path | None,
+    no_debug_png: bool,
     overlay: bool,
 ) -> None:
     """Measure SE(2) from unique cam XY → Ortho street_mask centerline.
 
+    Corridor crop + single-branch skeleton + continuity match.
     Writes align/T_cam_road.json. Does **not** apply — use
     `sat-offset apply --from align/T_cam_road.json` after Studio preview.
     One rigid SE(2) only — no free-pose. Skips roofs/street on apply.
@@ -2300,6 +2328,7 @@ def sat_offset_measure_cams_cmd(
     )
 
     project = open_project(name)
+    dbg = None if no_debug_png else debug_png
     try:
         mode = (se2_mode or "auto").lower()
         if translation_only:
@@ -2319,12 +2348,15 @@ def sat_offset_measure_cams_cmd(
             corridor_m=float(corridor_m),
             max_mad_m=float(max_mad_m),
             continuity=bool(continuity),
+            single_branch=bool(single_branch),
+            debug_png=dbg,
         )
         paths = persist_t_cam_road(
             project,
             payload,
             t_path=out_path,
             overlay=bool(overlay),
+            debug_png=dbg,
         )
     except SatOffsetError as exc:
         click.echo(f"sat-offset measure-cams failed: {exc}", err=True)
@@ -2332,6 +2364,7 @@ def sat_offset_measure_cams_cmd(
     t_norm = float(payload.get("t_norm_m", 0.0))
     mad = float(payload.get("mad_m", float("nan")))
     med = float(payload.get("median_abs_m", float("nan")))
+    branch = payload.get("branch") or {}
     click.echo(
         f"sat-offset measure-cams ok  tx={payload['tx_m']:.3f}  ty={payload['ty_m']:.3f}  "
         f"yaw={payload['yaw_deg']:.3f}  rms={payload['rms_m']:.3f}  "
@@ -2339,9 +2372,13 @@ def sat_offset_measure_cams_cmd(
         f"n_cams={payload['n_cams']}  n_pairs={payload['n_pairs']}  "
         f"mean_nn_m={payload['mean_nn_m']:.3f}  ||t||={t_norm:.3f}  "
         f"corridor_m={payload.get('corridor_m')}  continuity={payload.get('continuity')}  "
+        f"single_branch={payload.get('single_branch')}  "
+        f"branch_len_m={branch.get('length_m', float('nan'))}  "
+        f"branch_med_dist_m={branch.get('median_dist_m', float('nan'))}  "
         f"translation_only={payload.get('translation_only')}  "
         f"applied=false  out={paths['T_cam_road']}"
         + (f"  overlay={paths['overlay']}" if paths.get("overlay") else "")
+        + (f"  debug_png={paths['debug_png']}" if paths.get("debug_png") else "")
     )
 
 
