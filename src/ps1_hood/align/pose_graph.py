@@ -195,12 +195,15 @@ def refine_poses(
                 sat_obs.append({"i": i, **hit})
             else:
                 pose["e"], pose["n"] = eg, ng
+                why = (
+                    f"drift={drift:.2f}m > {MAX_SAT_SHIFT_M:.1f}m"
+                    if drift > MAX_SAT_SHIFT_M + 1e-6
+                    else f"score={float(hit['score']):.3f} <= 0.08"
+                )
                 log.info(
-                    "sat NCC rejected for %s (score=%.3f drift=%.2fm > %.1fm) — keep raw GPS",
+                    "sat NCC rejected for %s (%s) — keep raw GPS",
                     pose["pano_id"],
-                    float(hit["score"]),
-                    drift,
-                    MAX_SAT_SHIFT_M,
+                    why,
                 )
 
     if use_features:
