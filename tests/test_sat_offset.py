@@ -572,3 +572,81 @@ def test_fit_cam_road_from_pairs_preview_only():
     assert payload["applied"] is False
     assert abs(payload["ty_m"] - 2.0) < 0.2
     assert payload["rms_m"] <= 2.0
+
+
+def test_select_single_skeleton_branch_picks_near_cam_track():
+    """Fat multi-branch skel: score keeps the branch near cams, not parking."""
+    import numpy as np
+    from types import SimpleNamespace
+    from ps1_hood.align.sat_offset import (
+        extract_street_skeleton,
+        select_single_skeleton_branch,
+    )
+
+    h, w = 120, 160
+    street = np.zeros((h, w), dtype=np.uint8)
+    # Main road (near cams) at row 60 — thick band
+    street[56:65, 10:150] = 255
+    # Parking / side branch far north at row 20
+    street[16:25, 10:150] = 255
+    # Thin connector (makes one CC before corridor; after skel may still be 2+)
+    street[25:56, 80:83] = 255
+
+    skel = extract_street_skeleton(street)
+
+    class _Ortho:
+        h = 120
+        w = 160
+        sw = 0.0
+        ee = 160.0
+        sh = 0.0
+        nn = 120.0
+
+        def enu_to_px(self, e, n):
+            u = (e - self.sw) / (self.ee - self.sw) * (self.w - 1)
+            v = (1.0 - (n - self.sh) / (self.nn - self.sh)) * (self.h - 1)
+            return u, v
+
+    ortho = _Ortho()
+    # Cams along main road (row 60 → n ≈ 60 in 1m/px with sh=0,nn=120 → v=60 ⇒ n=60)
+    cams = np.array([[30.0, 60.0], [60.0, 60.0], [90.0, 60.0], [120.0, 60.0]])
+    poly, selected, meta = select_single_skeleton_branch(skel, ortho, cams)
+    assert len(poly) >= 8
+    # Selected branch should hug n≈60, not n≈20
+    med_n = float(np.median(poly[:, 1]))
+    assert abs(med_n - 60.0) < 8.0, f"picked wrong branch med_n={med_n} meta={meta}"
+    assert meta["median_dist_m"] < 10.0
+
+
+def test_arc_continuity_rejects_large_s_jump():
+    import numpy as np
+    from ps1_hood.align.sat_offset import match_cams_to_polyline_arc_continuity
+
+    # Polyline along E axis; spur goes north at e=10
+    main = np.stack([np.linspace(0, 30, 31), np.zeros(31)], axis=1)
+    cams = np.array([[0.0, 1.0], [5.0, 1.0], [10.0, 1.0], [15.0, 1.0], [20.0, 1.0]])
+    before, after, dists = match_cams_to_polyline_arc_continuity(
+        cams, main, search_r_m=15.0, min_nn_m=0.1, step_factor=1.5
+    )
+    assert len(before) >= 4
+    assert all(abs(a["n"]) < 0.5 for a in after)
+
+
+def test_measure_cam_road_single_branch_default(tmp_path: Path, monkeypatch):
+    from ps1_hood.align.sat_offset import measure_cam_road_se2
+
+    _patch_street_mask(monkeypatch)
+    project = _mini_project_cam_road(tmp_path, cam_shift_e=0.0, cam_shift_n=2.5)
+    dbg = tmp_path / "cam_road_debug.png"
+    payload = measure_cam_road_se2(
+        project,
+        search_r_m=15.0,
+        single_branch=True,
+        continuity=True,
+        debug_png=dbg,
+    )
+    assert payload["single_branch"] is True
+    assert payload["applied"] is False
+    assert payload["rms_m"] <= 2.0
+    assert payload["mad_m"] <= 1.5
+    assert dbg.is_file() and dbg.stat().st_size > 100
