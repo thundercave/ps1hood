@@ -1,4 +1,4 @@
-"""Studio product viewer layer defaults (hero = raw MA cloud)."""
+"""Studio product viewer layer defaults (raw MA cloud plus product overlays)."""
 
 from __future__ import annotations
 
@@ -13,16 +13,13 @@ def test_viewer_hero_layer_defaults() -> None:
     assert 'id="togCloud" checked' in body
     assert "cloud (raw MA)" in body
     assert "cloudPoints.visible = true" in body
-    # Façades / sat roofs / street OFF (overlay toggles; files stay on disk)
-    assert 'id="togFacades">' in body or 'id="togFacades" ' in body
-    assert 'id="togFacades" checked' not in body
-    assert 'id="togRoofs">' in body or 'id="togRoofs" ' in body
-    assert 'id="togRoofs" checked' not in body
-    assert 'id="togStreet">' in body or 'id="togStreet" ' in body
-    assert 'id="togStreet" checked' not in body
-    assert "facadeRoot.visible = false" in body
-    assert "roofRoot.visible = false" in body
-    assert "streetRoot.visible = false" in body
+    # Façades / sat roofs / street ON (product overlays)
+    assert 'id="togFacades" checked' in body
+    assert 'id="togRoofs" checked' in body
+    assert 'id="togStreet" checked' in body
+    assert "facadeRoot.visible = true" in body
+    assert "roofRoot.visible = true" in body
+    assert "streetRoot.visible = true" in body
     # BAG / zclean / offtile OFF
     assert 'id="togBag">' in body
     assert 'id="togBag" checked' not in body

@@ -113,7 +113,7 @@ def align_camera_to_satellite(
     pitch: float,
     height_m: float,
     fov_deg: float,
-    max_shift_m: float = 8.0,
+    max_shift_m: float = 1.0,
     max_heading_deg: float = 15.0,
     w_ncc: float = 0.35,
     w_edge: float = 0.65,
@@ -132,19 +132,22 @@ def align_camera_to_satellite(
 
     edge_src = ortho_edges_bgr if ortho_edges_bgr is not None else ortho_edge_bgr(ortho)
 
+    prior_e, prior_n = float(e), float(n)
     best = {
         "score": -1.0,
         "ncc": -1.0,
         "edge": -1.0,
-        "e": e,
-        "n": n,
+        "e": prior_e,
+        "n": prior_n,
         "heading": heading,
     }
-    # Coarse → medium → fine (edges survive downsample; fine pins kerb/roofline)
+    # Coarse → medium → fine. Every candidate is clamped to max_shift_m of the
+    # GPS/Ortho prior so later stages cannot walk outside the allowed seat.
+    span0 = float(max_shift_m)
     stages = (
-        (2.5, 5.0, max_shift_m, max_heading_deg),
-        (0.8, 2.0, 3.0, 6.0),
-        (0.4, 1.0, 2.0, 4.0),
+        (min(2.5, max(span0 / 3.0, 0.25)), 5.0, span0, max_heading_deg),
+        (min(0.8, max(span0 / 4.0, 0.2)), 2.0, min(3.0, span0), min(6.0, max_heading_deg)),
+        (min(0.4, max(span0 / 5.0, 0.15)), 1.0, min(2.0, span0), min(4.0, max_heading_deg)),
     )
     for step_m, step_h, span_m, span_h in stages:
         ce, cn, ch = best["e"], best["n"], best["heading"]
@@ -156,6 +159,9 @@ def align_camera_to_satellite(
                 for hh in dh:
                     cand_e = ce + float(ee)
                     cand_n = cn + float(nn)
+                    # Hard gate vs original prior (not vs previous stage best)
+                    if math.hypot(cand_e - prior_e, cand_n - prior_n) > max_shift_m + 1e-6:
+                        continue
                     cand_h = wrap_heading(ch + float(hh))
                     synth = render_satellite_into_camera_fast(
                         ortho,

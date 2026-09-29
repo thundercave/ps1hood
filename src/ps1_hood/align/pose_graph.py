@@ -1,4 +1,8 @@
-"""Build initial poses from GPS/OSM, then refine with views + satellite."""
+"""Build initial poses from Google raw GPS, then refine with views + satellite.
+
+OSM road snap is disabled. Sat NCC may nudge at most ``MAX_SAT_SHIFT_M`` from GPS;
+anything larger keeps the raw GPS seat so SV and Ortho share one LocalFrame absolute.
+"""
 
 from __future__ import annotations
 
@@ -18,10 +22,8 @@ from ps1_hood.geo import (
     LocalFrame,
     camera_rotation_cv,
     heading_diff,
-    snap_to_polylines_enu,
     wrap_heading,
 )
-from ps1_hood.overpass import roads_to_enu_lines
 
 log = logging.getLogger(__name__)
 
@@ -45,38 +47,36 @@ def _front_shots(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return fronts
 
 
+# Cap sat NCC + post-bundle drift from Google raw GPS (metres).
+MAX_SAT_SHIFT_M = 1.0
+MAX_GPS_DRIFT_M = 1.0
+
+
 def initial_poses(
     shots: list[dict[str, Any]],
     spec: ProjectSpec,
     frame: LocalFrame,
     osm: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    lines = roads_to_enu_lines(osm, frame) if osm else []
+    """Seat each pano on Google raw GPS in ``frame`` (same LocalFrame as Ortho).
+
+    OSM road snap is intentionally disabled: snapping to Overpass polylines
+    pulled SV ~6–9 m off Google GPS and fought the sat ortho absolute XY.
+    ``osm`` is kept for API compatibility / future debug but unused here.
+    """
+    del osm  # no OSM polyline snap — raw GPS only
     poses: list[dict[str, Any]] = []
     for shot in _front_shots(shots):
         e, n, _ = frame.to_enu(float(shot["lat"]), float(shot["lon"]))
-        e_gps, n_gps = e, n
         heading = float(shot.get("heading") or 0.0)
-        snapped = False
-        if lines:
-            se, sn, sh, dist = snap_to_polylines_enu(e, n, lines)
-            if dist < 12.0:
-                e, n = se, sn
-                # keep the photo heading if it is already close; otherwise use the road
-                if abs(heading_diff(heading, sh)) < 40 or abs(heading_diff(heading, sh + 180)) < 40:
-                    if abs(heading_diff(heading, sh + 180)) < abs(heading_diff(heading, sh)):
-                        heading = wrap_heading(sh + 180.0)
-                    else:
-                        heading = sh
-                snapped = True
         poses.append(
             {
                 "pano_id": shot["pano_id"],
                 "shot_path": shot["path"],
                 "lat_raw": shot["lat"],
                 "lon_raw": shot["lon"],
-                "e_gps": e_gps,
-                "n_gps": n_gps,
+                "e_gps": e,
+                "n_gps": n,
                 "e": e,
                 "n": n,
                 "u": spec.camera_height_m,
@@ -85,7 +85,7 @@ def initial_poses(
                 "fov": float(shot.get("fov") or spec.fov_deg),
                 "width": shot.get("width"),
                 "height": shot.get("height"),
-                "snapped": snapped,
+                "snapped": False,
                 "source": shot.get("source"),
                 "mask": shot.get("mask"),
                 "travel_heading": shot.get("travel_heading", heading),
@@ -166,16 +166,18 @@ def refine_poses(
             if photo is None:
                 continue
             log.info("satellite align %s/%s  %s", i + 1, len(refined), pose["pano_id"])
+            eg = float(pose["e_gps"])
+            ng = float(pose["n_gps"])
             hit = align_camera_to_satellite(
                 photo,
                 ortho,
-                e=pose["e"],
-                n=pose["n"],
+                e=eg,
+                n=ng,
                 heading=pose["heading"],
                 pitch=pose["pitch"],
                 height_m=spec.camera_height_m,
                 fov_deg=pose["fov"],
-                max_shift_m=8.0,
+                max_shift_m=MAX_SAT_SHIFT_M,
                 max_heading_deg=15.0,
                 w_ncc=w_ncc,
                 w_edge=w_edge,
@@ -184,12 +186,25 @@ def refine_poses(
             pose["sat_score"] = hit["score"]
             pose["sat_ncc"] = hit.get("ncc")
             pose["sat_edge"] = hit.get("edge")
-            # Accept fused peak; soft floor keeps relative graph stable
-            if hit["score"] > 0.08:
+            # Accept only if fused peak is good AND stays within MAX_SAT_SHIFT_M of raw GPS.
+            drift = float(np.hypot(hit["e"] - eg, hit["n"] - ng))
+            if hit["score"] > 0.08 and drift <= MAX_SAT_SHIFT_M + 1e-6:
                 pose["e"] = hit["e"]
                 pose["n"] = hit["n"]
                 pose["heading"] = hit["heading"]
                 sat_obs.append({"i": i, **hit})
+            else:
+                pose["e"], pose["n"] = eg, ng
+                why = (
+                    f"drift={drift:.2f}m > {MAX_SAT_SHIFT_M:.1f}m"
+                    if drift > MAX_SAT_SHIFT_M + 1e-6
+                    else f"score={float(hit['score']):.3f} <= 0.08"
+                )
+                log.info(
+                    "sat NCC rejected for %s (%s) — keep raw GPS",
+                    pose["pano_id"],
+                    why,
+                )
 
     if use_features:
         for i, j in _neighbor_pairs(refined):
@@ -201,7 +216,19 @@ def refine_poses(
     if len(refined) >= 2:
         refined = _bundle_se2(refined, feat_obs)
 
+    # Hard clamp: never let sat refine or feature bundle drift >1 m from Google GPS.
     for pose in refined:
+        eg = float(pose["e_gps"])
+        ng = float(pose["n_gps"])
+        drift = float(np.hypot(float(pose["e"]) - eg, float(pose["n"]) - ng))
+        if drift > MAX_GPS_DRIFT_M:
+            log.info(
+                "pose clamp %s drift=%.2fm → raw GPS (cap %.1fm)",
+                pose["pano_id"],
+                drift,
+                MAX_GPS_DRIFT_M,
+            )
+            pose["e"], pose["n"] = eg, ng
         lat, lon, _ = frame.to_geodetic(pose["e"], pose["n"], 0.0)
         pose["lat"] = lat
         pose["lon"] = lon
