@@ -6,7 +6,7 @@ Skip roofs/street when already sat-native.
 Sources:
   - façade↔Ortho Canny Chamfer → ``T_force.json`` (do **not** auto-apply)
   - Studio yellow↔red corner picks → ``fit_pairs_se2`` (preview only; apply on confirm)
-  - unique cam XY → corridor-cropped street_mask medial + continuity match → ``T_cam_road.json``
+  - unique cam XY → corridor-cropped street_mask → single-branch skeleton + continuity → ``T_cam_road.json``
   - Studio cam↔road-center picks / drawn centerline polyline → ``T_pick_cam_road.json``
 """
 
@@ -61,6 +61,10 @@ DEFAULT_CAM_CORRIDOR_M = 15.0
 DEFAULT_CAM_MAX_MAD_M = 1.5
 DEFAULT_CONTINUITY_STEP_FACTOR = 2.5
 DEFAULT_CONTINUITY_LATERAL_M = 8.0
+DEFAULT_BRANCH_DIST_SCALE_M = 5.0
+DEFAULT_ARC_CONTINUITY_STEP_FACTOR = 1.5
+DEFAULT_POLYLINE_SAMPLE_M = 0.5
+DEFAULT_CAM_ROAD_DEBUG_PNG = "align/cam_road_debug.png"
 SOURCE_CAM_ROAD_PICKS = "studio_cam_road_picks"
 SOURCE_CAM_ROAD_POLYLINE = "studio_cam_road_polyline"
 
@@ -819,16 +823,8 @@ def dt_ridge_skeleton(mask_u8: np.ndarray) -> np.ndarray:
     return out
 
 
-def street_mask_centerline(
-    street_m: np.ndarray,
-    *,
-    max_points: int = DEFAULT_CENTERLINE_MAX_POINTS,
-) -> np.ndarray:
-    """Street mask → skeleton pixel coordinates as (N,2) int (u=x, v=y).
-
-    Prefers ``cv2.ximgproc.thinning`` when available; else morphological
-    skeleton, with DT-ridge fallback if too sparse.
-    """
+def extract_street_skeleton(street_m: np.ndarray) -> np.ndarray:
+    """Street mask → uint8 skeleton (thinning → morph → DT-ridge)."""
     mask = (street_m > 0).astype(np.uint8) * 255
     if int(cv2.countNonZero(mask)) < 16:
         raise SatOffsetError("street_mask too empty for centerline")
@@ -846,12 +842,294 @@ def street_mask_centerline(
         skel = dt_ridge_skeleton(mask)
     if int(cv2.countNonZero(skel)) < 8:
         raise SatOffsetError("could not extract street centerline skeleton")
+    return skel
 
+
+def street_mask_centerline(
+    street_m: np.ndarray,
+    *,
+    max_points: int = DEFAULT_CENTERLINE_MAX_POINTS,
+) -> np.ndarray:
+    """Street mask → skeleton pixel coordinates as (N,2) int (u=x, v=y).
+
+    Prefers ``cv2.ximgproc.thinning`` when available; else morphological
+    skeleton, with DT-ridge fallback if too sparse.
+    """
+    skel = extract_street_skeleton(street_m)
     ys, xs = np.where(skel > 0)
     if len(ys) > int(max_points):
         idx = np.linspace(0, len(ys) - 1, int(max_points)).astype(np.int64)
         ys, xs = ys[idx], xs[idx]
     return np.column_stack([xs, ys]).astype(np.int32)
+
+
+def _walk_skeleton_pixels(coords: np.ndarray) -> np.ndarray:
+    """Order 8-connected skeleton pixels into a polyline (endpoint → walk).
+
+    ``coords`` is (N,2) int with columns (u,v). Returns ordered (M,2).
+    """
+    pts = np.asarray(coords, dtype=np.int32)
+    n = len(pts)
+    if n <= 1:
+        return pts.copy()
+    # Map pixel → index
+    key = {(int(u), int(v)): i for i, (u, v) in enumerate(pts)}
+    nbrs: list[list[int]] = [[] for _ in range(n)]
+    for i, (u, v) in enumerate(pts):
+        for du in (-1, 0, 1):
+            for dv in (-1, 0, 1):
+                if du == 0 and dv == 0:
+                    continue
+                j = key.get((int(u) + du, int(v) + dv))
+                if j is not None:
+                    nbrs[i].append(j)
+    # Prefer degree-1 endpoints; else farthest pair
+    ends = [i for i in range(n) if len(nbrs[i]) <= 1]
+    if ends:
+        start = ends[0]
+        # Prefer the endpoint with largest extent from centroid
+        cu = float(pts[:, 0].mean())
+        cv = float(pts[:, 1].mean())
+        start = max(ends, key=lambda i: (float(pts[i, 0]) - cu) ** 2 + (float(pts[i, 1]) - cv) ** 2)
+    else:
+        d2 = ((pts[:, None, :].astype(np.float64) - pts[None, :, :]) ** 2).sum(axis=2)
+        start = int(np.argmax(d2) // n)
+
+    order = [start]
+    used = {start}
+    cur = start
+    while True:
+        cand = [j for j in nbrs[cur] if j not in used]
+        if not cand:
+            # Jump to nearest unused if graph has loops/spurs left
+            unused = [i for i in range(n) if i not in used]
+            if not unused:
+                break
+            best = min(
+                unused,
+                key=lambda j: (int(pts[j, 0]) - int(pts[cur, 0])) ** 2
+                + (int(pts[j, 1]) - int(pts[cur, 1])) ** 2,
+            )
+            # Only jump if adjacent-ish (≤2 px); else stop (orphan spur)
+            jump = math.hypot(
+                float(pts[best, 0] - pts[cur, 0]), float(pts[best, 1] - pts[cur, 1])
+            )
+            if jump > 2.5:
+                break
+            order.append(best)
+            used.add(best)
+            cur = best
+            continue
+        # Prefer continuing straight: pick neighbor closest to previous heading
+        if len(order) >= 2 and len(cand) > 1:
+            pe = float(pts[order[-1], 0] - pts[order[-2], 0])
+            pn = float(pts[order[-1], 1] - pts[order[-2], 1])
+            plen = math.hypot(pe, pn) or 1.0
+            pe, pn = pe / plen, pn / plen
+
+            def _score(j: int) -> float:
+                de = float(pts[j, 0] - pts[cur, 0])
+                dn = float(pts[j, 1] - pts[cur, 1])
+                dlen = math.hypot(de, dn) or 1.0
+                return -(de / dlen) * pe - (dn / dlen) * pn  # prefer aligned
+
+            nxt = min(cand, key=_score)
+        else:
+            nxt = cand[0]
+        order.append(nxt)
+        used.add(nxt)
+        cur = nxt
+        if len(order) >= n:
+            break
+    return pts[np.asarray(order, dtype=np.int64)]
+
+
+def select_single_skeleton_branch(
+    skel_u8: np.ndarray,
+    ortho: Any,
+    cam_xy: np.ndarray,
+    *,
+    dist_scale_m: float = DEFAULT_BRANCH_DIST_SCALE_M,
+    min_pixels: int = 8,
+    max_points: int = DEFAULT_CENTERLINE_MAX_POINTS,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Keep ONE skeleton connected component near the cam track.
+
+    score = length_m * exp(-median_dist_to_ordered_cams / dist_scale_m)
+    Returns (polyline_enu Nx2 ordered, selected_skel_u8, meta).
+    """
+    bin_s = (skel_u8 > 0).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_s, connectivity=8)
+    if n_labels <= 1:
+        raise SatOffsetError("skeleton empty after connectedComponents")
+
+    cams = order_cams_along_path(np.asarray(cam_xy, dtype=np.float64))
+    mpp = _metres_per_px(ortho)
+    best_label = -1
+    best_score = -1.0
+    best_walk: np.ndarray | None = None
+    best_meta: dict[str, Any] = {}
+
+    for lab in range(1, n_labels):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < int(min_pixels):
+            continue
+        ys, xs = np.where(labels == lab)
+        coords = np.column_stack([xs, ys]).astype(np.int32)
+        walk = _walk_skeleton_pixels(coords)
+        # ENU samples for scoring
+        enu = np.empty((len(walk), 2), dtype=np.float64)
+        for i, (u, v) in enumerate(walk):
+            e, n = px_to_enu(ortho, float(u), float(v))
+            enu[i, 0] = e
+            enu[i, 1] = n
+        # Polyline length in metres
+        if len(enu) >= 2:
+            segs = np.sqrt(((enu[1:] - enu[:-1]) ** 2).sum(axis=1))
+            length_m = float(segs.sum())
+        else:
+            length_m = float(area) * float(mpp)
+        # Median distance from ordered cams to this branch
+        dists = []
+        for e, n in cams:
+            d2 = (enu[:, 0] - e) ** 2 + (enu[:, 1] - n) ** 2
+            dists.append(float(math.sqrt(float(d2.min()))))
+        med = float(np.median(np.asarray(dists, dtype=np.float64))) if dists else 1e9
+        score = length_m * math.exp(-med / max(float(dist_scale_m), 1e-3))
+        if score > best_score:
+            best_score = score
+            best_label = lab
+            best_walk = walk
+            best_meta = {
+                "label": int(lab),
+                "n_pixels": int(area),
+                "length_m": float(length_m),
+                "median_dist_m": float(med),
+                "score": float(score),
+                "n_labels": int(n_labels - 1),
+            }
+
+    if best_label < 0 or best_walk is None or len(best_walk) < 2:
+        raise SatOffsetError("no usable single skeleton branch near cams")
+
+    # Subsample if huge
+    walk = best_walk
+    if len(walk) > int(max_points):
+        idx = np.linspace(0, len(walk) - 1, int(max_points)).astype(np.int64)
+        walk = walk[idx]
+
+    poly = np.empty((len(walk), 2), dtype=np.float64)
+    for i, (u, v) in enumerate(walk):
+        e, n = px_to_enu(ortho, float(u), float(v))
+        poly[i, 0] = e
+        poly[i, 1] = n
+
+    selected = np.zeros_like(skel_u8)
+    selected[labels == best_label] = 255
+    return poly, selected, best_meta
+
+
+def densify_polyline_xy(
+    poly_xy: np.ndarray,
+    *,
+    step_m: float = DEFAULT_POLYLINE_SAMPLE_M,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Densify polyline to ~step_m samples; return (pts Nx2, arc_s N)."""
+    poly = np.asarray(poly_xy, dtype=np.float64)
+    if len(poly) == 0:
+        return poly.copy(), np.zeros(0, dtype=np.float64)
+    if len(poly) == 1:
+        return poly.copy(), np.zeros(1, dtype=np.float64)
+    samples: list[list[float]] = []
+    arcs: list[float] = []
+    s_acc = 0.0
+    step = max(float(step_m), 0.1)
+    for i in range(len(poly) - 1):
+        e0, n0 = float(poly[i, 0]), float(poly[i, 1])
+        e1, n1 = float(poly[i + 1, 0]), float(poly[i + 1, 1])
+        seg = math.hypot(e1 - e0, n1 - n0)
+        n_steps = max(1, int(math.ceil(seg / step)))
+        for k in range(n_steps):
+            t = k / n_steps
+            samples.append([e0 + t * (e1 - e0), n0 + t * (n1 - n0)])
+            arcs.append(s_acc + t * seg)
+        s_acc += seg
+    samples.append([float(poly[-1, 0]), float(poly[-1, 1])])
+    arcs.append(s_acc)
+    return np.asarray(samples, dtype=np.float64), np.asarray(arcs, dtype=np.float64)
+
+
+def match_cams_to_polyline_arc_continuity(
+    cam_xy: np.ndarray,
+    polyline_xy: np.ndarray,
+    *,
+    search_r_m: float = DEFAULT_CAM_SEARCH_R_M,
+    min_nn_m: float = DEFAULT_CAM_MIN_NN_M,
+    step_factor: float = DEFAULT_ARC_CONTINUITY_STEP_FACTOR,
+    sample_m: float = DEFAULT_POLYLINE_SAMPLE_M,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[float]]:
+    """Snap ordered cams to polyline with arc-length continuity.
+
+    After the first match, require ``|s - s_prev| ≤ step_factor * median_cam_spacing``
+    (pack default 1.5×). Rejects pairs that would jump to a spur/side branch.
+    """
+    if cam_xy.size == 0 or polyline_xy.size == 0 or len(polyline_xy) < 2:
+        return [], [], []
+    cams = order_cams_along_path(np.asarray(cam_xy, dtype=np.float64))
+    dens, arc_s = densify_polyline_xy(polyline_xy, step_m=sample_m)
+    if len(dens) < 2:
+        return [], [], []
+
+    spacings = [
+        math.hypot(float(cams[i, 0] - cams[i - 1, 0]), float(cams[i, 1] - cams[i - 1, 1]))
+        for i in range(1, len(cams))
+    ]
+    med_space = float(np.median(np.asarray(spacings, dtype=np.float64))) if spacings else 5.0
+    step_max = max(3.0, float(step_factor) * med_space)
+
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    dists: list[float] = []
+    prev_s: float | None = None
+
+    for e, n in cams:
+        d2 = (dens[:, 0] - e) ** 2 + (dens[:, 1] - n) ** 2
+        within = np.where(d2 <= float(search_r_m) ** 2)[0]
+        if within.size == 0:
+            continue
+        if prev_s is None:
+            chosen = int(within[int(np.argmin(d2[within]))])
+        else:
+            ok = []
+            for j in within.tolist():
+                ds = abs(float(arc_s[j]) - float(prev_s))
+                if ds <= step_max:
+                    ok.append(j)
+            if not ok:
+                # Soft: allow up to 1.5× step_max
+                for j in within.tolist():
+                    ds = abs(float(arc_s[j]) - float(prev_s))
+                    if ds <= step_max * 1.5:
+                        ok.append(j)
+            if not ok:
+                continue
+            chosen = int(min(ok, key=lambda j: float(d2[j])))
+
+        dist = float(math.sqrt(float(d2[chosen])))
+        prev_s = float(arc_s[chosen])
+        before.append({"e": float(e), "n": float(n)})
+        after.append({"e": float(dens[chosen, 0]), "n": float(dens[chosen, 1])})
+        dists.append(dist)
+
+    primary_b, primary_a, primary_d = [], [], []
+    for b, a, d in zip(before, after, dists):
+        if d > float(min_nn_m):
+            primary_b.append(b)
+            primary_a.append(a)
+            primary_d.append(d)
+    if len(primary_b) >= 2:
+        return primary_b, primary_a, primary_d
+    return before, after, dists
 
 
 def street_centerline_enu(
@@ -1136,13 +1414,19 @@ def measure_cam_road_se2(
     corridor_m: float = DEFAULT_CAM_CORRIDOR_M,
     max_mad_m: float = DEFAULT_CAM_MAX_MAD_M,
     continuity: bool = True,
+    single_branch: bool = True,
+    debug_png: Path | str | None = None,
+    write_debug_on_fail: bool = True,
 ) -> dict[str, Any]:
     """Measure SE(2): unique cam XY → corridor-cropped street centerline.
 
     Pipeline:
-      1. ``street_m &= dilate(cam_xy, corridor_m)`` then skeleton/medial
-      2. Continuity match along cam path (no NN to random parallel branches)
-      3. Fit SE(2) / translation-only; gate on rms, MAD, |yaw|, ||t||
+      1. ``street_c = street_m & dilate(cam_xy, corridor_m)`` then skeleton
+      2. ``--single-branch``: keep ONE skeleton CC scored by
+         ``length_m * exp(-median_dist_to_cams / 5)`` → ordered polyline P
+      3. Continuity match along P (arc-length |Δs| gate) or road-tangent NN
+      4. Fit SE(2) / translation-only; gate on rms, MAD, |yaw|, ||t||
+      5. Always write debug PNG (street_m | street_c | skel | P | cams | arrows)
 
     Does **not** apply. Caller persists ``align/T_cam_road.json``.
     Rejects multi-branch latch even when ||t|| is small (MAD / rms gates).
@@ -1154,31 +1438,109 @@ def measure_cam_road_se2(
         )
 
     ortho = load_ortho_for_run(project.root)
-    _, _, street_m = segment_roof_yard_mask(ortho.image)
-    street_m = crop_street_mask_to_cam_corridor(
-        street_m, ortho, cam_xy, corridor_m=float(corridor_m)
+    _, _, street_full = segment_roof_yard_mask(ortho.image)
+    street_c = crop_street_mask_to_cam_corridor(
+        street_full, ortho, cam_xy, corridor_m=float(corridor_m)
     )
-    centerline_xy, mpp = street_centerline_enu(ortho, street_m)
+    skel_full = extract_street_skeleton(street_c)
+    mpp = _metres_per_px(ortho)
+    branch_meta: dict[str, Any] = {}
+    skel_selected = skel_full
+    polyline_xy: np.ndarray | None = None
 
-    match_fn = match_cams_to_centerline_continuity if continuity else match_cams_to_centerline
-    before, after, dists = match_fn(
-        cam_xy,
-        centerline_xy,
-        search_r_m=search_r_m,
-        min_nn_m=min_nn_m,
-    )
-    if len(before) < int(min_pairs) and continuity:
-        # Continuity too strict — fall back to plain NN once
+    if single_branch:
+        polyline_xy, skel_selected, branch_meta = select_single_skeleton_branch(
+            skel_full, ortho, cam_xy
+        )
+        centerline_xy = polyline_xy
+    else:
+        centerline_xy, mpp = street_centerline_enu(ortho, street_c)
+
+    gate_error: str | None = None
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    dists: list[float] = []
+
+    if single_branch and continuity and polyline_xy is not None:
+        before, after, dists = match_cams_to_polyline_arc_continuity(
+            cam_xy,
+            polyline_xy,
+            search_r_m=search_r_m,
+            min_nn_m=min_nn_m,
+        )
+        if len(before) < int(min_pairs):
+            before, after, dists = match_cams_to_centerline_continuity(
+                cam_xy,
+                centerline_xy,
+                search_r_m=search_r_m,
+                min_nn_m=min_nn_m,
+            )
+    elif continuity:
+        before, after, dists = match_cams_to_centerline_continuity(
+            cam_xy,
+            centerline_xy,
+            search_r_m=search_r_m,
+            min_nn_m=min_nn_m,
+        )
+    else:
         before, after, dists = match_cams_to_centerline(
             cam_xy,
             centerline_xy,
             search_r_m=search_r_m,
             min_nn_m=min_nn_m,
         )
+
+    if len(before) < int(min_pairs) and continuity:
+        before, after, dists = match_cams_to_centerline(
+            cam_xy,
+            centerline_xy,
+            search_r_m=search_r_m,
+            min_nn_m=min_nn_m,
+        )
+
+    payload_partial: dict[str, Any] = {
+        "corridor_m": float(corridor_m),
+        "continuity": bool(continuity),
+        "single_branch": bool(single_branch),
+        "branch": branch_meta,
+        "n_cams": int(len(cam_xy)),
+        "n_centerline": int(len(centerline_xy)),
+        "m_per_px": float(mpp),
+        "debug_layers": {
+            "street_full": street_full,
+            "street_c": street_c,
+            "skel_full": skel_full,
+            "skel_selected": skel_selected,
+            "polyline_xy": polyline_xy if polyline_xy is not None else centerline_xy,
+            "cam_xy": cam_xy,
+        },
+    }
+
+    def _maybe_debug(payload: dict[str, Any]) -> None:
+        if debug_png is None:
+            return
+        try:
+            write_cam_road_debug_png(project, payload, out_path=Path(debug_png))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cam-road debug png failed: %s", exc)
+
     if len(before) < int(min_pairs):
-        raise SatOffsetError(
+        gate_error = (
             f"need ≥{min_pairs} cam↔centerline pairs within {search_r_m}m, got {len(before)}"
         )
+        payload_partial["preview"] = {
+            "cams_before": [{"e": float(e), "n": float(n)} for e, n in cam_xy],
+            "cams_mapped": [],
+            "centerline_targets": [],
+            "nn_arrows": [],
+            "polyline": [
+                {"e": float(p[0]), "n": float(p[1])}
+                for p in (polyline_xy if polyline_xy is not None else centerline_xy)
+            ],
+        }
+        if write_debug_on_fail:
+            _maybe_debug(payload_partial)
+        raise SatOffsetError(gate_error)
 
     T = fit_se2(before, after)
     yaw = float(T.get("yaw_deg", 0.0))
@@ -1197,23 +1559,13 @@ def measure_cam_road_se2(
     yaw = float(T.get("yaw_deg", 0.0))
     trans = math.hypot(tx, ty)
 
-    if rms > float(max_rms_m):
-        raise SatOffsetError(f"rms {rms:.3f}m > gate {max_rms_m}m")
-    if float(max_mad_m) > 0 and mad > float(max_mad_m):
-        raise SatOffsetError(
-            f"mad {mad:.3f}m > gate {max_mad_m}m (multi-branch / disagreeing pairs)"
-        )
-    if abs(yaw) > float(max_yaw_deg):
-        raise SatOffsetError(f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°")
-    if trans > float(max_translation_m):
-        raise SatOffsetError(f"||t|| {trans:.3f}m > gate {max_translation_m}m")
-
     preview_mapped: list[dict[str, float]] = []
     for b in before:
         e2, n2 = apply_se2_xy(float(b["e"]), float(b["n"]), T)
         preview_mapped.append({"e": float(e2), "n": float(n2)})
 
-    return {
+    poly_preview = polyline_xy if polyline_xy is not None else centerline_xy
+    payload: dict[str, Any] = {
         "tx_m": tx,
         "ty_m": ty,
         "yaw_deg": yaw,
@@ -1231,6 +1583,8 @@ def measure_cam_road_se2(
         "min_nn_m": float(min_nn_m),
         "corridor_m": float(corridor_m),
         "continuity": bool(continuity),
+        "single_branch": bool(single_branch),
+        "branch": branch_meta,
         "m_per_px": float(mpp),
         "mean_nn_m": float(sum(dists) / len(dists)) if dists else float("nan"),
         "translation_only": bool(use_t_only),
@@ -1247,9 +1601,153 @@ def measure_cam_road_se2(
                 }
                 for b, a, d in zip(before, after, dists)
             ],
+            "polyline": [{"e": float(p[0]), "n": float(p[1])} for p in poly_preview],
         },
+        "debug_layers": payload_partial["debug_layers"],
         "applied": False,
     }
+
+    # Gates after assembling payload so debug PNG always has full context
+    if rms > float(max_rms_m):
+        gate_error = f"rms {rms:.3f}m > gate {max_rms_m}m"
+    elif float(max_mad_m) > 0 and mad > float(max_mad_m):
+        gate_error = f"mad {mad:.3f}m > gate {max_mad_m}m (multi-branch / disagreeing pairs)"
+    elif abs(yaw) > float(max_yaw_deg):
+        gate_error = f"|yaw| {abs(yaw):.2f}° > gate {max_yaw_deg}°"
+    elif trans > float(max_translation_m):
+        gate_error = f"||t|| {trans:.3f}m > gate {max_translation_m}m"
+
+    if gate_error is not None:
+        if write_debug_on_fail:
+            _maybe_debug(payload)
+        # Drop heavy arrays before raising (caller may log payload keys)
+        raise SatOffsetError(gate_error)
+
+    _maybe_debug(payload)
+    # Strip ndarray layers from returned payload (not JSON-serializable)
+    payload.pop("debug_layers", None)
+    return payload
+
+
+def write_cam_road_debug_png(
+    project: Project,
+    payload: dict[str, Any],
+    *,
+    out_path: Path | str | None = None,
+) -> Path | None:
+    """Debug PNG: street_m | street_c | skel | P | cams | arrows on Ortho.
+
+    Always written by measure-cams (diagnose multi-branch latch). Four-panel
+    montage when debug_layers present; else falls back to overlay-style single.
+    """
+    try:
+        ortho = load_ortho_for_run(project.root)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cam-road debug: no ortho (%s)", exc)
+        return None
+
+    layers = payload.get("debug_layers") or {}
+    preview = payload.get("preview") or {}
+    base = ortho.image.copy()
+    if base.ndim == 2:
+        base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    h, w = base.shape[:2]
+
+    def _px(e: float, n: float) -> tuple[int, int]:
+        u, v = ortho.enu_to_px(e, n)
+        return int(round(u)), int(round(v))
+
+    def _colorize_mask(mask: np.ndarray | None, color: tuple[int, int, int], alpha: float = 0.45) -> np.ndarray:
+        img = base.copy()
+        if mask is None:
+            return img
+        m = (np.asarray(mask) > 0)
+        if m.shape[:2] != (h, w):
+            return img
+        overlay = img.copy()
+        overlay[m] = color
+        return cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0)
+
+    street_full = layers.get("street_full")
+    street_c = layers.get("street_c")
+    skel_full = layers.get("skel_full")
+    skel_sel = layers.get("skel_selected")
+    poly = layers.get("polyline_xy")
+    if poly is None:
+        poly_preview = preview.get("polyline") or []
+        if poly_preview:
+            poly = np.asarray([[p["e"], p["n"]] for p in poly_preview], dtype=np.float64)
+
+    panel_a = _colorize_mask(street_full, (180, 80, 40), 0.4)  # full street (blue-ish BGR)
+    cv2.putText(panel_a, "street_m", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    panel_b = _colorize_mask(street_c, (40, 180, 40), 0.45)  # corridor crop green
+    cv2.putText(panel_b, "street_c", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    panel_c = base.copy()
+    if skel_full is not None:
+        m = np.asarray(skel_full) > 0
+        if m.shape[:2] == (h, w):
+            panel_c[m] = (255, 0, 255)  # magenta full skel
+    if skel_sel is not None:
+        m = np.asarray(skel_sel) > 0
+        if m.shape[:2] == (h, w):
+            panel_c[m] = (0, 255, 255)  # yellow selected
+    cv2.putText(panel_c, "skel (mag) / branch (yel)", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    panel_d = base.copy()
+    # Draw selected polyline P thick yellow
+    if poly is not None and len(poly) >= 2:
+        pts = []
+        for e, n in np.asarray(poly, dtype=np.float64):
+            pts.append(_px(float(e), float(n)))
+        for i in range(len(pts) - 1):
+            cv2.line(panel_d, pts[i], pts[i + 1], (0, 255, 255), 2)
+    # Cams red + arrows
+    before = preview.get("cams_before") or []
+    arrows = preview.get("nn_arrows") or []
+    mapped = preview.get("cams_mapped") or []
+    cam_xy = layers.get("cam_xy")
+    if before:
+        for b in before:
+            cv2.circle(panel_d, _px(float(b["e"]), float(b["n"])), 4, (0, 0, 255), -1)
+    elif cam_xy is not None:
+        for e, n in np.asarray(cam_xy, dtype=np.float64):
+            cv2.circle(panel_d, _px(float(e), float(n)), 4, (0, 0, 255), -1)
+    for ar in arrows:
+        fr, to = ar.get("from") or {}, ar.get("to") or {}
+        if "e" in fr and "e" in to:
+            cv2.line(
+                panel_d,
+                _px(float(fr["e"]), float(fr["n"])),
+                _px(float(to["e"]), float(to["n"])),
+                (0, 165, 255),
+                1,
+            )
+            cv2.circle(panel_d, _px(float(to["e"]), float(to["n"])), 2, (0, 255, 255), -1)
+    for m in mapped:
+        cv2.circle(panel_d, _px(float(m["e"]), float(m["n"])), 3, (255, 255, 0), -1)
+    # Stats HUD
+    rms = payload.get("rms_m")
+    mad = payload.get("mad_m")
+    hud = f"P+cams  rms={rms} mad={mad} branch={payload.get('single_branch')}"
+    cv2.putText(panel_d, hud[:60], (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    top = np.hstack([panel_a, panel_b])
+    bot = np.hstack([panel_c, panel_d])
+    # Resize if odd dims mismatch
+    if top.shape[1] != bot.shape[1]:
+        w2 = min(top.shape[1], bot.shape[1])
+        top = top[:, :w2]
+        bot = bot[:, :w2]
+    montage = np.vstack([top, bot])
+
+    dest = Path(out_path) if out_path else (project.align_dir / "cam_road_debug.png")
+    if not dest.is_absolute():
+        dest = project.root / dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dest), montage)
+    payload["_debug_png"] = str(dest)
+    return dest
 
 
 def write_cam_road_overlay(
@@ -1318,6 +1816,7 @@ def persist_t_cam_road(
     t_path: Path | None = None,
     overlay: bool = False,
     overlay_path: Path | None = None,
+    debug_png: Path | str | None = None,
 ) -> dict[str, str]:
     """Write ``align/T_cam_road.json`` (measure only — no apply)."""
     dest = Path(t_path) if t_path else (project.align_dir / "T_cam_road.json")
@@ -1341,6 +1840,8 @@ def persist_t_cam_road(
         "translation_only": bool(payload.get("translation_only", False)),
         "corridor_m": float(payload.get("corridor_m", DEFAULT_CAM_CORRIDOR_M)),
         "continuity": bool(payload.get("continuity", True)),
+        "single_branch": bool(payload.get("single_branch", True)),
+        "branch": payload.get("branch") or {},
         "applied": False,
         "note": "preview only — apply via sat-offset apply --from align/T_cam_road.json (do NOT force-apply a failed gate)",
     }
@@ -1350,6 +1851,13 @@ def persist_t_cam_road(
         ov = write_cam_road_overlay(project, payload, out_path=overlay_path)
         if ov is not None:
             out["overlay"] = str(ov)
+    # Re-write debug if layers still present (normally measure already wrote it)
+    if debug_png is not None and payload.get("debug_layers") is not None:
+        dbg = write_cam_road_debug_png(project, payload, out_path=Path(debug_png))
+        if dbg is not None:
+            out["debug_png"] = str(dbg)
+    elif payload.get("_debug_png"):
+        out["debug_png"] = str(payload["_debug_png"])
     return out
 
 
