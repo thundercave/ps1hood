@@ -61,9 +61,19 @@ Rejects / clamps (log):
 
 Product SE(2) re-applied to `cloud.ply` / `cloud_photo.ply` / façades / planes.
 
-### Host PC
+### Host PC (Lego, HEAD `02dc623` / align on `4689bec`)
 
-Pending Lego checkout of `fix/sv-raw-gps-seat-no-osm-snap` + same align on `/home/sander/ps1-hood/runs/smoke-dense`. Expect same order of magnitude once HEAD matches.
+| Metric | Value |
+|--------|-------|
+| n cams | 13 |
+| mean Δgps→seat | **0.42 m** |
+| max Δgps→seat | **0.98 m** |
+| snapped | **0/13** |
+| bag_snapped | 0 |
+| OLD (pre-gpsfix on host) | mean **5.38 m** / max **10.49 m** |
+| Target &lt; 1 m | **PASS** |
+| Studio sync | confirmed (no re-align; bak-pre-gpsfix present) |
+
 
 ## MapAnything cloud vs sat roads
 
@@ -76,6 +86,6 @@ GPS seat is now within 1 m of Google raw GPS in the Ortho LocalFrame, so the dua
 
 ## Next
 
-1. PC: `git fetch && git checkout fix/sv-raw-gps-seat-no-osm-snap && uv run ps1hood align smoke-dense --align-prior sat`
-2. Open Studio; confirm cloud/cams vs sat roads
-3. Merge PR when host confirms
+1. ~~PC align + Studio sync~~ done (PASS)
+2. Visual: confirm no cars-through-buildings vs sat roads in Studio
+3. Merge [PR #57](https://github.com/thundercave/ps1hood/pull/57)
